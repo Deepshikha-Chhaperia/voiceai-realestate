@@ -1,0 +1,94 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<div class="space-y-6">
+  <!-- Priority Call Now (Hot genuine leads without booked slot) -->
+  <div class="bg-white border border-rose-200 rounded-2xl p-6 shadow-sm">
+    <div class="flex items-center justify-between pb-3 border-b border-rose-100 mb-4">
+      <div class="flex items-center gap-2">
+        <span class="w-3 h-3 rounded-full bg-rose-500 animate-ping"></span>
+        <h2 class="text-sm font-bold text-rose-900 uppercase tracking-wider">⚡ Priority Call Now (High-Intent Leads Needing Human Follow-up)</h2>
+      </div>
+      <span class="text-xs font-semibold bg-rose-50 text-rose-700 px-3 py-1 rounded-full border border-rose-200">
+        {{ call_now_leads|length }} Active
+      </span>
+    </div>
+
+    <div class="divide-y divide-slate-100">
+      {% for lead in call_now_leads %}
+      <div class="py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div>
+          <p class="font-bold text-sm text-slate-900">
+            {{ lead.name or 'Prospect' }} 
+            <span class="text-xs font-semibold text-slate-500 ml-1">({{ lead.masked_phone }})</span>
+          </p>
+          <p class="text-xs text-rose-700 mt-1 font-medium">{{ lead.score_reason }}</p>
+        </div>
+        <div class="flex items-center gap-2.5">
+          <a href="tel:{{ lead.phone }}" class="bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold px-4 py-2 rounded-xl transition shadow-sm">
+            Call Rep Direct
+          </a>
+          <a href="/dashboard/leads/{{ lead.id }}" class="bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold px-3.5 py-2 rounded-xl border border-slate-200 transition">
+            View Details
+          </a>
+        </div>
+      </div>
+      {% else %}
+      <p class="text-xs text-slate-400 py-4 text-center font-medium">All priority high-intent leads currently have scheduled appointments.</p>
+      {% endfor %}
+    </div>
+  </div>
+
+  <!-- Booked Site Visits Table -->
+  <div class="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
+    <div class="px-6 py-4 border-b border-slate-200 flex items-center justify-between bg-slate-50/50">
+      <h3 class="text-sm font-bold text-slate-900">Upcoming Confirmed Site Visits</h3>
+      <span class="text-xs font-semibold text-emerald-800 bg-emerald-50 border border-emerald-200 px-3 py-1 rounded-full">
+        {{ upcoming_visits|length }} Scheduled
+      </span>
+    </div>
+
+    <div class="overflow-x-auto">
+      <table class="w-full text-left text-xs">
+        <thead class="bg-slate-50 text-slate-600 border-b border-slate-200">
+          <tr>
+            <th class="px-6 py-3.5 font-semibold">Scheduled Time</th>
+            <th class="px-6 py-3.5 font-semibold">Prospect</th>
+            <th class="px-6 py-3.5 font-semibold">Property</th>
+            <th class="px-6 py-3.5 font-semibold">Status</th>
+            <th class="px-6 py-3.5 font-semibold text-right">Actions</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-slate-100 text-slate-700">
+          {% for v in upcoming_visits %}
+          <tr class="hover:bg-slate-50/80 transition">
+            <td class="px-6 py-3.5 font-bold text-slate-900">{{ v.slot_start.strftime('%A, %b %d at %I:%M %p') }}</td>
+            <td class="px-6 py-3.5">
+              <a href="/dashboard/leads/{{ v.lead_id }}" class="font-bold hover:underline text-slate-900">{{ v.lead.name or 'Prospect' }}</a>
+              <span class="text-slate-500 text-[11px] block mt-0.5">{{ v.lead.phone }}</span>
+            </td>
+            <td class="px-6 py-3.5 font-medium">{{ v.lead.project.name if v.lead.project else 'Meridian Residences' }}</td>
+            <td class="px-6 py-3.5">
+              <span class="bg-emerald-50 text-emerald-700 border border-emerald-200 font-semibold px-2.5 py-1 rounded-md capitalize">{{ v.status }}</span>
+            </td>
+            <td class="px-6 py-3.5 text-right">
+              <div class="inline-flex gap-1.5">
+                <button hx-post="/dashboard/visits/{{ v.id }}/done" hx-target="#mainContent" hx-select="#mainContent" class="bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 font-semibold px-2.5 py-1 rounded-lg text-[11px] transition">Done</button>
+                <button hx-post="/dashboard/visits/{{ v.id }}/no-show" hx-target="#mainContent" hx-select="#mainContent" class="bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 font-semibold px-2.5 py-1 rounded-lg text-[11px] transition">No-show</button>
+                <button hx-post="/dashboard/visits/{{ v.id }}/cancel" hx-target="#mainContent" hx-select="#mainContent" class="bg-rose-50 hover:bg-rose-100 text-rose-800 border border-rose-200 font-semibold px-2.5 py-1 rounded-lg text-[11px] transition">Cancel</button>
+              </div>
+            </td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="5" class="px-6 py-10 text-center text-slate-500 font-medium">
+              No scheduled site visits yet. Tell the AI voice advisor to book a site visit during your call.
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}

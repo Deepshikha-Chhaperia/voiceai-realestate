@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments (Virtualenv)
+venv/
+.venv/
+env/
+
+# Environment Variables (Keep .env.example, ignore .env)
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+
+# System Files
+.DS_Store
+Thumbs.db
+
+# IDE Settings
+.vscode/
+.idea/
+
+# Additional secrets and credentials
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+service-account.json
+secrets.json
+*credentials*.json
+*secret*.json
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Local environment/config folders
+remote-kernel/
+.kilo/
+
+outputs/call_reports/

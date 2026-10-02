@@ -1,0 +1,87 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: voicebot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: voicebot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: voicebot_leads
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U voicebot -d voicebot_leads"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: voicebot-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: voicebot-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - MARKET=${MARKET:-india}
+      - ENV=${ENV:-prod}
+      - DATABASE_URL=postgresql+asyncpg://voicebot:${POSTGRES_PASSWORD}@postgres:5432/voicebot_leads
+      - REDIS_URL=redis://redis:6379/0
+      - SARVAM_API_KEY=${SARVAM_API_KEY}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - DASHBOARD_API_KEY=${DASHBOARD_API_KEY}
+      - OUTBOUND_API_KEY=${OUTBOUND_API_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: voicebot-worker
+    restart: unless-stopped
+    command: python -m arq leads.worker.WorkerSettings
+    environment:
+      - MARKET=${MARKET:-india}
+      - ENV=${ENV:-prod}
+      - DATABASE_URL=postgresql+asyncpg://voicebot:${POSTGRES_PASSWORD}@postgres:5432/voicebot_leads
+      - REDIS_URL=redis://redis:6379/0
+      - SARVAM_API_KEY=${SARVAM_API_KEY}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:

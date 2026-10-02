@@ -1,0 +1,22 @@
+# Secrets -- never bake these into an image layer; inject at runtime via
+# your platform's env var / secret manager instead (see .env.example).
+.env
+*.pem
+*.key
+service-account*.json
+
+# Local artifacts / call data -- outputs/ can contain the SQLite call
+# database (customer PII: phone numbers, names, budgets) and old transcript
+# files. Must not ship inside the image.
+outputs/
+*.db
+*.log
+
+.git/
+.gitignore
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.md

@@ -1,0 +1,112 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<div class="space-y-6">
+  <!-- Back Button & Status Header -->
+  <div class="flex items-center justify-between">
+    <a href="/dashboard/board" class="text-xs font-semibold text-slate-600 hover:text-slate-900 flex items-center gap-1.5 transition">
+      ← Back to Leads
+    </a>
+    <div class="flex items-center gap-2">
+      <span class="text-xs font-bold uppercase tracking-wider px-3 py-1 rounded-full border
+        {% if lead.tier == 'hot' %}bg-rose-50 text-rose-700 border-rose-200
+        {% elif lead.tier == 'warm' %}bg-amber-50 text-amber-700 border-amber-200
+        {% else %}bg-blue-50 text-blue-700 border-blue-200{% endif %}">
+        Tier: {{ lead.tier }} ({{ lead.score }} pts)
+      </span>
+      <span class="text-xs font-semibold px-3 py-1 rounded-full bg-slate-100 text-slate-700 capitalize border border-slate-200">{{ lead.status }}</span>
+    </div>
+  </div>
+
+  <!-- Lead Core Information Card -->
+  <div class="bg-white border border-slate-200 rounded-2xl p-6 sm:p-8 shadow-sm">
+    <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-6">
+      <div>
+        <label class="text-[11px] text-slate-500 font-semibold uppercase tracking-wider block">Lead Name</label>
+        <p class="text-lg font-bold text-slate-900 mt-1">{{ lead.name or 'Prospect' }}</p>
+      </div>
+      <div>
+        <label class="text-[11px] text-slate-500 font-semibold uppercase tracking-wider block">Phone Number</label>
+        <p class="text-lg font-bold text-slate-900 mt-1"><a href="tel:{{ lead.phone }}" class="hover:underline text-blue-600">{{ lead.phone }}</a></p>
+      </div>
+      <div>
+        <label class="text-[11px] text-slate-500 font-semibold uppercase tracking-wider block">Campaign / Source</label>
+        <p class="text-sm font-semibold text-slate-800 mt-1">{{ lead.campaign_id or lead.source }}</p>
+      </div>
+      <div>
+        <label class="text-[11px] text-slate-500 font-semibold uppercase tracking-wider block">Assigned Advisor</label>
+        <p class="text-sm font-semibold text-slate-800 mt-1">{{ lead.owner or 'Meridian Sales Rep' }}</p>
+      </div>
+    </div>
+
+    <div class="mt-6 pt-5 border-t border-slate-100">
+      <h4 class="text-xs font-bold text-slate-900 uppercase tracking-wider">AI Lead Qualification Rationale</h4>
+      <p class="text-sm text-slate-600 mt-1.5 leading-relaxed bg-slate-50 p-4 rounded-xl border border-slate-200">
+        {{ lead.score_reason or 'Lead created from inbound webhook/form submission.' }}
+      </p>
+    </div>
+  </div>
+
+  <!-- Touchpoints & Conversation History -->
+  <div class="bg-white border border-slate-200 rounded-2xl p-6 sm:p-8 shadow-sm">
+    <div class="flex items-center justify-between pb-4 border-b border-slate-100 mb-6">
+      <h3 class="text-base font-bold text-slate-900">Touchpoints & Engagement History</h3>
+      <span class="text-xs text-slate-500 font-medium">{{ touchpoints|length }} Events Logged</span>
+    </div>
+
+    <div class="space-y-4">
+      {% for tp in touchpoints %}
+      <div class="flex items-start gap-4 p-5 rounded-xl bg-slate-50/80 border border-slate-200">
+        <div class="w-9 h-9 rounded-xl bg-white border border-slate-200 text-slate-800 flex items-center justify-center text-sm font-bold shadow-sm shrink-0">
+          {% if tp.kind == 'form' %}📝{% elif tp.kind == 'call_out' %}📞{% elif tp.kind == 'alert' %}🚨{% else %}💬{% endif %}
+        </div>
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center justify-between">
+            <p class="text-xs font-bold text-slate-900 uppercase tracking-wider">{{ tp.kind.replace('_', ' ') }}</p>
+            <span class="text-[11px] text-slate-500 font-medium">{{ tp.occurred_at.strftime('%b %d, %I:%M %p') }}</span>
+          </div>
+          <p class="text-xs text-slate-700 font-medium mt-1 leading-relaxed">{{ tp.summary }}</p>
+
+          {% if tp.payload and tp.payload.analysis %}
+          <div class="mt-3 bg-white p-3.5 rounded-xl border border-slate-200 text-xs space-y-2 text-slate-700">
+            <p><strong class="text-slate-900">Analysis Summary:</strong> {{ tp.payload.analysis.summary }}</p>
+            {% if tp.payload.analysis.configuration %}
+            <p><strong class="text-slate-900">Unit Preference:</strong> {{ tp.payload.analysis.configuration }}</p>
+            {% endif %}
+            {% if tp.payload.analysis.timeline_months %}
+            <p><strong class="text-slate-900">Expected Timeline:</strong> {{ tp.payload.analysis.timeline_months }} months</p>
+            {% endif %}
+
+            <div class="pt-2 border-t border-slate-100 flex flex-wrap items-center gap-2 text-[11px]">
+              <span class="inline-flex items-center gap-1 font-semibold text-emerald-700 bg-emerald-50 px-2.5 py-0.5 rounded-full border border-emerald-200">
+                ✓ WhatsApp Brochure Dispatched
+              </span>
+              {% if tp.payload.analysis.visit_intent in ('booked', 'requested') or 'site_visit' in tp.summary.lower() %}
+              <span class="inline-flex items-center gap-1 font-semibold text-blue-700 bg-blue-50 px-2.5 py-0.5 rounded-full border border-blue-200">
+                📅 Site Visit Confirmed
+              </span>
+              {% endif %}
+            </div>
+          </div>
+          {% endif %}
+
+          {% if tp.transcript %}
+          <details class="mt-3 group">
+            <summary class="text-xs font-bold text-slate-600 hover:text-slate-900 cursor-pointer inline-flex items-center gap-1.5 transition select-none py-1">
+              <span>💬 View Full Call Transcript</span>
+              <span class="text-[10px] text-slate-400 group-open:rotate-180 transition-transform">▼</span>
+            </summary>
+            <div class="mt-2 p-3.5 bg-slate-900 text-slate-100 rounded-xl text-xs font-mono max-h-60 overflow-y-auto border border-slate-800 shadow-inner">
+              <pre class="whitespace-pre-wrap font-sans text-xs text-slate-200 leading-relaxed">{{ tp.transcript }}</pre>
+            </div>
+          </details>
+          {% endif %}
+        </div>
+      </div>
+      {% else %}
+      <p class="text-xs text-slate-400 py-6 text-center font-medium">No touchpoints recorded for this lead yet.</p>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+{% endblock %}
