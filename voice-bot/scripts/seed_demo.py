@@ -7,7 +7,7 @@ Usage:
 """
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
 import random
 import sys
@@ -94,7 +94,7 @@ async def seed():
 
 
         # 2. Seed site visit slots for the upcoming weekend
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         # Find next Saturday
         days_ahead = 5 - now.weekday()
         if days_ahead <= 0:

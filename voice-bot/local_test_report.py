@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -287,8 +288,9 @@ def write_report(
         lines.append(_transcript_text(messages) or "(empty)")
         lines.append("```")
 
+        safe_call_id = re.sub(r"[^a-zA-Z0-9_\-]", "", str(call_id)) or "unknown"
         REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-        path = REPORTS_DIR / f"{call_id}.md"
+        path = REPORTS_DIR / f"{safe_call_id}.md"
         path.write_text("\n".join(lines), encoding="utf-8")
 
         # Convenience copy so you never have to look up the call_id at all --

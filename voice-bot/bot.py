@@ -9,7 +9,7 @@ Production voicebot orchestration with:
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import inspect
 import json
 import os
@@ -1196,10 +1196,10 @@ def _sync_working_memory(
         else:
             lead_memory["registered_name"] = registered_name
 
-    # Passively persist newly extracted slots to SQLite (0ms LLM latency, zero external APIs)
+    # Passively persist newly extracted slots via non-blocking async task (0ms audio-loop blocking)
     if stream_id and newly_extracted:
         try:
-            lead_state.record_fields(stream_id, newly_extracted)
+            asyncio.create_task(lead_state.record_fields_async(stream_id, newly_extracted))
         except Exception:
             pass
 
@@ -4782,7 +4782,7 @@ async def run_bot(
         )
 
         # Record initial call record in persistent store
-        lead_state.upsert_call(stream_id, campaign_id=campaign_id)
+        await lead_state.upsert_call_async(stream_id, campaign_id=campaign_id)
 
         supported_langs = config.get("language", {}).get("supported", ["en", "de"])
         language_state = LanguageState(
@@ -5036,7 +5036,7 @@ async def run_bot(
                     },
                 )
 
-                call_rec = lead_state.get_call(stream_id) or {}
+                call_rec = (await lead_state.get_call_async(stream_id)) or {}
                 lead_id_val = call_rec.get("lead_id")
 
                 try:
@@ -5061,7 +5061,7 @@ async def run_bot(
                             if lead_obj:
                                 lead_id_val = str(lead_obj.id)
                                 try:
-                                    lead_state.record_field(stream_id, "lead_id", lead_id_val)
+                                    await lead_state.record_field_async(stream_id, "lead_id", lead_id_val)
                                 except Exception:
                                     pass
 
@@ -5073,6 +5073,7 @@ async def run_bot(
                                 lead_id=lead_obj.id,
                                 slot_start=slot_dt,
                                 status="booked",
+                                occurred_at=datetime.now(timezone.utc),
                             )
                             session.add(sv)
                             tp = Touchpoint(
@@ -5080,7 +5081,7 @@ async def run_bot(
                                 kind="site_visit",
                                 call_id=stream_id,
                                 summary=f"Site visit booked for {date_str} at {time_str}",
-                                occurred_at=datetime.utcnow(),
+                                occurred_at=datetime.now(timezone.utc),
                             )
                             session.add(tp)
                             logger.info(f"[{stream_id}] Persisted SiteVisit for lead_id={lead_obj.id} slot={slot_dt}")
@@ -5125,7 +5126,7 @@ async def run_bot(
                     },
                 )
 
-                call_rec = lead_state.get_call(stream_id) or {}
+                call_rec = (await lead_state.get_call_async(stream_id)) or {}
                 lead_id_val = call_rec.get("lead_id")
 
                 if lead_id_val:
@@ -5141,7 +5142,7 @@ async def run_bot(
                                     kind="whatsapp_out",
                                     call_id=stream_id,
                                     summary=f"Brochure dispatched via WhatsApp. {notes}".strip(),
-                                    occurred_at=datetime.utcnow(),
+                                    occurred_at=datetime.now(timezone.utc),
                                 )
                                 session.add(tp)
                                 await queue_outbox_item(lead_obj.id, "whatsapp", {"action": "send_brochure", "notes": notes})
@@ -5180,7 +5181,7 @@ async def run_bot(
                     },
                 )
 
-                call_rec = lead_state.get_call(stream_id) or {}
+                call_rec = (await lead_state.get_call_async(stream_id)) or {}
                 lead_id_val = call_rec.get("lead_id")
 
                 if lead_id_val:
@@ -5199,7 +5200,7 @@ async def run_bot(
                                     kind="human_handoff",
                                     call_id=stream_id,
                                     summary=f"Escalated to human advisor: {reason}",
-                                    occurred_at=datetime.utcnow(),
+                                    occurred_at=datetime.now(timezone.utc),
                                 )
                                 session.add(tp)
                                 await send_telegram_alert(
@@ -5736,20 +5737,20 @@ async def run_bot(
                 call_metrics.enrich_from_transcript(transcript_to_use)
             call_metrics.finalize()
             metrics_sum = call_metrics.summary()
-            lead_state.record_call_stats(stream_id, **metrics_sum)
+            await lead_state.record_call_stats_async(stream_id, **metrics_sum)
 
         # 1. Deterministic disposition inference (<0.1ms, zero-cost, instant)
         try:
-            disposition = lead_state.infer_deterministic_disposition(
+            disposition = await lead_state.infer_deterministic_disposition_async(
                 lead_memory=current_lead_mem,
                 messages=transcript_to_use,
             )
-            lead_state.set_disposition(stream_id, disposition)
+            await lead_state.set_disposition_async(stream_id, disposition)
         except Exception as e:
             logger.warning("[{}] Failed inferring deterministic disposition: {}", stream_id, e)
 
         # 2. Finalize call in SQLite so ended_at and disposition are persisted BEFORE report generation
-        lead_state.finalize_call(stream_id)
+        await lead_state.finalize_call_async(stream_id)
 
         # 3. Immediate, deterministic local report generation: takes <1ms, $0 cost,
         # never waits on external LLMs, guaranteed to write on every call completion.

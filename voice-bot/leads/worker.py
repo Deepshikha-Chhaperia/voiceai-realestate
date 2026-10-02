@@ -2,21 +2,22 @@
 Background worker (arq / Redis) for Speed-to-Lead execution, call analysis, scoring, and retries.
 """
 
-from datetime import datetime, time as dt_time, timedelta
+from datetime import datetime, time as dt_time, timedelta, timezone
 import json
 import os
+import re
 import uuid
 from typing import Any
 import zoneinfo
 
-from arq import create_pool
+from arq import create_pool, cron
 from arq.connections import RedisSettings
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from leads.db import get_session
-from leads.models import Lead, SiteVisit, Touchpoint
+from leads.models import DoNotCall, Lead, SiteVisit, Touchpoint
 from leads.notify import send_telegram_alert
 from leads.outbox import drain_outbox, queue_outbox_item
 from leads.scoring import score
@@ -28,48 +29,75 @@ def get_redis_settings() -> RedisSettings:
 
 
 def _resolve_visit_datetime(date_str: str | None, time_str: str | None) -> datetime:
-    """Helper to convert spoken day/time into a realistic upcoming datetime slot."""
-    now = datetime.utcnow()
+    """Helper to convert spoken day/time into a realistic upcoming datetime slot (IST-aware)."""
+    try:
+        tz_ist = zoneinfo.ZoneInfo("Asia/Kolkata")
+    except Exception:
+        tz_ist = zoneinfo.ZoneInfo("UTC")
+    now_ist = datetime.now(tz_ist)
     date_val = str(date_str or "").strip().lower()
     time_val = str(time_str or "").strip().lower()
 
-    # Determine hour and minute
+    # Determine hour and minute using token regex matching
     hour = 14  # Default 2:00 PM
     minute = 0
-    if "10" in time_val:
-        hour = 10
-    elif "11" in time_val:
-        hour = 11
-    elif "12" in time_val:
-        hour = 12
-    elif "1" in time_val and "pm" in time_val:
-        hour = 13
-    elif "2" in time_val or "14" in time_val:
-        hour = 14
-    elif "3" in time_val:
-        hour = 15
-    elif "4" in time_val:
-        hour = 16
-    elif "5" in time_val:
-        hour = 17
 
-    # Determine day
+    time_match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", time_val)
+    if time_match:
+        h = int(time_match.group(1))
+        m = int(time_match.group(2) or 0)
+        ampm = (time_match.group(3) or "").lower()
+        if ampm == "pm" and h < 12:
+            h += 12
+        elif ampm == "am" and h == 12:
+            h = 0
+        elif not ampm:
+            # 1 to 6 without am/pm are usually afternoon site visits in real estate
+            if 1 <= h <= 6:
+                h += 12
+        if 0 <= h <= 23:
+            hour = h
+            minute = m
+
+    # Determine day using whole-word matching
     days_ahead = 2
     weekday_map = {
         "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
         "friday": 4, "saturday": 5, "sunday": 6
     }
+    found_weekday = False
     for day_name, day_idx in weekday_map.items():
-        if day_name in date_val:
-            days_ahead = (day_idx - now.weekday()) % 7
+        if re.search(r"\b" + day_name + r"\b", date_val):
+            days_ahead = (day_idx - now_ist.weekday()) % 7
             if days_ahead == 0:
                 days_ahead = 7
+            found_weekday = True
             break
-    if "tomorrow" in date_val:
-        days_ahead = 1
 
-    target = now + timedelta(days=days_ahead)
+    if not found_weekday:
+        if re.search(r"\btomorrow\b", date_val):
+            days_ahead = 1
+        elif re.search(r"\btoday\b", date_val):
+            days_ahead = 0
+
+    target = now_ist + timedelta(days=days_ahead)
     return target.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def get_next_calling_window_start(tz_name: str = "Asia/Kolkata", start_str: str = "09:00") -> datetime:
+    """Returns UTC datetime for the next start of legal calling hours."""
+    try:
+        tz = zoneinfo.ZoneInfo(tz_name)
+    except Exception:
+        tz = zoneinfo.ZoneInfo("Asia/Kolkata")
+    now_local = datetime.now(tz)
+    s_h, s_m = map(int, start_str.split(":"))
+    today_start = now_local.replace(hour=s_h, minute=s_m, second=0, microsecond=0)
+    if now_local < today_start:
+        target = today_start
+    else:
+        target = today_start + timedelta(days=1)
+    return target.astimezone(timezone.utc)
 
 
 _arq_pool = None
@@ -138,26 +166,39 @@ async def process_new_lead(ctx: dict, lead_id: str) -> None:
 
         if not is_within_calling_hours(tz_name, calling_hours.get("start", "09:00"), calling_hours.get("end", "21:00")):
             logger.info("Outside calling hours ({}) for lead_id={}; scheduling for next morning", tz_name, lead_id)
-            # Schedule next attempt at 09:00 next day
-            now = datetime.utcnow()
-            lead.next_attempt_at = now + timedelta(hours=10)
+            lead.next_attempt_at = get_next_calling_window_start(tz_name, calling_hours.get("start", "09:00"))
             return
 
         # Start outbound call via extracted function in main.py
-        from main import start_outbound_call
+        from main import initiate_outbound_call
         campaign = lead.campaign_id or (lead.project.name if lead.project else "web-test")
-        
+
         try:
-            call_res = await start_outbound_call(
+            call_res = await initiate_outbound_call(
                 to_phone=lead.phone,
                 customer_name=lead.name or "Alex",
                 campaign_id=campaign,
                 lead_id=str(lead.id),
             )
+            if call_res.get("status") == "blocked":
+                reason = call_res.get("reason")
+                logger.info("Outbound call blocked for lead_id={}: {}", lead.id, reason)
+                if reason == "do_not_call":
+                    lead.status = "dead"
+                    lead.score_reason = "Do Not Call list"
+                    lead.next_attempt_at = None
+                elif reason == "outside_calling_hours":
+                    lead.next_attempt_at = get_next_calling_window_start(tz_name, calling_hours.get("start", "09:00"))
+                return
+            if call_res.get("simulated"):
+                raise RuntimeError(
+                    f"Outbound call for lead_id={lead.id} ({lead.phone}) was simulated. Vobiz telephony credentials are not configured!"
+                )
             call_id = call_res.get("call_id")
             lead.status = "contacting"
             lead.attempts += 1
-            lead.last_touch_at = datetime.utcnow()
+            now_utc = datetime.now(timezone.utc)
+            lead.last_touch_at = now_utc
 
             tp = Touchpoint(
                 lead_id=lead.id,
@@ -165,12 +206,13 @@ async def process_new_lead(ctx: dict, lead_id: str) -> None:
                 call_id=call_id,
                 summary=f"Outbound AI call initiated (attempt {lead.attempts})",
                 payload={"call_res": call_res},
-                occurred_at=datetime.utcnow(),
+                occurred_at=now_utc,
             )
             session.add(tp)
             logger.info("Outbound call triggered for lead_id={} call_id={}", lead.id, call_id)
         except Exception as exc:
             logger.error("Failed to start outbound call for lead_id={}: {}", lead.id, exc)
+            raise
 
 
 async def on_call_finished(ctx: dict, call_id: str) -> None:
@@ -248,12 +290,24 @@ async def on_call_finished(ctx: dict, call_id: str) -> None:
         lead.tier = lead_tier
         lead.score_reason = score_reason
         lead.visit_genuine = visit_genuine
-        lead.last_touch_at = datetime.utcnow()
+        lead.last_touch_at = datetime.now(timezone.utc)
 
         turns = int(call_stats.get("turns", 0))
         if turns >= 1:
-            lead.first_contact_at = lead.first_contact_at or datetime.utcnow()
+            lead.first_contact_at = lead.first_contact_at or datetime.now(timezone.utc)
             lead.status = "conversed"
+
+        # Check if DNC requested
+        if disposition == "DNC_REQUESTED":
+            lead.status = "dead"
+            lead.score_reason = "Caller requested DNC"
+            lead.next_attempt_at = None
+            if lead.phone:
+                stmt_dnc = select(DoNotCall).where(DoNotCall.phone == lead.phone).limit(1)
+                res_dnc = await session.execute(stmt_dnc)
+                if not res_dnc.scalar_one_or_none():
+                    session.add(DoNotCall(phone=lead.phone, reason="Caller requested DNC during call"))
+                    logger.info("Added {} to DoNotCall list", lead.phone)
 
         # Check if site visit is booked
         stmt_v = select(SiteVisit).where(SiteVisit.lead_id == lead.id).limit(1)
@@ -289,24 +343,41 @@ async def on_call_finished(ctx: dict, call_id: str) -> None:
         # DEMO_FAST_RETRY=true: 1 min / 2 min (demo only, never default)
         # Default (false): 30 min / 3 hr / 24 hr
         fast_retry = os.getenv("DEMO_FAST_RETRY", "false").lower() == "true"
-        now = datetime.utcnow()
+        now_utc = datetime.now(timezone.utc)
         if disposition in ("NO_RESPONSE", "INCOMPLETE") or turns == 0:
-            if lead.attempts < 4:
+            if lead.attempts < 4 and lead.status != "dead":
                 if fast_retry:
                     delay_mins = 1 if lead.attempts == 1 else 2
                 else:
                     delays = {1: 30, 2: 180, 3: 1440}
                     delay_mins = delays.get(lead.attempts, 60)
-                lead.next_attempt_at = now + timedelta(minutes=delay_mins)
+                scheduled_retry = now_utc + timedelta(minutes=delay_mins)
+
+                # Calling-hours check (IST): if retry lands outside calling hours, schedule for 09:00 IST next day
+                project_config = (lead.project.config if lead.project else {}) or {}
+                tz_name = project_config.get("timezone", "Asia/Kolkata")
+                calling_hours = project_config.get("calling_hours", {"start": "09:00", "end": "21:00"})
+                try:
+                    tz_lead = zoneinfo.ZoneInfo(tz_name)
+                except Exception:
+                    tz_lead = zoneinfo.ZoneInfo("Asia/Kolkata")
+                scheduled_local = scheduled_retry.astimezone(tz_lead)
+                s_h, s_m = map(int, calling_hours.get("start", "09:00").split(":"))
+                e_h, e_m = map(int, calling_hours.get("end", "21:00").split(":"))
+                if not (dt_time(s_h, s_m) <= scheduled_local.time() <= dt_time(e_h, e_m)):
+                    scheduled_retry = get_next_calling_window_start(tz_name, calling_hours.get("start", "09:00"))
+
+                lead.next_attempt_at = scheduled_retry
                 logger.info(
-                    "Scheduled call retry for lead_id={} attempt {} at +{} mins",
+                    "Scheduled call retry for lead_id={} attempt {} at {}",
                     lead.id,
                     lead.attempts + 1,
-                    delay_mins,
+                    scheduled_retry,
                 )
             else:
                 lead.next_attempt_at = None
-                lead.score_reason = f"No answer after {lead.attempts} attempts"
+                if lead.status != "dead":
+                    lead.score_reason = f"No answer after {lead.attempts} attempts"
 
         # Add call touchpoint
         tp = Touchpoint(
@@ -315,7 +386,7 @@ async def on_call_finished(ctx: dict, call_id: str) -> None:
             call_id=call_id,
             summary=f"Call completed ({disposition}) - Tier: {lead_tier.upper()} ({score_reason})",
             payload=analysis_data,
-            occurred_at=now,
+            occurred_at=now_utc,
         )
         session.add(tp)
 
@@ -351,8 +422,35 @@ async def on_call_finished(ctx: dict, call_id: str) -> None:
         logger.warning("Drain outbox error: {}", exc)
 
 
+async def requeue_due_leads(ctx: dict) -> int:
+    """Cron task: scans for due leads with next_attempt_at <= now and enqueues them."""
+    now_utc = datetime.now(timezone.utc)
+    count = 0
+    async with get_session() as session:
+        stmt = (
+            select(Lead)
+            .where(
+                Lead.status.in_(["pending", "contacting", "new", "conversed"]),
+                Lead.next_attempt_at != None,  # noqa: E711
+                Lead.next_attempt_at <= now_utc,
+                Lead.attempts < 4,
+            )
+            .options(selectinload(Lead.project))
+        )
+        res = await session.execute(stmt)
+        due_leads = res.scalars().all()
+        for lead in due_leads:
+            lead.next_attempt_at = None
+            await enqueue_process_new_lead(str(lead.id))
+            count += 1
+    if count > 0:
+        logger.info("Cron re-queued {} due leads for retry", count)
+    return count
+
+
 class WorkerSettings:
-    functions = [process_new_lead, on_call_finished]
+    functions = [process_new_lead, on_call_finished, requeue_due_leads]
+    cron_jobs = [cron(requeue_due_leads, minute=None, second=0)]
     redis_settings = get_redis_settings()
     on_startup = None
     on_shutdown = None

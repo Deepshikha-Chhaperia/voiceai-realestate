@@ -6,7 +6,7 @@ dedupes against existing leads by (phone, project_id) or (source, external_id),
 and enqueues background processing.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 import re
 import uuid
 from typing import Any
@@ -115,7 +115,7 @@ async def ingest_lead(data: LeadIn) -> Lead:
         res = await session.execute(stmt)
         existing_lead = res.scalar_one_or_none()
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         if existing_lead:
             # Attach new touchpoint to existing lead
             tp = Touchpoint(

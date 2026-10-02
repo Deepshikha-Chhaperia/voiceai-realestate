@@ -39,7 +39,10 @@ async def send_telegram_alert(
     """Dispatches a structured alert message to the sales team's Telegram chat."""
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    base_url = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
+    base_url = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if not base_url:
+        public_host = os.getenv("PUBLIC_HOST", "").strip()
+        base_url = f"https://{public_host}" if public_host else "http://localhost:8000"
 
     display_name = name or "Lead"
     masked = mask_phone(phone)

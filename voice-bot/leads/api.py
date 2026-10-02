@@ -1,11 +1,11 @@
 """
-FastAPI router for lead capture webhooks (Website, Meta Lead Ads, Manual, LP).
+FastAPI router for lead capture webhooks (Website, Meta Lead Ads, LP).
 """
 
 import hashlib
 import hmac
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
@@ -34,7 +34,10 @@ async def website_webhook(
 ):
     """Website form lead capture."""
     expected = os.getenv("WEBSITE_WEBHOOK_SECRET")
-    if expected and not hmac.compare_digest(x_webhook_secret or "", expected):
+    if not expected:
+        if os.getenv("LOCAL_DEV", "").lower() != "true":
+            raise HTTPException(status_code=500, detail="Server misconfiguration: WEBSITE_WEBHOOK_SECRET not set")
+    elif not hmac.compare_digest(x_webhook_secret or "", expected):
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
     if not body.consent:
         raise HTTPException(status_code=400, detail="Consent is mandatory")
@@ -277,8 +280,14 @@ async def meta_lead_webhook(
     raw_body = await request.body()
     app_secret = os.getenv("META_APP_SECRET")
 
-    # Verify signature when secret is configured — header is mandatory, not optional
-    if app_secret:
+    # Verify signature — mandatory in all environments unless LOCAL_DEV=true
+    if not app_secret:
+        if os.getenv("LOCAL_DEV", "").lower() != "true":
+            raise HTTPException(
+                status_code=500, detail="Server misconfiguration: META_APP_SECRET not set"
+            )
+        logger.debug("META_APP_SECRET not set; skipping signature verification (LOCAL_DEV mode)")
+    else:
         if not x_hub_signature_256:
             raise HTTPException(status_code=401, detail="Missing X-Hub-Signature-256 header")
         expected_sig = "sha256=" + hmac.new(
@@ -287,8 +296,6 @@ async def meta_lead_webhook(
         if not hmac.compare_digest(x_hub_signature_256, expected_sig):
             logger.warning("Invalid Meta webhook signature")
             raise HTTPException(status_code=401, detail="Invalid signature")
-    else:
-        logger.debug("META_APP_SECRET not set; skipping signature verification (demo mode)")
 
     data = await request.json()
     entries = data.get("entry", [])
@@ -325,7 +332,7 @@ async def meta_lead_webhook(
                 name=name,
                 phone=phone,
                 source="meta",
-                external_id=leadgen_id or f"meta-{int(datetime.utcnow().timestamp())}",
+                external_id=leadgen_id or f"meta-{int(datetime.now(timezone.utc).timestamp())}",
                 campaign_id=campaign_id,
                 adset_id=adset_id,
                 ad_id=ad_id,
@@ -337,8 +344,3 @@ async def meta_lead_webhook(
     return {"status": "ok", "ingested": ingested_leads}
 
 
-@router.post("/webhooks/manual")
-async def manual_lead_webhook(body: LeadIn):
-    """Simulator/Manual lead ingestion endpoint."""
-    lead = await ingest_lead(body)
-    return {"status": "ok", "lead_id": str(lead.id), "phone": lead.phone, "tier": lead.tier}

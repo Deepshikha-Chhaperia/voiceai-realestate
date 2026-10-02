@@ -29,7 +29,11 @@ def verify_dashboard_auth(
     """Verifies dashboard access key with secure constant-time comparison."""
     expected_key = os.getenv("DASHBOARD_API_KEY", "").strip()
     if not expected_key:
-        return True  # Open access in local dev if no key configured
+        if os.getenv("LOCAL_DEV", "").lower() == "true":
+            return True  # Open access explicitly allowed in local dev
+        raise HTTPException(
+            status_code=500, detail="Server misconfiguration: DASHBOARD_API_KEY not set"
+        )
 
     provided_key = dashboard_key_cookie or ""
     if not provided_key and authorization:

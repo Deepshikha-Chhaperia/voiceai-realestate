@@ -4,7 +4,7 @@ Outbox Worker for CRM and Google Sheets Synchronization.
 Drains outbox table items with exponential backoff and error tracking.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
 from typing import Any
 
@@ -22,6 +22,7 @@ async def queue_outbox_item(
     session: Any = None,
 ) -> OutboxItem:
     """Inserts a new pending outbox item."""
+    now = datetime.now(timezone.utc)
     if session is not None:
         item = OutboxItem(
             lead_id=lead_id,
@@ -29,7 +30,7 @@ async def queue_outbox_item(
             payload=payload,
             status="pending",
             attempts=0,
-            created_at=datetime.utcnow(),
+            created_at=now,
         )
         session.add(item)
         return item
@@ -41,7 +42,7 @@ async def queue_outbox_item(
             payload=payload,
             status="pending",
             attempts=0,
-            created_at=datetime.utcnow(),
+            created_at=now,
         )
         sess.add(item)
         await sess.flush()
@@ -50,7 +51,7 @@ async def queue_outbox_item(
 
 async def drain_outbox() -> int:
     """Processes pending outbox items."""
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     processed_count = 0
 
     async with get_session() as session:
