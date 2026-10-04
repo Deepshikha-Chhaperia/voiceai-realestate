@@ -21,11 +21,11 @@ from leads.models import DoNotCall, Lead, SiteVisit, Touchpoint
 from leads.notify import send_telegram_alert
 from leads.outbox import drain_outbox, queue_outbox_item
 from leads.scoring import score
+from settings import is_local_demo
 
 
 def get_redis_settings() -> RedisSettings:
-    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    return RedisSettings.from_dsn(redis_url)
+    return RedisSettings.from_dsn(os.environ["REDIS_URL"])
 
 
 def _resolve_visit_datetime(date_str: str | None, time_str: str | None) -> datetime:
@@ -105,14 +105,13 @@ _arq_pool = None
 
 async def get_arq_pool():
     global _arq_pool
-    if _arq_pool is None:
+    if _arq_pool is None and os.getenv("REDIS_URL"):
         try:
             _arq_pool = await create_pool(get_redis_settings())
         except Exception as exc:
-            env = os.getenv("ENV", "dev")
-            if env == "prod":
-                raise RuntimeError(f"Could not connect to Redis in prod: {exc}")
-            logger.warning("Could not connect to Redis arq pool in dev mode ({}); worker jobs will run synchronously.", exc)
+            if not is_local_demo():
+                raise RuntimeError(f"REDIS_URL is set but Redis is unreachable: {exc}")
+            logger.warning("Redis arq pool unreachable ({}); LOCAL_DEMO runs worker jobs synchronously.", exc)
     return _arq_pool
 
 
@@ -451,7 +450,7 @@ async def requeue_due_leads(ctx: dict) -> int:
 class WorkerSettings:
     functions = [process_new_lead, on_call_finished, requeue_due_leads]
     cron_jobs = [cron(requeue_due_leads, minute=None, second=0)]
-    redis_settings = get_redis_settings()
+    redis_settings = get_redis_settings() if os.getenv("REDIS_URL") else None  # arq worker process requires REDIS_URL
     on_startup = None
     on_shutdown = None
     max_jobs = 20

@@ -21,20 +21,9 @@ from leads.models import Base
 def get_database_url() -> str:
     url = os.getenv("DATABASE_URL")
     if not url:
-        env = os.getenv("ENV", "dev")
-        if env == "prod":
-            pg_user = os.getenv("POSTGRES_USER", "voicebot")
-            pg_pass = os.getenv("POSTGRES_PASSWORD", "")
-            pg_host = os.getenv("POSTGRES_HOST", "postgres")
-            pg_port = os.getenv("POSTGRES_PORT", "5432")
-            pg_db = os.getenv("POSTGRES_DB", "voicebot_leads")
-            url = f"postgresql+asyncpg://{pg_user}:{pg_pass}@{pg_host}:{pg_port}/{pg_db}"
-        else:
-            # Zero-config SQLite default in dev mode
-            db_dir = Path(__file__).parent.parent / "outputs"
-            db_dir.mkdir(parents=True, exist_ok=True)
-            db_file = db_dir / "leads.db"
-            return f"sqlite+aiosqlite:///{db_file.as_posix()}"
+        db_dir = Path(os.getenv("DATA_DIR", "outputs")).resolve()
+        db_dir.mkdir(parents=True, exist_ok=True)
+        return f"sqlite+aiosqlite:///{(db_dir / 'leads.db').as_posix()}"
 
     # Normalize postgres URL schemes
     if url.startswith("postgres://"):

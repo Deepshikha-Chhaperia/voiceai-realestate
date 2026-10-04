@@ -12,10 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-
-RUN mkdir -p outputs
-
-
+ENV HOST=0.0.0.0
 ENV PORT=8000
 EXPOSE 8000
 

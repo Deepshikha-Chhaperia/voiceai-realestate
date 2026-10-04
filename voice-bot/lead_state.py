@@ -20,10 +20,9 @@ from typing import Any, Iterator
 
 from loguru import logger
 
-_DEFAULT_DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs", "calls.db")
-_raw_db_path = os.getenv("LEAD_DB_PATH", _DEFAULT_DB_FILE)
-DB_PATH = _raw_db_path if os.path.isabs(_raw_db_path) else os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), _raw_db_path))
-DATABASE_URL = os.getenv("DATABASE_URL")  # e.g. postgresql://user:pass@host:5432/db
+DB_PATH = os.path.join(os.path.abspath(os.getenv("DATA_DIR", "outputs")), "calls.db")
+# psycopg doesn't understand SQLAlchemy driver suffixes (postgresql+asyncpg://)
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").replace("+asyncpg", "", 1).replace("+psycopg", "", 1) or None  # e.g. postgresql://user:pass@host:5432/db
 
 _BACKEND = "sqlite"
 if DATABASE_URL:

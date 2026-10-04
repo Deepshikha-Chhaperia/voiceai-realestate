@@ -1,10 +1,13 @@
 import asyncio
+import base64
+import hashlib
 import hmac
 import json
 import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
+from urllib.parse import quote
 
 import httpx
 from loguru import logger
@@ -15,12 +18,13 @@ from fastapi import FastAPI, Header, HTTPException, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
 from bot import run_bot, warmup_providers
 import lead_state
-import leads.api
 import leads.dashboard
 import leads.db
+from settings import is_local_demo, safe_eq, validate_startup
 
 class CallManager:
     """
@@ -32,19 +36,19 @@ class CallManager:
         self.redis: redis.Redis | None = None
         self.memory: dict[str, dict] = {}
     
-    async def connect(self, url: str = "redis://localhost"):
+    async def connect(self, url: str | None = None):
+        if not url:
+            logger.info("REDIS_URL not set; using IN-MEMORY call storage.")
+            return
         try:
             client = redis.from_url(url, decode_responses=True)
             await client.ping()
             self.redis = client
-            logger.info(f"Connected to Redis at {url}")
+            logger.info("Connected to Redis")
         except Exception as e:
-            self.redis = None
-            env = os.getenv("ENV", "dev")
-            if env == "prod":
-                logger.error(f"Redis connection failed in prod: {e}")
-                raise RuntimeError(f"Redis is required in prod: {e}")
-            logger.warning(f"Redis connection failed ({e}). using IN-MEMORY storage.")
+            if not is_local_demo():
+                raise RuntimeError(f"REDIS_URL is set but Redis is unreachable: {e}")
+            logger.warning(f"Redis unreachable ({e}); LOCAL_DEMO falling back to IN-MEMORY storage.")
 
     async def get(self, call_id: str) -> dict | None:
         if self.redis:
@@ -101,28 +105,8 @@ async def lifespan(app: FastAPI):
     """
     global CONFIG
 
-    is_prod = os.getenv("ENV", "prod").lower() == "prod"
-    is_local_dev = os.getenv("LOCAL_DEV", "").lower() == "true"
-
-    if is_prod or not is_local_dev:
-        missing = []
-        if not os.getenv("META_APP_SECRET"):
-            missing.append("META_APP_SECRET (required to verify Meta webhook signatures)")
-        if not os.getenv("DASHBOARD_API_KEY") and not is_local_dev:
-            missing.append("DASHBOARD_API_KEY (set LOCAL_DEV=true to allow open access in dev)")
-        if not os.getenv("WS_TOKEN"):
-            missing.append("WS_TOKEN (required to authenticate WebSocket /ws connections)")
-        if not os.getenv("WEBSITE_WEBHOOK_SECRET"):
-            missing.append("WEBSITE_WEBHOOK_SECRET (required to authenticate website webhook requests)")
-        if not os.getenv("PUBLIC_HOST"):
-            missing.append("PUBLIC_HOST (required to construct trusted telephony stream and callback URLs)")
-        if missing:
-            for m in missing:
-                logger.critical("Missing required env var: {}", m)
-            raise RuntimeError(
-                "Server refused to start: missing required env vars.\n"
-                + "\n".join(f"  - {m}" for m in missing)
-            )
+    validate_startup()
+    os.makedirs(os.getenv("DATA_DIR", "outputs"), exist_ok=True)
 
     market = os.getenv("MARKET", "india").lower()
     logger.info(f"Initializing voice bot services for market: {market}...")
@@ -147,9 +131,8 @@ async def lifespan(app: FastAPI):
         CONFIG = base_config
         logger.info("Loaded default config.yaml")
 
-    # Initialize Redis (or fallback)
-    redis_url = os.getenv("REDIS_URL", "redis://localhost")
-    await CALL_MANAGER.connect(redis_url)
+    # Redis only when REDIS_URL is set (otherwise in-memory)
+    await CALL_MANAGER.connect(os.getenv("REDIS_URL"))
 
     # Durable call-record store (SQLite fallback for legacy calls)
     lead_state.init_db()
@@ -196,7 +179,7 @@ app = FastAPI(title="Plug-and-Play Voice Bot", lifespan=lifespan)
 dashboard_origin = os.getenv("DASHBOARD_ORIGIN", "").strip()
 if dashboard_origin:
     allowed_origins = [o.strip() for o in dashboard_origin.split(",") if o.strip()]
-elif os.getenv("LOCAL_DEV", "").lower() == "true":
+elif is_local_demo():
     allowed_origins = ["http://localhost:3000", "http://localhost:8000"]
 else:
     allowed_origins = []
@@ -209,38 +192,44 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include Leads Webhooks and Dashboard routers
-app.include_router(leads.api.router)
 app.include_router(leads.dashboard.router)
 
 
-def _build_ws_url(request: Request, path: str = "/ws") -> str:
-    """Build a fully-qualified WebSocket URL for Vobiz stream callbacks.
+def _tls() -> bool:
+    return os.getenv("FORCE_WSS", "").lower() == "true"
 
-    Priority order for host:
-      1. PUBLIC_HOST env var  (required in prod; avoids trusting Host header)
-      2. request host header  (dev fallback only)
 
-    Priority order for scheme:
-      1. FORCE_WSS=true env var  (for TLS-terminated reverse proxies)
-      2. X-Forwarded-Proto header set to 'https'
-      3. request.url.scheme
+def _build_ws_url(path: str = "/ws") -> str:
+    """Stream URL for Vobiz. Host is always PUBLIC_HOST (never the Host header); wss iff FORCE_WSS."""
+    sep = "&" if "?" in path else "?"
+    return f"{'wss' if _tls() else 'ws'}://{os.getenv('PUBLIC_HOST')}{path}{sep}token={os.getenv('WS_TOKEN')}"
+
+
+def _verify_vobiz_signature(request: Request) -> None:
+    """Verify Vobiz's HMAC-SHA256 webhook signature (key = VOBIZ_AUTH_TOKEN, base64 over URL + nonce).
+
+    V2 signs url+nonce, V3 signs url+"."+nonce. UNCONFIRMED: whether the signed URL includes the
+    query string and whether V3 is base64 - both are accepted; confirm with one real call, then
+    narrow this. Set VERIFY_VOBIZ_SIGNATURE=false only to debug that first call.
     """
-    host = os.getenv("PUBLIC_HOST")
-    if not host:
-        if os.getenv("LOCAL_DEV", "").lower() == "true":
-            host = request.headers.get("host", "localhost:8000")
-        else:
-            host = "localhost:8000"
-    force_wss = os.getenv("FORCE_WSS", "").lower() == "true"
-    forwarded_proto = request.headers.get("x-forwarded-proto", "")
-    is_tls = force_wss or forwarded_proto == "https" or request.url.scheme == "https"
-    scheme = "wss" if is_tls else "ws"
-    ws_token = os.getenv("WS_TOKEN", "")
-    if ws_token:
-        sep = "&" if "?" in path else "?"
-        return f"{scheme}://{host}{path}{sep}token={ws_token}"
-    return f"{scheme}://{host}{path}"
+    if os.getenv("VERIFY_VOBIZ_SIGNATURE", "true").lower() != "true":
+        return
+    if is_local_demo():
+        logger.warning("LOCAL_DEMO: skipping Vobiz signature verification")
+        return
+    token = os.getenv("VOBIZ_AUTH_TOKEN", "")
+    if not token:
+        raise HTTPException(500, "Server misconfiguration: VOBIZ_AUTH_TOKEN not set")
+    base = f"{'https' if _tls() else 'http'}://{os.getenv('PUBLIC_HOST')}{request.url.path}"
+    urls = (base, f"{base}?{request.url.query}") if request.url.query else (base,)
+    for version, sep in (("v2", ""), ("v3", ".")):
+        sig = request.headers.get(f"x-vobiz-signature-{version}", "")
+        nonce = request.headers.get(f"x-vobiz-signature-{version}-nonce", "")
+        for url in urls if sig and nonce else ():
+            digest = hmac.new(token.encode(), f"{url}{sep}{nonce}".encode(), hashlib.sha256).digest()
+            if safe_eq(sig, base64.b64encode(digest).decode()):
+                return
+    raise HTTPException(401, "Invalid or missing Vobiz signature")
 
 
 # INBOUND CALL HANDLER
@@ -253,7 +242,8 @@ async def handle_inbound_call(request: Request):
     The audio format is µ-law at 8kHz — the standard for telephone networks.
     VobizFrameSerializer handles the conversion to PCM that Pipecat expects.
     """
-    stream_url = _build_ws_url(request, "/ws")
+    _verify_vobiz_signature(request)
+    stream_url = _build_ws_url("/ws")
 
     # Instruct Vobiz to open a bidirectional 8kHz µ-law audio stream
     vxml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -261,7 +251,7 @@ async def handle_inbound_call(request: Request):
     <Stream bidirectional="true" audioTrack="inbound" contentType="audio/x-mulaw;rate=8000" keepCallAlive="true">{stream_url}</Stream>
 </Response>"""
 
-    logger.info(f"Inbound call directed to {stream_url}")
+    logger.info(f"Inbound call directed to stream host {os.getenv('PUBLIC_HOST')}")
     return Response(content=vxml, media_type="application/xml")
 
 
@@ -284,19 +274,16 @@ async def initiate_outbound_call(
         logger.warning(f"Outbound call to {to_phone} blocked: outside legal calling hours (09:00-21:00 IST)")
         return {"status": "blocked", "reason": "outside_calling_hours", "phone": to_phone}
 
-    # 2. Do-Not-Call (DNC) check
-    try:
-        from leads.db import get_session
-        from leads.models import DoNotCall
-        from sqlalchemy import select
-        async with get_session() as session:
-            stmt = select(DoNotCall).where(DoNotCall.phone == to_phone).limit(1)
-            res = await session.execute(stmt)
-            if res.scalar_one_or_none():
-                logger.warning(f"Outbound call to {to_phone} blocked: number is on Do-Not-Call list")
-                return {"status": "blocked", "reason": "do_not_call", "phone": to_phone}
-    except Exception as exc:
-        logger.debug(f"DNC check warning: {exc}")
+    # 2. Do-Not-Call (DNC) check - fails closed: a lookup error aborts the call
+    from leads.db import get_session
+    from leads.models import DoNotCall
+    from sqlalchemy import select
+    async with get_session() as session:
+        stmt = select(DoNotCall).where(DoNotCall.phone == to_phone).limit(1)
+        res = await session.execute(stmt)
+        if res.scalar_one_or_none():
+            logger.warning(f"Outbound call to {to_phone} blocked: number is on Do-Not-Call list")
+            return {"status": "blocked", "reason": "do_not_call", "phone": to_phone}
 
     call_id = str(uuid.uuid4())
     camp_id = campaign_id or f"uncategorized-{datetime.now().strftime('%Y-%m-%d')}"
@@ -366,6 +353,33 @@ async def initiate_outbound_call(
             raise HTTPException(500, "Failed to initiate outbound call. Check server logs.")
 
 
+class OutboundCallRequest(BaseModel):
+    to: str = Field(pattern=r"^\+[1-9]\d{1,14}$")  # E.164
+    customer_name: str = "there"
+    campaign_prompt: str | None = None
+    greeting: str | None = None
+    campaign_id: str | None = None
+    lead_id: str | None = None
+
+
+@app.post("/outbound")
+async def start_outbound_call(body: OutboundCallRequest, x_api_key: str | None = Header(None)):
+    """Initiate an outbound call. Fails closed: OUTBOUND_API_KEY must be set and match."""
+    required_key = os.getenv("OUTBOUND_API_KEY", "")
+    if not required_key:
+        raise HTTPException(500, "Server misconfiguration: OUTBOUND_API_KEY not set")
+    if not safe_eq(x_api_key or "", required_key):
+        raise HTTPException(401, "Invalid API Key")
+    return await initiate_outbound_call(
+        to_phone=body.to,
+        customer_name=body.customer_name,
+        campaign_id=body.campaign_id,
+        campaign_prompt=body.campaign_prompt,
+        greeting=body.greeting,
+        lead_id=body.lead_id,
+    )
+
+
 # OUTBOUND ANSWER CALLBACK
 @app.post("/outbound-answer")
 async def handle_outbound_answer(request: Request):
@@ -374,15 +388,16 @@ async def handle_outbound_answer(request: Request):
     Returns VXML directing Vobiz to open a bidirectional audio stream to /ws.
     The ?type=outbound query param tells the bot to use the outbound greeting.
     """
-    call_id = request.query_params.get("call_id", "")
-    stream_url = _build_ws_url(request, f"/ws?type=outbound&call_id={call_id}")
+    _verify_vobiz_signature(request)
+    call_id = quote(request.query_params.get("call_id", ""), safe="")
+    stream_url = _build_ws_url(f"/ws?type=outbound&call_id={call_id}")
 
     vxml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Stream bidirectional="true" audioTrack="inbound" contentType="audio/x-mulaw;rate=8000" keepCallAlive="true">{stream_url}</Stream>
 </Response>"""
 
-    logger.info(f"Outbound call answered, directed to {stream_url}")
+    logger.info(f"Outbound call answered (call_id={call_id}), directed to stream host {os.getenv('PUBLIC_HOST')}")
     return Response(content=vxml, media_type="application/xml")
 
 # WEBSOCKET (audio pipeline)
@@ -401,14 +416,13 @@ async def websocket_endpoint(websocket: WebSocket):
     The call is wrapped in asyncio.wait_for() to enforce a maximum duration.
     This prevents stuck WebSocket connections from consuming resources.
     """
-    ws_token = os.getenv("WS_TOKEN")
-    if ws_token:
-        provided = websocket.query_params.get("token") or (
-            websocket.headers.get("authorization", "").removeprefix("Bearer ").strip()
-        )
-        if not hmac.compare_digest(provided, ws_token):
-            await websocket.close(code=4403)
-            return
+    ws_token = os.getenv("WS_TOKEN", "")
+    provided = websocket.query_params.get("token") or (
+        websocket.headers.get("authorization", "").removeprefix("Bearer ").strip()
+    )
+    if not ws_token or not safe_eq(provided, ws_token):
+        await websocket.close(code=4403)
+        return
 
     await websocket.accept()
     logger.info("WebSocket accepted")
@@ -472,14 +486,14 @@ async def websocket_endpoint(websocket: WebSocket):
         get_call_semaphore().release()
         logger.info(f"[{stream_id}] WebSocket closed ({call_type})")
 
-# WEB BROWSER WEBSOCKET ENDPOINT — local dev only
-if os.getenv("LOCAL_DEV", "").lower() == "true":
+# WEB BROWSER WEBSOCKET ENDPOINT — local demo only
+if is_local_demo():
     @app.websocket("/ws-web")
     async def websocket_web_endpoint(websocket: WebSocket):
         """
         WebSocket endpoint strictly for local testing from the browser using standard PCM audio.
         Bypasses Vobiz frame formatting and expects 16kHz PCM.
-        Only available when LOCAL_DEV=true.
+        Only available when LOCAL_DEMO=1 (loopback only).
         """
         await websocket.accept()
         logger.info("WebSocket accepted for WEB client")
@@ -537,16 +551,7 @@ if os.getenv("LOCAL_DEV", "").lower() == "true":
 # HEALTH CHECK
 @app.get("/health")
 async def health():
-    # Health check endpoint reports which services are configured
-    active = CONFIG.get("active_providers", {})
-    semaphore = get_call_semaphore()
-    active_calls = MAX_CONCURRENT_CALLS - semaphore._value
-    return {
-        "status": "healthy",
-        "configured_services": active,
-        "active_calls": active_calls,
-        "max_concurrent_calls": MAX_CONCURRENT_CALLS,
-    }
+    return {"status": "healthy"}
 
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -556,11 +561,7 @@ async def favicon():
 # Dashboard and call reporting endpoints
 def _require_dashboard_key(x_api_key: str | None) -> None:
     required_key = os.getenv("DASHBOARD_API_KEY", "")
-    if not required_key:
-        if os.getenv("LOCAL_DEV", "").lower() == "true":
-            return  # open access explicitly allowed in local dev
-        raise HTTPException(500, "Server misconfiguration: no dashboard API key set")
-    if not hmac.compare_digest(x_api_key or "", required_key):
+    if not required_key or not safe_eq(x_api_key or "", required_key):
         raise HTTPException(401, "Invalid API Key")
 
 
@@ -619,7 +620,7 @@ async def get_campaign_summary(campaign_id: str, x_api_key: str | None = Header(
 
 
 # Mount frontend static files for local testing via browser (http://localhost:8000)
-if os.getenv("LOCAL_DEV", "").lower() == "true":
+if is_local_demo():
     frontend_dir = os.path.join(os.path.dirname(__file__), "frontend")
     if os.path.exists(frontend_dir):
         @app.get("/", include_in_schema=False)
@@ -638,4 +639,4 @@ if os.getenv("LOCAL_DEV", "").lower() == "true":
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    uvicorn.run(app, host=os.getenv("HOST", "127.0.0.1"), port=int(os.getenv("PORT", 8000)))

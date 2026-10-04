@@ -1,6 +1,5 @@
 import statistics
 from datetime import datetime
-import hmac
 import os
 from pathlib import Path
 import uuid
@@ -15,6 +14,7 @@ from sqlalchemy.orm import selectinload
 from leads.db import get_session
 from leads.models import Lead, Project, SiteVisit, Touchpoint
 from leads.notify import mask_phone
+from settings import safe_eq
 
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
@@ -29,11 +29,7 @@ def verify_dashboard_auth(
     """Verifies dashboard access key with secure constant-time comparison."""
     expected_key = os.getenv("DASHBOARD_API_KEY", "").strip()
     if not expected_key:
-        if os.getenv("LOCAL_DEV", "").lower() == "true":
-            return True  # Open access explicitly allowed in local dev
-        raise HTTPException(
-            status_code=500, detail="Server misconfiguration: DASHBOARD_API_KEY not set"
-        )
+        raise HTTPException(status_code=401, detail="Unauthorized dashboard access")
 
     provided_key = dashboard_key_cookie or ""
     if not provided_key and authorization:
@@ -43,7 +39,7 @@ def verify_dashboard_auth(
         else:
             provided_key = authorization
 
-    if hmac.compare_digest(provided_key, expected_key):
+    if safe_eq(provided_key, expected_key):
         return True
     raise HTTPException(status_code=401, detail="Unauthorized dashboard access")
 
