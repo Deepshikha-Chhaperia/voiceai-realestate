@@ -19,13 +19,13 @@ providers:
         keepalive_interval: 15
         vad_signals: true
         high_vad_sensitivity: true
-        positive_speech_threshold: 0.60
+        positive_speech_threshold: 0.70
         negative_speech_threshold: 0.48
         min_speech_frames: 2
         first_turn_min_speech_frames: 2
         negative_frames_count: 6
         negative_frames_window: 12
-        interrupt_min_speech_frames: 2
+        interrupt_min_speech_frames: 3
         pre_speech_pad_frames: 3
 
     deepgram:

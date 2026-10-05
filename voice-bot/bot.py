@@ -1063,9 +1063,12 @@ def _extract_lead_preferences(text: str, agent_text: str = "") -> dict[str, str]
     # 5. Site Visit Day & Time (must be stated or confirmed by user, not hallucinated by agent)
     if not user_has_refusal and not is_farewell:
         m_vdate = re.search(
-            r"\b(tomorrow|today|this\s+weekend|next\s+weekend|this\s+saturday|this\s+sunday|saturday|sunday|monday|tuesday|wednesday|thursday|friday)\b",
+            r"\b(tomorrow|today|this\s+weekend|next\s+weekend|this\s+saturday|this\s+sunday|saturday|sunday|monday|tuesday|wednesday|thursday|friday|kal|aaj|parso)\b",
             user_lower,
         )
+        # Hindi Devanagari: \b unreliable — use Unicode-aware search
+        if not m_vdate:
+            m_vdate = re.search(r"(कल|आज|परसों)", user_lower, re.UNICODE)
         # If user didn't state date directly, check if user affirmed an agent visit proposal
         if not m_vdate and any(user_lower.startswith(aff) or aff in user_lower.split() for aff in ("yes", "sure", "theek hai", "chalega", "done")):
             agent_lower = agent_text.lower()
@@ -1171,6 +1174,10 @@ def _sync_working_memory(
                         existing = lead_memory[k]
                         if len(existing) > len(v) and v.lower() in existing.lower():
                             continue
+                    # Tool value always wins: never overwrite a visit date/time
+                    # already committed by book_site_visit.
+                    if k in ("preferred_visit_date", "preferred_visit_time") and k in lead_memory:
+                        continue
                     lead_memory[k] = v
                     newly_extracted[k] = v
 
@@ -1915,6 +1922,7 @@ class _SpokenTextGuard(FrameProcessor):
         lead_memory: dict | None = None,
         call_metrics=None,
         stream_id: str | None = None,
+        on_new_bot_turn: Callable | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -1929,6 +1937,7 @@ class _SpokenTextGuard(FrameProcessor):
         self._lead_memory = lead_memory
         self._call_metrics = call_metrics
         self._stream_id = stream_id
+        self._on_new_bot_turn = on_new_bot_turn  # called on LLMFullResponseStartFrame
         self._turn_count = 0
         self._in_llm_turn = False
         self._turn_tokens = 0
@@ -2008,6 +2017,10 @@ class _SpokenTextGuard(FrameProcessor):
                 self._cached_playback_active = False
                 self._current_turn_spoken_text = ""
                 self._suppressing_duplicate_turn = False
+                # Primary watchdog disarm: new bot turn supersedes any pending re-delivery.
+                # Called here because this frame reliably passes through SpokenTextGuard.
+                if self._on_new_bot_turn:
+                    self._on_new_bot_turn()
             elif isinstance(frame, TTSSpeakFrame):
                 is_silence_nudge = any(
                     nudge in getattr(frame, "text", "")
@@ -2055,8 +2068,19 @@ class _SpokenTextGuard(FrameProcessor):
                         if cached_key:
                             pcm = _AUDIO_CACHE.get(self._sample_rate, {}).get(cached_key)
                             if pcm:
+                                # Guard: if we are already streaming cached audio for this guard
+                                # (e.g. a stale re-delivered TTSSpeakFrame arrived while the opening
+                                # greeting is playing), drop it. Use our own _cached_playback_active
+                                # flag — NOT the gate's generation ID, which is set by next_generation()
+                                # before the first frame is queued and would wrongly drop the greeting.
+                                if self._cached_playback_active:
+                                    logger.debug(
+                                        "SpokenTextGuard: dropping TTSSpeakFrame '{}' — cached audio already active",
+                                        cached_key,
+                                    )
+                                    return
                                 logger.info(
-                                    "SpokenTextGuard: TTSSpeakFrame matches cache '{}' -> streaming cached PCM",
+                                    "SpokenTextGuard: TTSSpeakFrame matches cache '%s' -> streaming cached PCM",
                                     cached_key,
                                 )
                                 self._cached_playback_active = True
@@ -2071,6 +2095,7 @@ class _SpokenTextGuard(FrameProcessor):
                                 if cached_key in ("final_farewell", "de_final_farewell") and self._call_end_coordinator:
                                     self._call_end_coordinator.request_ending()
                                 return
+
                     frame.text = self._normalize(original)
             elif isinstance(frame, TextFrame):
                 if self._cached_playback_active:
@@ -2326,7 +2351,16 @@ class _InterruptionAudioGate(FrameProcessor):
 
         self.next_generation()
         current_gen = self._current_gen_id
-        self._is_interrupted = False
+        # next_generation() resets _is_interrupted to False; if an InterruptionFrame
+        # had already arrived before play_cached_audio was scheduled (e.g. noise fired
+        # the 280ms filler race but a real interruption came in first), restore the flag
+        # and abort without playing anything.
+        if self._is_interrupted:
+            logger.debug(
+                "[{}] AudioCache: skipping playback — interruption flag was set before start",
+                self._stream_id,
+            )
+            return
 
         logger.info(
             "[{}] AudioCache: Streaming cached audio ({} bytes, {} Hz, ~{:.2f}s)",
@@ -2369,6 +2403,22 @@ class _InterruptionAudioGate(FrameProcessor):
         frame: Frame,
         direction: FrameDirection,
     ) -> None:
+        # B2: UPSTREAM InterruptionFrame = real caller barge-in (UserStartedSpeakingFrame
+        # triggers InterruptionFrame upstream from the user aggregator). The gate sits
+        # downstream of TTS and normally only sees downstream frames; without this branch,
+        # a caller barge-in during cached audio playback never sets _is_interrupted and
+        # the audio plays to completion.
+        if direction == FrameDirection.UPSTREAM and isinstance(frame, InterruptionFrame):
+            self._is_interrupted = True
+            self._active_playing_gen_id = 0
+            self._awaiting_first_audio_of_turn = False
+            self._accumulated_trimmed_bytes = 0
+            self._pre_roll_buffer = b""
+            logger.debug(
+                "[{}] Barge-in event (upstream): invalidated active audio output",
+                self._stream_id,
+            )
+
         if direction == FrameDirection.DOWNSTREAM:
 
             if isinstance(frame, InterruptionFrame):
@@ -5021,21 +5071,48 @@ async def run_bot(
             """Tool handler for booking property site visit slots."""
             tool_call_started_at = time.monotonic()
             args = params.arguments or {}
-            date_str = str(args.get("date", "Saturday"))
+            date_raw = str(args.get("date", ""))
             time_str = str(args.get("time", "11:00 AM"))
-            logger.info(f"[{stream_id}] Tool book_site_visit called: date={date_str}, time={time_str}")
+            logger.info(f"[{stream_id}] Tool book_site_visit called: date={date_raw!r}, time={time_str}")
+
+            # Normalize date before any storage — fail closed on unparseable input
+            try:
+                import zoneinfo as _zi
+                from leads.worker import normalize_visit_date
+                _now_ist = __import__("datetime").datetime.now(_zi.ZoneInfo("Asia/Kolkata"))
+                date_result = normalize_visit_date(date_raw, _now_ist)
+            except Exception as _norm_exc:
+                logger.warning(f"[{stream_id}] normalize_visit_date error: {_norm_exc}; treating as unparseable")
+                date_result = None
+
+            if date_result is None:
+                logger.warning(
+                    f"[{stream_id}] book_site_visit: unparseable date {date_raw!r} — returning needs_confirmation"
+                )
+                call_metrics.record_tool_call(
+                    "book_site_visit",
+                    success=False,
+                    latency_ms=(time.monotonic() - tool_call_started_at) * 1000,
+                )
+                await params.result_callback({
+                    "status": "needs_confirmation",
+                    "message": "Date is unclear — please ask the caller to confirm a specific day (e.g. Saturday, tomorrow, Monday).",
+                })
+                return
+
+            _iso_date, date_label = date_result
+            logger.info(f"[{stream_id}] book_site_visit: normalized {date_raw!r} -> {date_label!r}")
 
             try:
                 await lead_state.record_fields_async(
                     stream_id,
                     {
-                        "preferred_visit_date": date_str,
+                        "preferred_visit_date": date_label,
                         "preferred_visit_time": time_str,
                         "site_visit": "booked",
                         "disposition": "SITE_VISIT_BOOKED",
                     },
                 )
-
                 call_rec = (await lead_state.get_call_async(stream_id)) or {}
                 lead_id_val = call_rec.get("lead_id")
 
@@ -5068,7 +5145,7 @@ async def run_bot(
                         if lead_obj:
                             lead_obj.status = "visit_booked"
                             lead_obj.visit_genuine = True
-                            slot_dt = _resolve_visit_datetime(date_str, time_str)
+                            slot_dt = _resolve_visit_datetime(date_label, time_str)
                             sv = SiteVisit(
                                 lead_id=lead_obj.id,
                                 slot_start=slot_dt,
@@ -5080,7 +5157,7 @@ async def run_bot(
                                 lead_id=lead_obj.id,
                                 kind="site_visit",
                                 call_id=stream_id,
-                                summary=f"Site visit booked for {date_str} at {time_str}",
+                                summary=f"Site visit booked for {date_label} at {time_str}",
                                 occurred_at=datetime.now(timezone.utc),
                             )
                             session.add(tp)
@@ -5096,9 +5173,9 @@ async def run_bot(
                 await params.result_callback(
                     {
                         "status": "confirmed",
-                        "date": date_str,
+                        "date": date_label,
                         "time": time_str,
-                        "message": f"Site visit confirmed for {date_str} at {time_str}.",
+                        "message": f"Site visit confirmed for {date_label} at {time_str}.",
                     }
                 )
             except Exception as exc:
@@ -5377,6 +5454,10 @@ async def run_bot(
             lead_memory=lead_memory,
             call_metrics=call_metrics,
             stream_id=stream_id,
+            # Primary watchdog disarm: called when LLM starts generating.
+            # Lambda closes over stall_watchdog (assigned below); safe because it's
+            # only invoked during pipeline frame processing, after both exist.
+            on_new_bot_turn=lambda: stall_watchdog.disarm_resume("new_bot_turn"),
         )
 
         async def _on_repeated_provider_stall(sid: str) -> None:
@@ -5386,10 +5467,13 @@ async def run_bot(
         stall_watchdog = StallWatchdog(
             stream_id=stream_id,
             on_repeated_stall=_on_repeated_provider_stall,
-            # Skip recovery prompt if call is already in teardown
             is_call_ending=lambda: call_end_coordinator.is_ending,
             is_turn_in_flight=lambda: getattr(silence_checker, "_turn_in_flight", False),
             lead_memory=lead_memory,
+            get_last_interrupted_text=lambda: getattr(spoken_text_guard, "_last_spoken_turn_text", ""),
+            # Used at fire time to detect case 2: watchdog re-delivering text the LLM just spoke.
+            get_current_bot_turn_text=lambda: getattr(spoken_text_guard, "_current_turn_spoken_text", "")
+                or getattr(spoken_text_guard, "_last_spoken_turn_text", ""),
         )
 
         silence_checker = _SilenceChecker(
@@ -5601,9 +5685,54 @@ async def run_bot(
                     silence_checker._stage,
                 )
             else:
+                # FIX 4: Drop STT garbage produced by music/noise (e.g. 'Iyamya.', 'लाळवान.').
+                # A valid user utterance must have at least 3 alphabetic characters total.
+                _alpha_count = sum(1 for c in str(user_content) if c.isalpha())
+                if _alpha_count < 3:
+                    silence_checker._turn_in_flight = False
+                    silence_checker._user_is_speaking = False
+                    stall_watchdog.disarm()
+                    logger.warning(
+                        "[{}] Dropped garbage STT transcript {!r} ({} alpha chars) — not sending to LLM",
+                        stream_id,
+                        str(user_content)[:60],
+                        _alpha_count,
+                    )
+                    return
+
                 silence_checker._turn_in_flight = True
                 silence_checker._user_is_speaking = False
                 silence_checker._stage = 0
+                # Primary watchdog disarm: a committed user turn means no re-delivery needed.
+                stall_watchdog.disarm_resume("user_turn")
+
+                # Bug 2 echo guard: browser echo cancellation sometimes fails under heavy VAD
+                # activity. If the bot is currently speaking and the transcript's words
+                # substantially overlap the bot's current utterance, it is almost certainly
+                # acoustic echo — drop it without sending to the LLM.
+                _bot_current = getattr(spoken_text_guard, "_current_turn_spoken_text", "") or \
+                               getattr(spoken_text_guard, "_last_spoken_turn_text", "")
+                _gate_active = (
+                    interruption_audio_gate is not None
+                    and getattr(interruption_audio_gate, "_active_playing_gen_id", 0) > 0
+                    and not getattr(interruption_audio_gate, "_is_interrupted", True)
+                )
+                if _gate_active and _bot_current:
+                    _strip = lambda s: set(re.sub(r"[^\w\s]", "", s.lower()).split())
+                    _user_words = _strip(str(user_content))
+                    _bot_words = _strip(_bot_current)
+                    if _user_words and _bot_words:
+                        _overlap = len(_user_words & _bot_words) / min(len(_user_words), len(_bot_words))
+                        if _overlap >= 0.5:
+                            silence_checker._turn_in_flight = False
+                            logger.warning(
+                                "[{}] Dropped probable echo transcript {!r} (overlap={:.0%} with bot utterance {!r})",
+                                stream_id,
+                                str(user_content)[:60],
+                                _overlap,
+                                _bot_current[:60],
+                            )
+                            return
 
                 # If the preceding assistant message was a farewell, check whether caller reciprocated
                 # or barged in with a continuation question/statement.

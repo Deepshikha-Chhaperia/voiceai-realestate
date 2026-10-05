@@ -28,6 +28,58 @@ def get_redis_settings() -> RedisSettings:
     return RedisSettings.from_dsn(os.environ["REDIS_URL"])
 
 
+def normalize_visit_date(raw: str, now_ist: datetime) -> tuple[str, str] | None:
+    """Map a spoken visit date (English or Hindi/Hinglish) to (iso_date, human_label).
+
+    Returns None when the input cannot be confidently mapped to a specific date.
+    Never falls back to a guessed default — callers must handle None explicitly.
+    """
+    v = raw.strip().lower()
+    if not v:
+        return None
+
+    # today: today / aaj / आज
+    # \b works for ASCII tokens; for Devanagari, use direct substring match
+    if re.search(r"\b(today|aaj)\b", v) or "आज" in v:
+        d = now_ist.date()
+        return (d.isoformat(), f"Today — {d.strftime('%d %b %Y')}")
+
+    # tomorrow: tomorrow / kal / कल
+    if re.search(r"\b(tomorrow|kal)\b", v) or "कल" in v:
+        d = (now_ist + timedelta(days=1)).date()
+        return (d.isoformat(), f"Tomorrow — {d.strftime('%d %b %Y')}")
+
+    # day after tomorrow: parso / परसों
+    if re.search(r"\b(parso|parson)\b", v) or "परसों" in v:
+        d = (now_ist + timedelta(days=2)).date()
+        return (d.isoformat(), f"{d.strftime('%A, %d %b %Y')}")
+
+    # weekday names (English whole-word)
+    weekday_map = {
+        "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+        "friday": 4, "saturday": 5, "sunday": 6,
+    }
+    for day_name, day_idx in weekday_map.items():
+        if re.search(r"\b" + day_name + r"\b", v):
+            days_ahead = (day_idx - now_ist.weekday()) % 7
+            if days_ahead == 0:
+                days_ahead = 7  # "Saturday" means the coming one, not today
+            d = (now_ist + timedelta(days=days_ahead)).date()
+            return (d.isoformat(), f"{d.strftime('%A, %d %b %Y')}")
+
+    # ISO date literal (YYYY-MM-DD passed through from LLM)
+    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", v)
+    if m:
+        from datetime import date as _date
+        try:
+            d = _date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            return (d.isoformat(), f"{d.strftime('%A, %d %b %Y')}")
+        except ValueError:
+            return None
+
+    return None
+
+
 def _resolve_visit_datetime(date_str: str | None, time_str: str | None) -> datetime:
     """Helper to convert spoken day/time into a realistic upcoming datetime slot (IST-aware)."""
     try:
@@ -45,7 +97,7 @@ def _resolve_visit_datetime(date_str: str | None, time_str: str | None) -> datet
     time_match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", time_val)
     if time_match:
         h = int(time_match.group(1))
-        m = int(time_match.group(2) or 0)
+        m_min = int(time_match.group(2) or 0)
         ampm = (time_match.group(3) or "").lower()
         if ampm == "pm" and h < 12:
             h += 12
@@ -57,31 +109,30 @@ def _resolve_visit_datetime(date_str: str | None, time_str: str | None) -> datet
                 h += 12
         if 0 <= h <= 23:
             hour = h
-            minute = m
+            minute = m_min
 
-    # Determine day using whole-word matching
-    days_ahead = 2
-    weekday_map = {
-        "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
-        "friday": 4, "saturday": 5, "sunday": 6
-    }
-    found_weekday = False
-    for day_name, day_idx in weekday_map.items():
-        if re.search(r"\b" + day_name + r"\b", date_val):
-            days_ahead = (day_idx - now_ist.weekday()) % 7
-            if days_ahead == 0:
-                days_ahead = 7
-            found_weekday = True
-            break
+    # Try normalize_visit_date (handles English + Hindi/Hinglish + ISO)
+    result = normalize_visit_date(date_val, now_ist)
+    if result is not None:
+        from datetime import date as _date
+        iso_date, _ = result
+        d = _date.fromisoformat(iso_date)
+        return now_ist.replace(year=d.year, month=d.month, day=d.day,
+                               hour=hour, minute=minute, second=0, microsecond=0)
 
-    if not found_weekday:
-        if re.search(r"\btomorrow\b", date_val):
-            days_ahead = 1
-        elif re.search(r"\btoday\b", date_val):
-            days_ahead = 0
-
-    target = now_ist + timedelta(days=days_ahead)
+    # Fallback: days_ahead=2 — should never fire for new bookings after A3.
+    # book_site_visit returns needs_confirmation when normalize_visit_date returns None,
+    # so reaching here means the date arrived via a legacy path (e.g. old DB row or
+    # manual retry queue). Log loudly so it is visible in call logs.
+    logger.warning(
+        "resolve_visit_datetime: unparseable date {!r} — falling back to days_ahead=2. "
+        "This should never happen for new bookings; book_site_visit should have returned "
+        "needs_confirmation instead of passing this value.",
+        date_val,
+    )
+    target = now_ist + timedelta(days=2)
     return target.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
 
 
 def get_next_calling_window_start(tz_name: str = "Asia/Kolkata", start_str: str = "09:00") -> datetime:

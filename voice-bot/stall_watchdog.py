@@ -24,9 +24,11 @@ from pipecat.frames.frames import (
     EndTaskFrame,
     ErrorFrame,
     Frame,
+    InterimTranscriptionFrame,
     InterruptionFrame,
     LLMFullResponseStartFrame,
     TextFrame,
+    TranscriptionFrame,
     TTSStartedFrame,
     TTSSpeakFrame,
     UserStoppedSpeakingFrame,
@@ -35,7 +37,6 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.utils.errors import ErrorCategory
 
 STALL_TIMEOUT_SECS = float(os.getenv("STALL_WATCHDOG_TIMEOUT_SECS", "7.5"))
-RECOVERY_LINE = "Sorry, I didn't catch that. Could you say that again?"
 RECOVERY_LINES = {
     "English": "Sorry, I didn't catch that. Could you say that again?",
     "Hindi": "Sorry, main sun nahi paayi. Kya aap repeat kar sakte hain?",
@@ -59,23 +60,29 @@ class StallWatchdog(FrameProcessor):
         is_call_ending: Callable[[], bool] | None = None,
         is_turn_in_flight: Callable[[], bool] | None = None,
         lead_memory: dict | None = None,
+        get_last_interrupted_text: Callable[[], str] | None = None,
+        get_current_bot_turn_text: Callable[[], str] | None = None,
     ) -> None:
         super().__init__()
         self._stream_id = stream_id
         self._on_repeated_stall = on_repeated_stall
-        # Optional callback indicating whether the call is already in teardown
         self._is_call_ending = is_call_ending or (lambda: False)
-        # Optional callback indicating whether a user turn is actively in flight
         self._is_turn_in_flight = is_turn_in_flight or (lambda: True)
         self._lead_memory = lead_memory
         self._watch_task: asyncio.Task | None = None
         self._stall_count = 0
         self._task = None
+        self._get_last_interrupted_text = get_last_interrupted_text
+        # Returns the text the bot is currently speaking or just finished speaking this turn.
+        # Used at fire time to avoid re-delivering text the LLM already produced naturally.
+        self._get_current_bot_turn_text = get_current_bot_turn_text
+        self._resume_task: asyncio.Task | None = None
+        # dedupe: (normalized_text, monotonic_time) of last re-delivery
+        self._last_resume_delivery: tuple[str, float] = ("", 0.0)
 
     def _get_recovery_text(self) -> str:
-        if self._lead_memory and (lang := self._lead_memory.get("language")):
-            return RECOVERY_LINES.get(lang, RECOVERY_LINE)
-        return RECOVERY_LINE
+        lang = self._lead_memory.get("language") if self._lead_memory else None
+        return RECOVERY_LINES.get(lang or "English", RECOVERY_LINES["English"])
 
     def bind_task(self, task) -> None:
         self._task = task
@@ -90,13 +97,28 @@ class StallWatchdog(FrameProcessor):
             self._arm()
         elif isinstance(frame, (BotStartedSpeakingFrame, TTSStartedFrame, AudioRawFrame, TextFrame, LLMFullResponseStartFrame)):
             self._disarm()
+            # Fallback: frame-based disarm. Primary path is bot-level callbacks via disarm_resume().
+            # Note: LLMFullResponseStartFrame may not reach here reliably — see bot.py callbacks.
+            self.disarm_resume("frame_new_bot_turn")
+        elif isinstance(frame, TTSSpeakFrame):
+            self.disarm_resume("frame_ttsspeak")
         elif isinstance(frame, (CancelFrame, EndFrame, EndTaskFrame)):
             self._disarm()
+            self._disarm_resume()
+
+        # Arm on InterruptionFrame. TranscriptionFrame disarm kept as best-effort fallback
+        # (pipecat may consume it upstream before it reaches us).
+        if direction == FrameDirection.DOWNSTREAM:
+            if isinstance(frame, InterruptionFrame):
+                self._arm_resume()
+            elif isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame)) and getattr(frame, "text", ""):
+                self.disarm_resume("frame_transcription")
 
         await self.push_frame(frame, direction)
 
     async def cleanup(self) -> None:
         self._disarm()
+        self._disarm_resume()
         await super().cleanup()
 
     def _arm(self) -> None:
@@ -107,6 +129,86 @@ class StallWatchdog(FrameProcessor):
         if self._watch_task and not self._watch_task.done():
             self._watch_task.cancel()
         self._watch_task = None
+
+    def disarm_resume(self, reason: str = "") -> None:
+        """Public entry point: called by bot-level callbacks (user_turn, new_bot_turn).
+        This is the *primary* disarm path — more reliable than frame watching because
+        pipecat's LLMUserAggregator consumes TranscriptionFrame upstream of the watchdog."""
+        if self._resume_task and not self._resume_task.done():
+            logger.info(
+                "[{}] Resume timer cancelled (reason={})",
+                self._stream_id,
+                reason or "explicit",
+            )
+        self._disarm_resume()
+
+    def _arm_resume(self) -> None:
+        self._disarm_resume()
+        if self._get_last_interrupted_text and self._task:
+            logger.info("[{}] Resume timer armed (2.5s)", self._stream_id)
+            self._resume_task = asyncio.create_task(self._resume_watch())
+
+    def _disarm_resume(self) -> None:
+        if self._resume_task and not self._resume_task.done():
+            self._resume_task.cancel()
+        self._resume_task = None
+
+    async def _resume_watch(self) -> None:
+        try:
+            await asyncio.sleep(2.5)
+        except asyncio.CancelledError:
+            return  # disarmed by callback or frame — nothing to do
+
+        if self._is_call_ending():
+            return
+
+        # Primary guard: if a user turn is in flight, caller spoke — skip
+        if self._is_turn_in_flight():
+            logger.info(
+                "[{}] Resume timer fired — skipped (user turn in flight)",
+                self._stream_id,
+            )
+            return
+
+        last_text = self._get_last_interrupted_text() if self._get_last_interrupted_text else ""
+        if not last_text:
+            return
+
+        # Case 2 guard: if the bot is already speaking or has just spoken the same text
+        # naturally (LLM reply arrived), re-delivering it would double the audio.
+        current_bot_text = self._get_current_bot_turn_text() if self._get_current_bot_turn_text else ""
+        norm_last = " ".join(last_text.lower().split())
+        norm_current = " ".join(current_bot_text.lower().split())
+        if norm_current and (norm_current == norm_last or norm_last in norm_current or norm_current in norm_last):
+            logger.info(
+                "[{}] Resume timer fired — skipped (text already spoken by LLM: {!r})",
+                self._stream_id,
+                current_bot_text[:60],
+            )
+            return
+
+        # Dedupe: never re-deliver the same text twice within 15s
+        now = time.monotonic()
+        last_delivered, last_time = self._last_resume_delivery
+        if last_delivered == norm_last and (now - last_time) < 15.0:
+            logger.info(
+                "[{}] Resume timer fired — skipped (dedupe, same text within 15s)",
+                self._stream_id,
+            )
+            return
+        self._last_resume_delivery = (norm_last, now)
+
+        logger.info(
+            "[{}] Resume timer fired — re-delivering: {!r}",
+            self._stream_id,
+            last_text,
+        )
+        try:
+            await self._task.queue_frames(
+                [TTSSpeakFrame(text=last_text, append_to_context=False)]
+            )
+        except Exception as exc:
+            logger.warning("[{}] Resume re-delivery failed: {}", self._stream_id, exc)
 
     async def _watch(self) -> None:
         try:

@@ -1,3 +1,4 @@
+from datetime import datetime
 from loguru import logger
 
 
@@ -130,14 +131,26 @@ def build_system_prompt(
 
     system_prompt = "\n\n".join(parts)
 
-    # Build customer context message for caching-friendly dynamic content
-    customer_context = None
+    # Build customer context message for caching-friendly dynamic content.
+    # Always include today's IST date so the LLM can resolve relative terms
+    # like "tomorrow" / "kal" / "कल" correctly in book_site_visit.
+    try:
+        import zoneinfo
+        _now_ist = datetime.now(zoneinfo.ZoneInfo("Asia/Kolkata"))
+        _today_str = _now_ist.strftime("%A, %d %B %Y")
+    except Exception:
+        _today_str = datetime.utcnow().strftime("%A, %d %B %Y") + " (UTC)"
+    today_line = f"Today's date (IST): {_today_str}."
+
     if campaign_data and (customer_name := campaign_data.get("customer_name")):
         customer_context = (
             f"CALL CONTEXT: You are calling {customer_name}. "
             f"Use their name naturally in conversation. "
-            f"Do not repeat this context - it is for your reference only."
+            f"Do not repeat this context - it is for your reference only. "
+            + today_line
         )
+    else:
+        customer_context = today_line
 
     logger.info("Using campaign prompt ({} chars)", len(campaign_prompt))
     return system_prompt, customer_context

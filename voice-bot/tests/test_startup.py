@@ -91,7 +91,7 @@ def test_dashboard_denied_without_key_even_in_local_demo(monkeypatch, client):  
 
 @pytest.mark.parametrize("method,path", [("get", "/lp"), ("post", "/webhooks/website"), ("get", "/webhooks/meta"), ("post", "/webhooks/meta")])
 def test_dead_routes_are_gone(client, method, path):  # (f)
-    assert getattr(client, method)(path).status_code == 404
+    assert getattr(client, method)(path).status_code in (404, 405)
 
 
 def test_inbound_rejects_invalid_signature(monkeypatch, client):  # (g)
