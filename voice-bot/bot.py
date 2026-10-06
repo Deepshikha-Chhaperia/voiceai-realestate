@@ -1406,39 +1406,34 @@ def _sync_working_memory(
                 'Consultative Dialogue: Answer caller\'s property/pricing question directly. DO NOT re-pitch brochure. DO NOT close call while caller is asking questions.'
             )
 
+    # Strip any existing [ACTIVE LEAD STATE: ...] block cleanly across all system messages
+    for msg in messages:
+        if msg.get("role") == "system":
+            content = msg.get("content", "")
+            if isinstance(content, str) and "[ACTIVE LEAD STATE:" in content:
+                parts = content.split("[ACTIVE LEAD STATE:")
+                base = parts[0].rstrip()
+                after_bracket = parts[1].split("]", 1)[-1].strip() if "]" in parts[1] else ""
+                msg["content"] = f"{base}{(' ' + after_bracket) if after_bracket else ''}".strip()
+
     if not slots and not lead_memory:
-        # If there's an existing [ACTIVE LEAD STATE: ...] block, strip it cleanly
-        for msg in messages:
-            if msg.get("role") == "system":
-                content = msg.get("content", "")
-                if isinstance(content, str) and "[ACTIVE LEAD STATE:" in content:
-                    parts = content.split("[ACTIVE LEAD STATE:")
-                    base = parts[0].rstrip()
-                    after_bracket = parts[1].split("]", 1)[-1].strip() if "]" in parts[1] else ""
-                    msg["content"] = f"{base}{(' ' + after_bracket) if after_bracket else ''}".strip()
         return
 
     memory_str = f"[ACTIVE LEAD STATE: {' | '.join(slots)}]"
     lead_memory["_working_memory"] = memory_str
 
-    # Find the primary system prompt (messages[0] or first system message)
+    # Find the LAST system message so static prompt prefix remains 100% frozen for Groq prefix caching
+    last_sys_msg = None
     for msg in messages:
         if msg.get("role") == "system":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                # If there's an existing [ACTIVE LEAD STATE: ...] block, replace it in-place
-                if "[ACTIVE LEAD STATE:" in content:
-                    parts = content.split("[ACTIVE LEAD STATE:")
-                    base = parts[0].rstrip()
-                    # Strip any trailing bracketed state
-                    after_bracket = parts[1].split("]", 1)[-1].strip() if "]" in parts[1] else ""
-                    msg["content"] = f"{base}\n\n{memory_str}{(' ' + after_bracket) if after_bracket else ''}".strip()
-                else:
-                    msg["content"] = f"{content.rstrip()}\n\n{memory_str}".strip()
-            return
+            last_sys_msg = msg
 
-    # Fallback if no system message exists
-    messages.insert(0, {"role": "system", "content": memory_str})
+    if last_sys_msg is not None:
+        content = last_sys_msg.get("content", "")
+        last_sys_msg["content"] = f"{content.rstrip()}\n\n{memory_str}".strip()
+    else:
+        # Fallback if no system message exists
+        messages.insert(0, {"role": "system", "content": memory_str})
 
 
 def _coalesce_consecutive_messages(messages: list) -> None:
@@ -2014,6 +2009,11 @@ class _SpokenTextGuard(FrameProcessor):
         self._last_spoken_turn_time: float = 0.0
         self._current_turn_spoken_text: str = ""
         self._suppressing_duplicate_turn: bool = False
+        self._stale_regeneration_attempted: bool = False
+        self._task: Any = None
+
+    def bind_task(self, task: Any) -> None:
+        self._task = task
 
     def _record_assistant_spoken(self, text: str, cached_key: str | None = None) -> None:
         if not text:
@@ -2062,6 +2062,7 @@ class _SpokenTextGuard(FrameProcessor):
                 self._cached_playback_active = False
                 self._current_turn_spoken_text = ""
                 self._suppressing_duplicate_turn = False
+                self._stale_regeneration_attempted = False
             elif isinstance(frame, UserStoppedSpeakingFrame):
                 self._turn_count += 1
                 self._in_llm_turn = False
@@ -2072,6 +2073,7 @@ class _SpokenTextGuard(FrameProcessor):
                 self._cached_playback_active = False
                 self._current_turn_spoken_text = ""
                 self._suppressing_duplicate_turn = False
+                self._stale_regeneration_attempted = False
             elif isinstance(frame, LLMFullResponseStartFrame):
                 self._in_llm_turn = True
                 self._turn_tokens = 0
@@ -2219,20 +2221,44 @@ class _SpokenTextGuard(FrameProcessor):
                             if cleaned.strip():
                                 norm = self._normalize(cleaned)
                                 if norm.strip():
-                                    now = time.monotonic()
                                     clean_norm = re.sub(r"[^\w\s]", "", norm.lower()).strip()
                                     clean_last = re.sub(r"[^\w\s]", "", self._last_spoken_turn_text.lower()).strip()
-                                    if (
+                                    is_dup = bool(
                                         clean_last
-                                        and (now - self._last_spoken_turn_time < 3.0)
+                                        and len(clean_last) >= 8
                                         and (clean_norm == clean_last or clean_norm in clean_last or clean_last in clean_norm)
-                                    ):
+                                    )
+                                    if is_dup:
                                         logger.warning(
-                                            "SpokenTextGuard: Suppressed duplicate assistant utterance {!r} generated within {:.1f}s of previous turn",
+                                            "SpokenTextGuard: Suppressed duplicate assistant utterance {!r} (previous turn {!r})",
                                             norm.strip(),
-                                            now - self._last_spoken_turn_time,
+                                            self._last_spoken_turn_text[:60],
                                         )
                                         self._suppressing_duplicate_turn = True
+
+                                        # Fix 3: Fresh user input was ignored by duplicate LLM output -> re-trigger once
+                                        latest_user_text = ""
+                                        if self._context and hasattr(self._context, "messages"):
+                                            for m in reversed(self._context.messages):
+                                                if m.get("role") == "user":
+                                                    c = m.get("content", "")
+                                                    if isinstance(c, str):
+                                                        latest_user_text = c.strip()
+                                                    elif isinstance(c, list):
+                                                        latest_user_text = " ".join(p.get("text", "") for p in c if isinstance(p, dict)).strip()
+                                                    break
+
+                                        if latest_user_text and not self._stale_regeneration_attempted:
+                                            self._stale_regeneration_attempted = True
+                                            logger.info(
+                                                "SpokenTextGuard: Fresh user utterance {!r} but LLM emitted duplicate turn; re-triggering LLM turn",
+                                                latest_user_text[:60],
+                                            )
+                                            if self._task:
+                                                try:
+                                                    await self._task.queue_frames([LLMContextFrame(context=self._context)])
+                                                except Exception as _re_err:
+                                                    logger.warning("SpokenTextGuard: Failed to queue re-trigger frame: {}", _re_err)
                                         return
 
                                     self._current_turn_spoken_text += " " + norm
@@ -2274,49 +2300,33 @@ class _SpokenTextGuard(FrameProcessor):
                     if cleaned.strip():
                         norm = self._normalize(cleaned)
                         if norm.strip():
-                            now = time.monotonic()
                             clean_norm = re.sub(r"[^\w\s]", "", norm.lower()).strip()
                             clean_last = re.sub(r"[^\w\s]", "", self._last_spoken_turn_text.lower()).strip()
-                            if not (
+                            is_dup = bool(
                                 clean_last
-                                and (now - self._last_spoken_turn_time < 3.0)
+                                and len(clean_last) >= 8
                                 and (clean_norm == clean_last or clean_norm in clean_last or clean_last in clean_norm)
-                            ):
+                            )
+                            if not is_dup:
                                 self._current_turn_spoken_text += " " + norm
                                 self._turn_has_spoken_or_generated = True
                                 self._turn_tokens += len(norm.split())
                                 await self.push_frame(TextFrame(text=norm), direction)
                             else:
                                 logger.warning(
-                                    "SpokenTextGuard: Suppressed duplicate assistant end-buffer {!r} generated within {:.1f}s of previous turn",
+                                    "SpokenTextGuard: Suppressed duplicate assistant end-buffer {!r} (previous turn {!r})",
                                     norm.strip(),
-                                    now - self._last_spoken_turn_time,
+                                    self._last_spoken_turn_text[:60],
                                 )
+                                self._suppressing_duplicate_turn = True
 
                 if not self._suppressing_duplicate_turn and self._current_turn_spoken_text.strip():
                     self._last_spoken_turn_text = self._current_turn_spoken_text.strip()
                     self._last_spoken_turn_time = time.monotonic()
                 self._current_turn_spoken_text = ""
                 self._suppressing_duplicate_turn = False
-                is_ending = (
-                    getattr(self, "_is_cancelled", False)
-                    or (self._hangup_state is not None and self._hangup_state.get("done", False))
-                    or (self._shutdown_state is not None and self._shutdown_state.get("active", False))
-                    or (
-                        self._call_end_coordinator is not None
-                        and (
-                            getattr(self._call_end_coordinator, "is_ending", False)
-                            or getattr(self._call_end_coordinator, "is_closing_in_progress", False)
-                            or (getattr(self._call_end_coordinator, "_shutdown_state", None) or {}).get("active", False)
-                        )
-                    )
-                )
-                if self._in_llm_turn and self._turn_tokens == 0 and not is_ending:
-                    logger.warning(
-                        "SpokenTextGuard: LLM produced 0 tokens, pushing immediate recovery frame to prevent stall"
-                    )
-                    recovery_frame = TextFrame(text="Could you please say that again?")
-                    await self.push_frame(recovery_frame, direction)
+                # Fix 1 / Ponytail: Deleted old harmful recovery-frame path ("Could you please say that again?")
+                # When duplicate is suppressed or LLM produces 0 tokens, stay silent and listen.
                 self._in_llm_turn = False
                 self._turn_tokens = 0
                 self._leading_buffer = ""
@@ -2380,6 +2390,9 @@ class _InterruptionAudioGate(FrameProcessor):
         stream_id: str,
         on_interruption: Callable[[], None] | None = None,
         metrics_collector: Any = None,
+        llm: Any = None,
+        tts: Any = None,
+        websocket: Any = None,
     ) -> None:
         super().__init__()
 
@@ -2390,6 +2403,9 @@ class _InterruptionAudioGate(FrameProcessor):
         self._dropped_frames = 0
         self._on_interruption = on_interruption
         self._metrics_collector = metrics_collector
+        self._llm = llm
+        self._tts = tts
+        self._websocket = websocket
         self._awaiting_first_audio_of_turn = False
         self._accumulated_trimmed_bytes = 0
         self._pre_roll_buffer = b""
@@ -2466,54 +2482,63 @@ class _InterruptionAudioGate(FrameProcessor):
         frame: Frame,
         direction: FrameDirection,
     ) -> None:
-        # B2: UPSTREAM InterruptionFrame = real caller barge-in (UserStartedSpeakingFrame
-        # triggers InterruptionFrame upstream from the user aggregator). The gate sits
-        # downstream of TTS and normally only sees downstream frames; without this branch,
-        # a caller barge-in during cached audio playback never sets _is_interrupted and
-        # the audio plays to completion.
-        if direction == FrameDirection.UPSTREAM and isinstance(frame, InterruptionFrame):
+        if isinstance(frame, InterruptionFrame):
             self._is_interrupted = True
             self._active_playing_gen_id = 0
             self._awaiting_first_audio_of_turn = False
             self._accumulated_trimmed_bytes = 0
             self._pre_roll_buffer = b""
-            logger.debug(
-                "[{}] Barge-in event (upstream): invalidated active audio output",
+
+            # Fix 2: Immediately purge and log stale frames at interruption time
+            purged = self._dropped_frames
+            self._dropped_frames = 0
+            logger.info(
+                "[{}] Barge-in interruption: purged {} stale audio frames immediately",
                 self._stream_id,
+                purged,
             )
 
+            # (a) Cancel in-flight LLM generation
+            if self._llm and hasattr(self._llm, "_handle_interruptions"):
+                try:
+                    await self._llm._handle_interruptions(frame)
+                except Exception as _e:
+                    logger.debug("[{}] Error interrupting LLM: {}", self._stream_id, _e)
+
+            # (b) Stop TTS
+            if self._tts and hasattr(self._tts, "_handle_interruption"):
+                try:
+                    await self._tts._handle_interruption(frame, direction)
+                except Exception as _e:
+                    logger.debug("[{}] Error interrupting TTS: {}", self._stream_id, _e)
+
+            # (c) Flush client-side playback buffer via WebSocket clearAudio
+            if self._websocket:
+                try:
+                    payload = json.dumps({"event": "clearAudio", "streamId": self._stream_id})
+                    if hasattr(self._websocket, "send_text"):
+                        await self._websocket.send_text(payload)
+                    elif hasattr(self._websocket, "send_json"):
+                        await self._websocket.send_json({"event": "clearAudio", "streamId": self._stream_id})
+                except Exception as _ws_err:
+                    logger.debug("[{}] Error sending clearAudio to websocket: {}", self._stream_id, _ws_err)
+
+            if self._on_interruption:
+                self._on_interruption()
+
+            # Forward downstream if arriving upstream so transport.output sees it
+            if direction == FrameDirection.UPSTREAM:
+                await self.push_frame(frame, FrameDirection.DOWNSTREAM)
+                return
+
         if direction == FrameDirection.DOWNSTREAM:
-
-            if isinstance(frame, InterruptionFrame):
-                self._is_interrupted = True
-                self._active_playing_gen_id = 0
-                self._awaiting_first_audio_of_turn = False
-                self._accumulated_trimmed_bytes = 0
-                self._pre_roll_buffer = b""
-
-                if self._on_interruption:
-                    self._on_interruption()
-
-                logger.debug(
-                    "[{}] Barge-in event: invalidated active audio output",
-                    self._stream_id,
-                )
-
-            elif isinstance(frame, TTSStartedFrame):
+            if isinstance(frame, TTSStartedFrame):
                 self._active_playing_gen_id = self._current_gen_id
                 self._is_interrupted = False
                 self._awaiting_first_audio_of_turn = True
                 self._accumulated_trimmed_bytes = 0
                 self._pre_roll_buffer = b""
-
-                if self._dropped_frames:
-                    logger.debug(
-                        "[{}] Playing fresh utterance; purged {} stale audio frames",
-                        self._stream_id,
-                        self._dropped_frames,
-                    )
-
-                    self._dropped_frames = 0
+                self._dropped_frames = 0  # Ponytail: Purge-at-next-utterance logic eliminated
 
             elif isinstance(frame, TTSStoppedFrame):
                 self._active_playing_gen_id = 0
@@ -5174,6 +5199,9 @@ async def run_bot(
                 else None
             ),
             metrics_collector=call_metrics,
+            llm=llm,
+            tts=tts,
+            websocket=websocket,
         )
 
         def _latest_user_utterance() -> str:
@@ -5848,6 +5876,7 @@ async def run_bot(
         call_end_coordinator.bind_task(task)
         stall_watchdog.bind_task(task)
         spam_qualify_gate.bind_task(task)
+        spoken_text_guard.bind_task(task)
 
         # Outbound greeting initialization
         _greeting_sent = {
