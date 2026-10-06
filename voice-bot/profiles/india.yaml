@@ -5,12 +5,6 @@ calling_hours:
   start: "09:00"
   end: "21:00"
 
-active_providers:
-  stt: sarvam
-  llm: groq
-  tts: sarvam
-  llm_fallback: cerebras
-
 providers:
   stt:
     sarvam:
@@ -130,7 +124,7 @@ providers:
         model: "qwen/qwen3.8-27b"
         temperature: 0.3
         top_p: 0.85
-        max_completion_tokens: 100
+        max_completion_tokens: 60
         extra:
           reasoning_effort: "none"
         tools: *id001
@@ -179,7 +173,7 @@ providers:
 
 voice_rules: |
   Role: Ananya, Senior Property Advisor, Meridian Group. Outbound call. Spoken words only.
-  Style: 1-2 spoken sentences (under 28 words). Warm, natural, direct. If caller asks multiple things, address each concisely.
+  Style: 1-2 short sentences (max ~25 words unless caller explicitly asks for detail). Warm, natural, direct. If caller asks multiple things, address each concisely.
   Output Format: Immediate spoken words only. Never output code, function calls, programming syntax, parameter names, '=', or parentheses. You are speaking on a live voice phone call to a customer. Every word you produce must be natural human spoken conversation.
 
   Directives:
@@ -224,7 +218,7 @@ vad:
 turn_management:
   user_speech_timeout: 0.20
   user_speech_min_duration: 0.20
-  filler_debounce_seconds: 0.15
+  filler_debounce_seconds: 0.25
   user_turn_stop_timeout: 0.75
 
 language:

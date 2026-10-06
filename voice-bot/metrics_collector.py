@@ -64,6 +64,8 @@ class CallMetricsCollector(FrameProcessor):
         self._llm_ttft_ms: list[float] = []
         self._tts_ttfa_ms: list[float] = []
         self._tts_silence_trimmed_ms: list[float] = []
+        self._stt_final_ms: list[float] = []
+        self._cache_hits: int = 0
 
         # Silence nudge tracking: keep nudge response latency separate from voice-to-voice turn latency
         self._silence_nudge_pending = False
@@ -105,13 +107,8 @@ class CallMetricsCollector(FrameProcessor):
             )
 
     def record_cached_audio_ttfa(self, cached_key: str) -> None:
-        """Record a 0ms TTFA for cached audio turns.
-
-        Cached audio bypasses live TTS entirely, so there is no network
-        round-trip — the first audio byte is always available instantly.
-        Recording 0ms keeps the avg_tts_ttfa_ms metric populated even on
-        calls that never hit live TTS (e.g. all turns matched cached phrases).
-        """
+        """Record a 0ms TTFA for cached audio turns and increment cache hits."""
+        self._cache_hits += 1
         self._tts_ttfa_ms.append(0.0)
         self._log(
             "tts_cached_audio_ttfa",
@@ -119,6 +116,10 @@ class CallMetricsCollector(FrameProcessor):
             cached_key=cached_key,
             ttfa_ms=0.0,
         )
+
+    def record_cache_hit(self, cached_key: str = "") -> None:
+        """Explicitly record a static audio cache hit."""
+        self._cache_hits += 1
 
 
     def _log(self, event: str, **fields: Any) -> None:
@@ -198,6 +199,10 @@ class CallMetricsCollector(FrameProcessor):
             )
 
         elif isinstance(frame, TranscriptionFrame):
+            if self._user_stopped_speaking_at is not None:
+                stt_final_ms = (time.monotonic() - self._user_stopped_speaking_at) * 1000
+                self._stt_final_ms.append(round(stt_final_ms, 1))
+
             result = getattr(frame, "result", None)
             confidence = (
                 result.get("confidence")
@@ -493,8 +498,25 @@ class CallMetricsCollector(FrameProcessor):
             else None
         )
 
+        avg_stt_final = (
+            round(sum(self._stt_final_ms) / len(self._stt_final_ms), 1)
+            if self._stt_final_ms
+            else None
+        )
+
         cost_usd, breakdown = self._estimate_cost()
         duration_s = round(max(0.0, time.monotonic() - self._call_start), 1)
+        duration_min = max(0.01, duration_s / 60.0)
+        tts_chars = self._totals.get("tts_characters", 0)
+        tts_chars_per_min = round(tts_chars / duration_min, 1)
+        cache_hit_pct = round((self._cache_hits / max(1, self._turn_index)) * 100, 1)
+
+        latency_split = {
+            "stt_final_ms": avg_stt_final,
+            "llm_ttft_ms": avg_llm_ttft,
+            "tts_ttfa_ms": avg_tts_ttfa_effective if avg_tts_ttfa_effective is not None else avg_tts_ttfa_raw,
+        }
+
         return {
             "avg_voice_latency_ms": avg_latency,
             "median_voice_latency_ms": median_latency,
@@ -504,6 +526,11 @@ class CallMetricsCollector(FrameProcessor):
             "avg_tts_ttfa_raw_ms": avg_tts_ttfa_raw,
             "avg_tts_ttfa_effective_ms": avg_tts_ttfa_effective,
             "avg_tts_silence_saved_ms": avg_saved_silence if avg_saved_silence > 0 else None,
+            "avg_stt_final_ms": avg_stt_final,
+            "cache_hit_pct": cache_hit_pct,
+            "cache_hits": self._cache_hits,
+            "tts_chars_per_min": tts_chars_per_min,
+            "latency_split": latency_split,
             "turns": self._turn_index,
             "duration_s": duration_s,
             "cost_usd": cost_usd,
@@ -517,9 +544,17 @@ class CallMetricsCollector(FrameProcessor):
         """Call once at call teardown to emit the single end-of-call summary
         line. Safe to call even if the call failed before any turns happened."""
         duration_s = time.monotonic() - self._call_start
+        duration_min = max(0.01, duration_s / 60.0)
+        tts_chars = self._totals.get("tts_characters", 0)
+        tts_chars_per_min = round(tts_chars / duration_min, 1)
+        cache_hit_pct = round((self._cache_hits / max(1, self._turn_index)) * 100, 1)
+
         self._log(
             "call_summary",
             duration_s=round(duration_s, 2),
             turns=self._turn_index,
+            cache_hit_pct=f"{cache_hit_pct}%",
+            cache_hits=self._cache_hits,
+            tts_chars_per_min=tts_chars_per_min,
             **self._totals,
         )

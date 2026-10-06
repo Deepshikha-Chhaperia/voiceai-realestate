@@ -175,6 +175,20 @@ def write_report(
             or (metrics_summary.get("turns") if metrics_summary else None)
         )
 
+        avg_stt_final = (
+            call.get("avg_stt_final_ms")
+            or (metrics_summary.get("avg_stt_final_ms") if metrics_summary else None)
+        )
+        cache_hit_pct = (
+            metrics_summary.get("cache_hit_pct") if metrics_summary else None
+        )
+        cache_hits = (
+            metrics_summary.get("cache_hits") if metrics_summary else 0
+        )
+        tts_chars_per_min = (
+            metrics_summary.get("tts_chars_per_min") if metrics_summary else None
+        )
+
         lines = [
             f"# Call report — `{call_id}`",
             "",
@@ -186,8 +200,9 @@ def write_report(
             f"- **Avg voice-to-voice latency:** {avg_voice_latency or '—'} ms",
             f"- **Median voice-to-voice latency:** {median_voice_latency or '—'} ms",
             f"- **P90 voice-to-voice latency:** {p90_voice_latency or '—'} ms",
-            f"- **Avg LLM TTFT (Time to First Token):** {avg_llm_ttft or '—'} ms",
-            f"- **Avg TTS TTFA (Time to First Audio):** {ttfa_display}",
+            f"- **Latency split:** STT Final: {avg_stt_final or '—'} ms | LLM TTFT: {avg_llm_ttft or '—'} ms | TTS TTFA: {ttfa_display}",
+            f"- **Phrase Cache Hit:** {cache_hit_pct if cache_hit_pct is not None else '—'}% ({cache_hits} hits)",
+            f"- **TTS Characters / min:** {tts_chars_per_min if tts_chars_per_min is not None else '—'}",
             f"- **Turns:** {turns or '—'}",
             f"- **Estimated cost:** ₹{cost_inr:.4f} (${cost_usd:.6f})" if cost_usd is not None else "- **Estimated cost:** not available",
             f"- **Blended CPM (Cost per Minute):** {cpm_str}",

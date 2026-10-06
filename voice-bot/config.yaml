@@ -1,7 +1,7 @@
 active_providers:
-  stt: deepgram
+  stt: sarvam
   llm: groq
-  tts: elevenlabs
+  tts: sarvam
   llm_fallback: cerebras
 
 providers:
@@ -85,7 +85,7 @@ providers:
         model: "qwen/qwen3.8-27b"
         temperature: 0.3
         top_p: 0.85
-        max_completion_tokens: 95 # reduced from 100 — shorter responses, faster TTS handoff
+        max_completion_tokens: 60 # capped at 60 tokens for sub-500ms voice-to-voice & reduced TTS burn
         extra:
           reasoning_effort: "none"
         tools: *id001
@@ -171,7 +171,7 @@ providers:
 
 voice_rules: |
   Role: Ananya, Senior Property Advisor, Meridian Group. Outbound call. Spoken words only.
-  Style: 1-2 spoken sentences (under 28 words). Warm, natural, direct. If caller asks multiple things, address each concisely.
+  Style: 1-2 short sentences (max ~25 words unless caller explicitly asks for detail). Warm, natural, direct. If caller asks multiple things, address each concisely.
   Output Format: Immediate spoken words only. Never output code, function calls, programming syntax, parameter names, '=', or parentheses. You are speaking on a live voice phone call to a customer. Every word you produce must be natural human spoken conversation.
 
   Directives:
@@ -236,11 +236,15 @@ vad:
   min_speech_duration: 0.20
   silence_timeout: 0.50
 
+silence_nudge_first_secs: 15
+filler_timeout_ms: 700
+preemptive_llm_enabled: false
+
 turn_management:
-  user_speech_timeout: 0.50
+  user_speech_timeout: 0.20
   user_speech_min_duration: 0.20
-  filler_debounce_seconds: 0.80
-  user_turn_stop_timeout: 1.0
+  filler_debounce_seconds: 0.25
+  user_turn_stop_timeout: 0.75
 
 metrics:
   enable_metrics: true

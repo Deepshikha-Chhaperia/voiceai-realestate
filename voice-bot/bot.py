@@ -878,13 +878,13 @@ async def warmup_providers(
             )
 
     if aiohttp_session and not aiohttp_session.closed:
-        warmup_urls = [
-            "https://api.sarvam.ai/v1",
-            "https://api.groq.com/openai/v1",
-            "https://openrouter.ai/api/v1",
-            "https://in.api.murf.ai/v1/speech/stream",
-            "https://api.deepgram.com/v1/listen",
-        ]
+        warmup_urls = []
+        if "sarvam" in (active_providers.get("stt"), active_providers.get("tts")):
+            warmup_urls.append("https://api.sarvam.ai/v1")
+        if active_providers.get("llm") == "groq":
+            warmup_urls.append("https://api.groq.com/openai/v1")
+        if active_providers.get("llm_fallback") == "cerebras":
+            warmup_urls.append("https://api.cerebras.ai/v1")
 
         async def _ping(url: str) -> None:
             try:
@@ -1534,11 +1534,26 @@ def _load_audio_cache() -> dict[int, dict[str, bytes]]:
     phrase_files = {
         "greeting_alex": "greeting_alex.wav",
         "greeting_generic": "greeting_generic.wav",
+        "inbound_greeting": "inbound_greeting.wav",
         "opening_intro": "opening_intro.wav",
         "brochure_close": "brochure_close.wav",
         "objection_pivot": "objection_pivot.wav",
         "final_farewell": "final_farewell.wav",
+        "farewell_polite": "farewell_polite.wav",
+        "farewell_hi": "farewell_hi.wav",
         "transfer_announcement": "transfer_announcement.wav",
+        "ack_sure": "ack_sure.wav",
+        "ack_understood": "ack_understood.wav",
+        "ack_got_it": "ack_got_it.wav",
+        "ack_ji_bilkul": "ack_ji_bilkul.wav",
+        "ack_haanji": "ack_haanji.wav",
+        "ack_theek_hai": "ack_theek_hai.wav",
+        "clarify_repeat": "clarify_repeat.wav",
+        "clarify_repeat_hi": "clarify_repeat_hi.wav",
+        "clarify_property": "clarify_property.wav",
+        "visit_confirm": "visit_confirm.wav",
+        "filler_en": "filler_en.wav",
+        "filler_hi": "filler_hi.wav",
     }
 
     def _load_file(path: Path, key: str):
@@ -1580,7 +1595,7 @@ _AUDIO_CACHE: dict[int, dict[str, bytes]] = _load_audio_cache()
 
 def _match_cached_phrase(text: str, turn_count: int = 1) -> str | None:
     """Matches candidate text against known pre-rendered audio cache keys.
-    Matches Turn 1 opening intro, objection pivot attempt 1, and verified final farewell.
+    Matches Turn 1 opening intro, objection pivots, acknowledgments, and farewells.
     """
     if not text:
         return None
@@ -1591,16 +1606,48 @@ def _match_cached_phrase(text: str, turn_count: int = 1) -> str | None:
         return "greeting_alex"
     if ("meridian" in t or "ananya" in t) and "good time to talk" in t:
         return "greeting_generic"
+    if "thank you for calling meridian group" in t and "assist you today" in t:
+        return "inbound_greeting"
 
     # Turn 1 Opening
     if ("meridian" in t and ("bhk" in t or "2" in t or "3" in t)) or (turn_count == 1 and ("meridian" in t or "ananya" in t)):
         return "opening_intro"
 
+    # Clarifications & spam check
+    if "are you looking for a property" in t:
+        return "clarify_property"
+    if "didn't catch that" in t or "say that again" in t:
+        return "clarify_repeat"
+    if "sun nahi paayi" in t or "repeat kar sakte hain" in t:
+        return "clarify_repeat_hi"
+
+    # Quick Acknowledgments
+    if t in ("sure, absolutely.", "sure, absolutely", "sure absolutely"):
+        return "ack_sure"
+    if t in ("understood.", "understood", "okay, got it.", "okay got it"):
+        return "ack_understood"
+    if t in ("ji bilkul.", "ji bilkul", "ji, bilkul"):
+        return "ack_ji_bilkul"
+    if t in ("haanji, bilkul.", "haanji, bilkul", "haanji bilkul", "haanji"):
+        return "ack_haanji"
+    if t in ("theek hai.", "theek hai"):
+        return "ack_theek_hai"
+
+    # Site visit confirmation
+    if "preference for the site visit" in t or "scheduled your site visit" in t:
+        return "visit_confirm"
+
     # Objection pivot
     if "totally understand" in t and ("location" in t or "price" in t or "right time" in t or "time" in t):
         return "objection_pivot"
 
-    # Farewell
+    # Brochure close
+    if "brochure and floor plans on whatsapp" in t:
+        return "brochure_close"
+
+    # Farewells
+    if "dhanyavaad" in t and "din shubh rahe" in t:
+        return "farewell_hi"
     if any(k in t for k in ("thanks for your time", "thank you for your time")) and any(k in t for k in ("have a great day", "have a nice day", "have a good day", "have a wonderful day", "goodbye", "bye")):
         return "final_farewell"
 
@@ -1610,10 +1657,26 @@ def _match_cached_phrase(text: str, turn_count: int = 1) -> str | None:
 _CACHED_PHRASE_TEXTS: dict[str, str] = {
     "greeting_alex": "Hi, am I speaking with Alex?",
     "greeting_generic": "Hi, this is Ananya from Meridian Group. Is this a good time to talk?",
+    "inbound_greeting": "Hello, thank you for calling Meridian Group. How may I assist you today?",
     "opening_intro": "Great, this is Ananya from Meridian Group. Are you looking for a 2 or 3 BHK?",
     "brochure_close": "Sure, our team will share the brochure and floor plans on WhatsApp shortly. Have a wonderful day!",
     "objection_pivot": "Totally understand, is it the location, price, or just not the right time?",
     "final_farewell": "Understood, thanks for your time. Have a wonderful day!",
+    "farewell_polite": "Thank you for your time. Have a great day!",
+    "farewell_hi": "Dhanyavaad, aapka din shubh rahe!",
+    "transfer_announcement": "Please hold while I connect you to a senior property advisor.",
+    "ack_sure": "Sure, absolutely.",
+    "ack_understood": "Understood.",
+    "ack_got_it": "Okay, got it.",
+    "ack_ji_bilkul": "Ji bilkul.",
+    "ack_haanji": "Haanji, bilkul.",
+    "ack_theek_hai": "Theek hai.",
+    "clarify_repeat": "Sorry, I didn't catch that. Could you say that again?",
+    "clarify_repeat_hi": "Sorry, main sun nahi paayi. Kya aap repeat kar sakte hain?",
+    "clarify_property": "Hello? Are you looking for a property?",
+    "visit_confirm": "Wonderful, I have noted your preference for the site visit.",
+    "filler_en": "Sure, one moment, let me check that for you.",
+    "filler_hi": "Haan, ek second, main check karti hoon.",
 }
 
 
@@ -2787,11 +2850,11 @@ class _DelayedRaceFiller(FrameProcessor):
         self,
         *,
         stream_id: str,
-        sample_rate: int = 16000,
+        sample_rate: int = 8000,
         interruption_audio_gate: Any = None,
         language_state: Any = None,
         hangup_state: dict | None = None,
-        timeout_seconds: float = 0.280,
+        timeout_seconds: float = 0.700,
     ):
         super().__init__()
         self._stream_id = stream_id
@@ -2820,12 +2883,18 @@ class _DelayedRaceFiller(FrameProcessor):
                 and self._turn_index == turn_id
                 and not (self._hangup_state and self._hangup_state.get("done", False))
             ):
-                filler_key = "filler_en"
-                pcm = _AUDIO_CACHE.get(self._sample_rate, {}).get(filler_key)
+                lang = (
+                    self._language_state.get_language()
+                    if self._language_state and hasattr(self._language_state, "get_language")
+                    else "en"
+                )
+                filler_key = "filler_hi" if lang in ("hi", "Hindi") else "filler_en"
+                pcm = _AUDIO_CACHE.get(self._sample_rate, {}).get(filler_key) or _AUDIO_CACHE.get(self._sample_rate, {}).get("filler_en")
                 if pcm and self._interruption_audio_gate:
                     logger.info(
-                        "[{}] 280ms Race Filler: LLM wait crossed 280ms on turn {} -> playing filler '{}'",
+                        "[{}] Slow-Turn Filler: LLM TTFT wait crossed {:.0f}ms on turn {} -> playing filler '{}'",
                         self._stream_id,
+                        self._timeout_seconds * 1000,
                         turn_id,
                         filler_key,
                     )
@@ -2878,7 +2947,7 @@ class _SilenceChecker(FrameProcessor):
         task: PipelineTask | None = None,
         context_aggregator_user: Any,
         call_end_coordinator: Any = None,
-        silence_threshold_secs: float = 14.0,
+        silence_threshold_secs: float = 15.0,
         second_threshold_secs: float = 14.0,
         third_threshold_secs: float = 14.0,
         check_in_message: str = "Hello? Are you there?",
@@ -3114,12 +3183,195 @@ class _SilenceChecker(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class _SpamQualifyGate(FrameProcessor):
+    """20-second Qualify / Spam Gate (Item 2).
+
+    Decides in the first ~20 seconds of a call whether caller is a real person
+    or dead/spam/machine call, using deterministic thresholds only:
+      1. First ~5-8s VAD pattern:
+         - Continuous speech burst > 2.4s before any bot audio played -> likely machine greeting/recording.
+         - Zero speech at all for 7.0s from connection -> dead line.
+         Action: short polite goodbye, immediate hangup, log verdict + features.
+      2. At ~10-20s:
+         - Checks committed transcripts for real-estate intent tokens or valid greeting responses.
+         - If neither: sends one clarifying nudge ("Hello? Are you looking for a property?").
+         - If next response is still empty or nonsense, ends call politely.
+      3. Logs every gate verdict + features per call for tuning.
+    """
+
+    INTENT_TOKENS = frozenset({
+        "bhk", "flat", "apartment", "villa", "plot", "unit", "studio", "house", "ghar", "makan", "kamra",
+        "price", "cost", "rate", "daam", "keemat", "budget", "lakh", "lakhs", "lac", "lacs", "crore", "crores", "cr",
+        "visit", "site", "dekhna", "location", "area", "possession", "vastu", "balcony", "floor", "parking",
+        "loan", "bank", "payment", "builder", "meridian", "brochure", "sqft", "sq ft", "square",
+        # Sensible answers to opening questions ("Are you looking for a 2 or 3 BHK?" / "Is this a good time?")
+        "2", "3", "two", "three", "both", "yes", "no", "yeah", "yep", "sure", "haan", "nahi", "nahin", "theek",
+        "speaking", "bolo", "batao", "suno", "tell", "interested", "looking", "buy", "investment",
+    })
+
+    def __init__(
+        self,
+        *,
+        stream_id: str,
+        force_hangup_fn: Callable[[str], Awaitable[None]] | None = None,
+        is_call_ending: Callable[[], bool] | None = None,
+        goodbye_message: str = "Looks like you're busy right now. I'll call you later, have a great day!",
+        clarifying_message: str = "Hello? Are you looking for a property?",
+    ) -> None:
+        super().__init__()
+        self._stream_id = stream_id
+        self._force_hangup_fn = force_hangup_fn
+        self._is_call_ending = is_call_ending or (lambda: False)
+        self._goodbye_message = goodbye_message
+        self._clarifying_message = clarifying_message
+
+        self._task = None
+        self._connected_at = time.monotonic()
+        self._bot_audio_started = False
+        self._user_speech_start_time: float | None = None
+        self._user_speech_burst_max: float = 0.0
+        self._user_ever_spoke = False
+        self._user_turn_count = 0
+        self._gate_resolved = False
+        self._clarifying_nudge_sent = False
+        self._monitor_task: asyncio.Task | None = None
+
+    def bind_task(self, task) -> None:
+        self._task = task
+        if self._monitor_task is None:
+            self._monitor_task = asyncio.create_task(self._monitor_loop())
+
+    async def _hangup_with_verdict(self, verdict: str, reason: str, **features: Any) -> None:
+        if self._gate_resolved or self._is_call_ending():
+            return
+        self._gate_resolved = True
+        elapsed = round(time.monotonic() - self._connected_at, 2)
+        features_str = " ".join(f"{k}={v}" for k, v in features.items())
+        logger.info(
+            "[{}] SpamQualifyGate VERDICT={} reason={} elapsed={}s {}",
+            self._stream_id,
+            verdict,
+            reason,
+            elapsed,
+            features_str,
+        )
+        try:
+            if self._task and not self._is_call_ending():
+                await self._task.queue_frames(
+                    [TTSSpeakFrame(text=self._goodbye_message, append_to_context=False)]
+                )
+                await asyncio.sleep(2.0)
+        except Exception:
+            pass
+        if self._force_hangup_fn:
+            await self._force_hangup_fn(f"spam_gate:{verdict}")
+
+    async def _monitor_loop(self) -> None:
+        """Background checker for early VAD anomalies (0-8s dead line / machine burst)."""
+        try:
+            # Check 1: dead line silence at 7.0s
+            await asyncio.sleep(7.0)
+            if not self._gate_resolved and not self._is_call_ending():
+                if not self._user_ever_spoke and self._user_turn_count == 0:
+                    await self._hangup_with_verdict(
+                        "dead_line",
+                        "no_speech_within_7s",
+                        speech_detected=False,
+                        max_burst=0.0,
+                    )
+                    return
+
+            # Check 2: check at 15.0s if turn 1 occurred but had zero intent
+            await asyncio.sleep(8.0)  # total 15.0s
+            if not self._gate_resolved and not self._is_call_ending():
+                if self._user_turn_count >= 1 and not self._clarifying_nudge_sent:
+                    logger.info(
+                        "[{}] SpamQualifyGate: 15s intent check; sending clarifying nudge",
+                        self._stream_id,
+                    )
+                    self._clarifying_nudge_sent = True
+                    if self._task and not self._is_call_ending():
+                        await self._task.queue_frames(
+                            [TTSSpeakFrame(text=self._clarifying_message, append_to_context=False)]
+                        )
+        except asyncio.CancelledError:
+            pass
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+
+        if self._gate_resolved or self._is_call_ending():
+            await self.push_frame(frame, direction)
+            return
+
+        frame_type = type(frame).__name__
+
+        if frame_type == "BotStartedSpeakingFrame":
+            self._bot_audio_started = True
+
+        elif frame_type == "UserStartedSpeakingFrame":
+            self._user_ever_spoke = True
+            self._user_speech_start_time = time.monotonic()
+
+        elif frame_type == "UserStoppedSpeakingFrame":
+            if self._user_speech_start_time is not None:
+                duration = time.monotonic() - self._user_speech_start_time
+                self._user_speech_burst_max = max(self._user_speech_burst_max, duration)
+                # Signal A: continuous speech burst > 2.4s BEFORE bot audio started
+                if not self._bot_audio_started and duration > 2.4:
+                    await self._hangup_with_verdict(
+                        "machine_greeting",
+                        "continuous_burst_before_bot_audio",
+                        burst_duration=round(duration, 2),
+                    )
+                    await self.push_frame(frame, direction)
+                    return
+                self._user_speech_start_time = None
+
+        elif frame_type == "TranscriptionFrame":
+            self._user_turn_count += 1
+            text = (getattr(frame, "text", "") or "").lower()
+            tokens = set(re.findall(r"\w+", text))
+
+            # Match against intent tokens
+            matched_intent = tokens & self.INTENT_TOKENS
+            if matched_intent:
+                self._gate_resolved = True
+                elapsed = round(time.monotonic() - self._connected_at, 2)
+                logger.info(
+                    "[{}] SpamQualifyGate VERDICT=qualified_real_caller elapsed={}s matched_tokens={}",
+                    self._stream_id,
+                    elapsed,
+                    list(matched_intent)[:5],
+                )
+            elif self._clarifying_nudge_sent:
+                # User had a chance after clarifying nudge, but still gave no intent/empty response
+                await self._hangup_with_verdict(
+                    "unqualified_no_intent",
+                    "no_intent_after_clarifying_nudge",
+                    transcript_length=len(text),
+                )
+                await self.push_frame(frame, direction)
+                return
+
+        elif frame_type in ("CancelFrame", "EndFrame", "EndTaskFrame"):
+            if self._monitor_task and not self._monitor_task.done():
+                self._monitor_task.cancel()
+
+        await self.push_frame(frame, direction)
+
+    async def cleanup(self) -> None:
+        if self._monitor_task and not self._monitor_task.done():
+            self._monitor_task.cancel()
+        await super().cleanup()
+
+
 class DebouncedExternalUserTurnStopStrategy(ExternalUserTurnStopStrategy):
     """
     Subclasses ExternalUserTurnStopStrategy to prevent premature turn cuts on filler/hesitation words.
 
     If an utterance consists purely of filler/hesitation words (e.g. 'uh', 'um', 'hmm', 'er', 'acha toh'),
-    an extra debounce buffer (450ms) is applied allowing the user to complete their thought
+    an extra debounce buffer (250ms) is applied allowing the user to complete their thought
     without the bot barging in.
 
     CRITICAL: NEVER use character count (<= 3). 'Yes' (3 chars) and 'No' (2 chars)
@@ -3162,8 +3414,8 @@ class DebouncedExternalUserTurnStopStrategy(ExternalUserTurnStopStrategy):
     def __init__(
         self,
         *,
-        timeout: float = 0.25,
-        filler_debounce_seconds: float = 0.45,
+        timeout: float = 0.20,
+        filler_debounce_seconds: float = 0.25,
         wait_for_transcript: bool = True,
         **kwargs,
     ):
@@ -4600,9 +4852,9 @@ async def run_bot(
 
         call_metrics = CallMetricsCollector(
             call_id=stream_id,
-            stt_provider=active.get("stt", "deepgram"),
+            stt_provider=active.get("stt", "sarvam"),
             llm_provider=llm_provider_used,
-            tts_provider=active.get("tts", "elevenlabs"),
+            tts_provider=active.get("tts", "sarvam"),
             language=config.get("language", {}).get("initial", "en"),
             cost_rates=config.get("cost_rates", {}),
         )
@@ -5325,7 +5577,10 @@ async def run_bot(
                 cancel_on_interruption=True,
             )
 
-        # Initial context messages; greeting is appended directly during connection
+        # Item 6: Prompt ordering for Groq / Cerebras prefix caching.
+        # Static system prompt and project facts are strictly FIRST in the message array.
+        # Any per-call / dynamic context (customer name, IST date) is appended SECOND (last).
+        # This guarantees exact-prefix caching (~50% token cost reduction & lower TTFT).
         messages = [
             {
                 "role": "system",
@@ -5387,33 +5642,53 @@ async def run_bot(
         if fallback_vad_processor is not None:
             user_turn_start_strategies.insert(0, VADUserTurnStartStrategy())
 
+        user_turn_stop_strategies = []
+        # Item 3: Try Pipecat Smart Turn (local ONNX model) first for sub-250ms endpointing
+        try:
+            from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+            from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
+                TurnAnalyzerUserTurnStopStrategy,
+            )
+            smart_analyzer = LocalSmartTurnAnalyzerV3()
+            user_turn_stop_strategies.append(
+                TurnAnalyzerUserTurnStopStrategy(turn_analyzer=smart_analyzer)
+            )
+            logger.info("[{}] Smart Turn endpointing enabled (LocalSmartTurnAnalyzerV3)", stream_id)
+        except Exception as _st_err:
+            logger.info(
+                "[{}] Smart Turn not available ({}); fallback to debounced stop strategy",
+                stream_id,
+                _st_err,
+            )
+            user_turn_stop_strategies.append(
+                DebouncedExternalUserTurnStopStrategy(
+                    timeout=float(
+                        turn_config.get(
+                            "user_speech_timeout",
+                            0.20,
+                        )
+                    ),
+                    filler_debounce_seconds=float(
+                        turn_config.get(
+                            "filler_debounce_seconds",
+                            0.25,
+                        )
+                    ),
+                    wait_for_transcript=True,
+                )
+            )
+
         context_aggregator = LLMContextAggregatorPair(
             context,
             user_params=LLMUserAggregatorParams(
                 user_turn_strategies=UserTurnStrategies(
                     start=user_turn_start_strategies,
-                    stop=[
-                        DebouncedExternalUserTurnStopStrategy(
-                            timeout=float(
-                                turn_config.get(
-                                    "user_speech_timeout",
-                                    0.20,
-                                )
-                            ),
-                            filler_debounce_seconds=float(
-                                turn_config.get(
-                                    "filler_debounce_seconds",
-                                    0.15,
-                                )
-                            ),
-                            wait_for_transcript=True,
-                        ),
-                    ],
+                    stop=user_turn_stop_strategies,
                 ),
                 user_turn_stop_timeout=float(
                     turn_config.get(
                         "user_turn_stop_timeout",
-                        1.0,
+                        0.75,
                     )
                 ),
             ),
@@ -5481,8 +5756,8 @@ async def run_bot(
             task=None,
             context_aggregator_user=context_aggregator.user(),
             call_end_coordinator=call_end_coordinator,
-            # TUNED: 14.0s intervals provide human-like pause tolerance before nudge
-            silence_threshold_secs=14.0,
+            # TUNED: 15.0s first interval (then 14s) provides human-like pause tolerance before nudge
+            silence_threshold_secs=float(config.get("silence_nudge_first_secs", 15.0)),
             second_threshold_secs=14.0,
             third_threshold_secs=14.0,
             check_in_message="Hello? Are you there?",
@@ -5504,6 +5779,21 @@ async def run_bot(
             config=config,
         )
 
+        delayed_race_filler = _DelayedRaceFiller(
+            stream_id=stream_id,
+            sample_rate=sample_rate,
+            interruption_audio_gate=interruption_audio_gate,
+            language_state=language_state,
+            hangup_state=hangup_state,
+            timeout_seconds=float(config.get("filler_timeout_ms", 700)) / 1000.0,
+        )
+
+        spam_qualify_gate = _SpamQualifyGate(
+            stream_id=stream_id,
+            force_hangup_fn=_force_hangup_and_mark_done,
+            is_call_ending=lambda: call_end_coordinator.is_ending,
+        )
+
         pipeline_elements = [transport.input()]
         if fallback_vad_processor is not None:
             pipeline_elements.append(fallback_vad_processor)
@@ -5513,12 +5803,14 @@ async def run_bot(
             context_aggregator.user(),
             fast_path_router,
             llm,
+            delayed_race_filler,
             spoken_text_guard,
             tts,
             interruption_audio_gate,
             call_end_coordinator,
             termination_processor,
             silence_checker,
+            spam_qualify_gate,
             stall_watchdog,
             transport.output(),
             context_aggregator.assistant(),
@@ -5555,6 +5847,7 @@ async def run_bot(
         silence_checker.set_task(task)
         call_end_coordinator.bind_task(task)
         stall_watchdog.bind_task(task)
+        spam_qualify_gate.bind_task(task)
 
         # Outbound greeting initialization
         _greeting_sent = {
