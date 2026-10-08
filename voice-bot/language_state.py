@@ -19,18 +19,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
-LanguageCode = Literal["en", "hi", "te", "de", "ar"]
+LanguageCode = Literal["en", "hi", "te"]
 
 SUPPORTED_LANGUAGES: frozenset[LanguageCode] = frozenset(
-    {"en", "hi", "te", "de", "ar"}
+    {"en", "hi", "te"}
 )
 
 LANGUAGE_LOCALES: dict[LanguageCode, str] = {
     "en": "en-IN",
     "hi": "hi-IN",
     "te": "te-IN",
-    "de": "de-DE",
-    "ar": "ar-AE",
 }
 
 MIN_STT_CONFIDENCE = 0.75
@@ -69,6 +67,7 @@ class LanguageState:
         self,
         language: Optional[str],
         confidence: Optional[float] = None,
+        text: Optional[str] = None,
     ) -> tuple[LanguageCode, bool]:
         """Consume one finalized STT language observation.
 
@@ -77,6 +76,12 @@ class LanguageState:
         - Switching from Hindi/Telugu back to English requires sustained English turns to prevent flip-flopping.
         """
         self.turn_index += 1
+
+        if text:
+            import re
+            clean = re.sub(r"[^\w\s]", "", str(text).lower()).strip()
+            if clean in {"oh", "yeah", "okay", "ok", "hmm", "haan", "accha", "acha", "uh", "um"}:
+                return self.current_language, False
 
         detected = normalize_language(language)
         confidence_value = (
@@ -108,7 +113,25 @@ class LanguageState:
             )
             return new, new != old
 
-        # Switching back to pure English requires 2 consecutive turns to avoid flapping
+        # Switching back to pure English requires sustained turns (e.g. 2) to avoid flapping
+        if detected == "en" and self.current_language in {"hi", "te"}:
+            if self.candidate_language == detected:
+                self.consecutive_candidate_turns += 1
+            else:
+                self.candidate_language = detected
+                self.candidate_confidence = confidence_value
+                self.consecutive_candidate_turns = 1
+
+            if self.consecutive_candidate_turns >= self.sustained_switch_turns:
+                new = self._switch(
+                    detected,
+                    "sustained_change",
+                    confidence_value,
+                )
+                return new, new != old
+
+            return old, False
+
         if not self.established:
             new = self._switch(
                 detected,

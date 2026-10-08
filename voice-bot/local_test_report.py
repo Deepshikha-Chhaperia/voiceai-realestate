@@ -197,13 +197,13 @@ def write_report(
             f"- **Duration:** {duration_s}s" if duration_s is not None else "- **Duration:** —",
             f"- **Campaign:** {call.get('campaign_id') or '—'}",
             f"- **Disposition:** `{disposition_val or 'INCOMPLETE'}`",
-            f"- **Avg voice-to-voice latency:** {avg_voice_latency or '—'} ms",
+            f"- **Avg voice-to-voice latency:** {avg_voice_latency or '—'} ms" + (f" (Announced-stop: {metrics_summary.get('avg_speech_stop_to_audio_ms', '—')} ms | Final-transcript: {metrics_summary.get('avg_transcript_to_audio_ms', '—')} ms)" if metrics_summary and (metrics_summary.get('avg_speech_stop_to_audio_ms') or metrics_summary.get('avg_transcript_to_audio_ms')) else ""),
             f"- **Median voice-to-voice latency:** {median_voice_latency or '—'} ms",
             f"- **P90 voice-to-voice latency:** {p90_voice_latency or '—'} ms",
             f"- **Latency split:** STT Final: {avg_stt_final or '—'} ms | LLM TTFT: {avg_llm_ttft or '—'} ms | TTS TTFA: {ttfa_display}",
             f"- **Phrase Cache Hit:** {cache_hit_pct if cache_hit_pct is not None else '—'}% ({cache_hits} hits)",
             f"- **TTS Characters / min:** {tts_chars_per_min if tts_chars_per_min is not None else '—'}",
-            f"- **Turns:** {turns or '—'}",
+            f"- **Turns:** {turns or '—'} (No reply: {metrics_summary.get('turns_with_no_reply', 0) if metrics_summary else 0} | Cached audio: {metrics_summary.get('cached_audio_turns', 0) if metrics_summary else 0})",
             f"- **Estimated cost:** ₹{cost_inr:.4f} (${cost_usd:.6f})" if cost_usd is not None else "- **Estimated cost:** not available",
             f"- **Blended CPM (Cost per Minute):** {cpm_str}",
         ]
@@ -314,6 +314,19 @@ def write_report(
         latest.write_text("\n".join(lines), encoding="utf-8")
 
         logger.info("[{}] Local test report written to {}", call_id, path)
+
+        try:
+            import extract_live_call_evidence
+            if hasattr(extract_live_call_evidence, "extract_call_evidence"):
+                import asyncio
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(extract_live_call_evidence.extract_call_evidence(str(call_id)))
+                except RuntimeError:
+                    pass
+        except Exception as _ev_err:
+            logger.debug("[{}] Automatic evidence extraction notice: {}", call_id, _ev_err)
+
         return str(path)
     except Exception as e:
         logger.warning("[{}] Failed to write local test report: {}", call_id, e)

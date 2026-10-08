@@ -40,7 +40,12 @@ from pipecat.frames.frames import (
     LLMFullResponseStartFrame,
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
+    MetricsFrame,
     LLMContextFrame,
+    LLMRunFrame,
+    FunctionCallResultFrame,
+    ProposedUserStartedSpeakingFrame,
+    ProposedUserStoppedSpeakingFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
@@ -50,6 +55,9 @@ from pipecat.frames.frames import (
     TTSSpeakFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
+    FunctionCallResultProperties,
 )
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -66,6 +74,9 @@ from pipecat.turns.user_stop import (
     ExternalUserTurnStopStrategy,
     SpeechTimeoutUserTurnStopStrategy,
 )
+from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import TurnAnalyzerUserTurnStopStrategy
+from pipecat.audio.turn.smart_turn.base_smart_turn import EndOfTurnState
+from pipecat.turns.types import ProcessFrameResult
 from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.pipeline.pipeline import Pipeline
@@ -322,7 +333,7 @@ class LanguageObserver(FrameProcessor):
             return None
         
         # Default supported languages if not provided
-        valid_langs = supported if supported is not None else frozenset({"en", "hi", "te", "de"})
+        valid_langs = supported if supported is not None else frozenset({"en", "hi", "te"})
 
         # Reject descriptive, past-tense, negation, or commentary statements
         if re.search(
@@ -432,7 +443,7 @@ class LanguageObserver(FrameProcessor):
                 raw_language, probability = self._extract_language(frame)
                 old_language = self._language_state.current_language
                 new_language, switched = self._language_state.observe_stt(
-                    raw_language, probability
+                    raw_language, probability, text=text
                 )
 
                 if self._lead_memory is not None:
@@ -520,16 +531,33 @@ def _attach_resilient_failover(service: Any, provider_name: str, config: dict) -
     """Attaches an automated in-flight failover to the LLM service.
 
     If the primary LLM provider/model hits an API rate limit (429), overload,
-    or service error mid-call, this catches the exception immediately and falls back
-    to the secondary provider (e.g. Cerebras) or backup model rather than dropping
-    to 0 tokens and triggering StallWatchdog termination.
+    or connection/token timeout mid-call, this catches the exception immediately and falls back
+     rather than dropping to 0 tokens and triggering StallWatchdog termination.
     """
     orig_get_chat = getattr(service, "get_chat_completions", None)
     if not orig_get_chat:
         return
 
-    cerebras_key = os.getenv("CEREBRAS_API_KEY")
-    groq_key = os.getenv("GROQ_API_KEY")
+    if hasattr(service, "_client") and hasattr(service._client, "max_retries"):
+        service._client.max_retries = 0
+
+    def _extract_err_details(exc: Exception) -> tuple[str, str]:
+        cls_name = type(exc).__name__
+        detail = str(exc) if str(exc).strip() else repr(exc)
+        status = getattr(exc, "status_code", None)
+        resp = getattr(exc, "response", None)
+        headers = getattr(resp, "headers", {}) if resp is not None else {}
+        rem_toks = headers.get("x-ratelimit-remaining-tokens")
+        retry_aft = headers.get("retry-after")
+        header_info = ""
+        if status is not None:
+            header_info += f" status={status}"
+        if rem_toks is not None:
+            header_info += f" x-ratelimit-remaining-tokens={rem_toks}"
+        if retry_aft is not None:
+            header_info += f" retry-after={retry_aft}"
+        full_str = f"{cls_name}: {detail}{header_info}"
+        return cls_name, full_str
 
     async def _resilient_get_chat_completions(context: Any):
         async def _stream_wrapper():
@@ -537,83 +565,236 @@ def _attach_resilient_failover(service: Any, provider_name: str, config: dict) -
             first_chunk = None
             iter_stream = None
 
-            try:
-                primary_stream = await orig_get_chat(context)
-                iter_stream = primary_stream.__aiter__()
-                try:
-                    # Fast timeout guard: if primary doesn't emit first token within 1.5s
-                    # (e.g. rate-limit queue delay), failover immediately rather than stalling.
-                    first_chunk = await asyncio.wait_for(iter_stream.__anext__(), timeout=1.5)
-                except (asyncio.TimeoutError, Exception) as stream_err:
-                    logger.warning(
-                        "[LLM Failover] Primary LLM provider '{}' first token failed/timed out after 1.5s ({}); triggering fast failover...",
-                        provider_name,
-                        stream_err,
-                    )
-                    primary_failed = True
-            except Exception as e:
-                logger.warning(
-                    "[LLM Failover] Primary LLM provider '{}' stream creation failed ({}); attempting automated failover...",
+            call_metrics = getattr(context, "call_metrics", None) or getattr(service, "_call_metrics", None)
+            lead_mem = getattr(context, "lead_memory", None) or getattr(service, "_lead_memory", None)
+
+            # Circuit breaker: if primary failed earlier this call, skip Groq for circuit duration
+            now_mono = time.monotonic()
+            skip_val = getattr(service, "_skip_primary_until", 0.0)
+            skip_until = float(skip_val) if isinstance(skip_val, (int, float)) else 0.0
+            if now_mono < skip_until:
+                logger.info(
+                    "[LLM Skip] Primary provider '{}' failed earlier this call; skipping for {:.1f}s more and using recovery line directly",
                     provider_name,
-                    e,
+                    skip_until - now_mono,
                 )
                 primary_failed = True
+            else:
+                # Diagnostics: log exact messages payload before LLM request
+                msgs = getattr(context, "messages", []) or []
+                msg_roles = [m.get("role") for m in msgs if isinstance(m, dict)]
+                msg_lens = [len(str(m.get("content", ""))) for m in msgs if isinstance(m, dict)]
+                logger.info(
+                    "[LLM Request] provider={} msg_count={} roles={} char_lens={}",
+                    provider_name,
+                    len(msgs),
+                    msg_roles,
+                    msg_lens,
+                )
+
+                t0 = time.monotonic()
+                try:
+                    primary_stream = await asyncio.wait_for(orig_get_chat(context), timeout=1.5)
+                    iter_stream = primary_stream.__aiter__()
+                    try:
+                        first_chunk = await asyncio.wait_for(iter_stream.__anext__(), timeout=1.5)
+                        ttfc_ms = round((time.monotonic() - t0) * 1000, 1)
+                        logger.info("[LLM Response] provider={} TTFC={}ms", provider_name, ttfc_ms)
+                    except (asyncio.TimeoutError, Exception) as stream_err:
+                        elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
+                        err_cls, err_str = _extract_err_details(stream_err)
+                        if call_metrics and hasattr(call_metrics, "record_provider_failure"):
+                            call_metrics.record_provider_failure(provider_name, err_str, elapsed_ms)
+
+                        # Check 429 rate limit with retry-after header
+                        is_429 = "429" in err_str or "ratelimit" in err_str.lower()
+                        retry_val = None
+                        if "retry-after=" in err_str:
+                            try:
+                                retry_val = float(err_str.split("retry-after=")[1].split()[0])
+                            except (ValueError, IndexError):
+                                pass
+
+                        if is_429 and retry_val is not None and retry_val <= 2.0:
+                            logger.warning(
+                                "[LLM 429] Provider '{}' hit 429 with retry-after={:.1f}s <= 2.0s; waiting and retrying once...",
+                                provider_name,
+                                retry_val,
+                            )
+                            try:
+                                await asyncio.sleep(max(0.2, retry_val))
+                                retry_stream = await asyncio.wait_for(orig_get_chat(context), timeout=2.0)
+                                iter_stream = retry_stream.__aiter__()
+                                first_chunk = await asyncio.wait_for(iter_stream.__anext__(), timeout=2.0)
+                                primary_failed = False
+                                service._skip_primary_until = 0.0
+                            except Exception as retry_e:
+                                retry_elapsed = round((time.monotonic() - t0) * 1000, 1)
+                                _, retry_err_str = _extract_err_details(retry_e)
+                                logger.warning(
+                                    "[LLM 429] Retry after 429 also failed after {}ms ({}); skipping primary for 60s",
+                                    retry_elapsed,
+                                    retry_err_str,
+                                )
+                                service._skip_primary_until = time.monotonic() + 60.0
+                                primary_failed = True
+                        elif "failed_generation" in err_str.lower() or "failed to call a function" in err_str.lower():
+                            logger.warning(
+                                "[LLM] Primary LLM failed_generation on first token after {}ms ({}); retrying 1 time...",
+                                elapsed_ms,
+                                err_str,
+                            )
+                            try:
+                                retry_stream = await asyncio.wait_for(orig_get_chat(context), timeout=2.0)
+                                iter_stream = retry_stream.__aiter__()
+                                first_chunk = await asyncio.wait_for(iter_stream.__anext__(), timeout=2.0)
+                                primary_failed = False
+                                service._skip_primary_until = 0.0
+                            except Exception as retry_e:
+                                retry_elapsed = round((time.monotonic() - t0) * 1000, 1)
+                                _, retry_err_str = _extract_err_details(retry_e)
+                                logger.warning(
+                                    "[LLM Failover] Primary retry after failed_generation also failed after {}ms ({}); skipping primary...",
+                                    retry_elapsed,
+                                    retry_err_str,
+                                )
+                                service._skip_primary_until = time.monotonic() + 60.0
+                                primary_failed = True
+                        else:
+                            skip_dur = min(60.0, max(10.0, retry_val)) if (is_429 and retry_val is not None) else 60.0
+                            service._skip_primary_until = time.monotonic() + skip_dur
+                            logger.warning(
+                                "[LLM Failover] Primary LLM provider '{}' first token failed/timed out after {}ms ({}); skipping primary for {:.1f}s...",
+                                provider_name,
+                                elapsed_ms,
+                                err_str,
+                                skip_dur,
+                            )
+                            primary_failed = True
+                except (asyncio.TimeoutError, Exception) as e:
+                    elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
+                    err_cls, err_str = _extract_err_details(e)
+                    if call_metrics and hasattr(call_metrics, "record_provider_failure"):
+                        call_metrics.record_provider_failure(provider_name, err_str, elapsed_ms)
+
+                    is_429 = "429" in err_str or "ratelimit" in err_str.lower()
+                    retry_val = None
+                    if "retry-after=" in err_str:
+                        try:
+                            retry_val = float(err_str.split("retry-after=")[1].split()[0])
+                        except (ValueError, IndexError):
+                            pass
+
+                    if is_429 and retry_val is not None and retry_val <= 2.0:
+                        logger.warning(
+                            "[LLM 429] Provider '{}' stream init hit 429 with retry-after={:.1f}s <= 2.0s; waiting and retrying once...",
+                            provider_name,
+                            retry_val,
+                        )
+                        try:
+                            await asyncio.sleep(max(0.2, retry_val))
+                            retry_stream = await asyncio.wait_for(orig_get_chat(context), timeout=2.0)
+                            iter_stream = retry_stream.__aiter__()
+                            first_chunk = await asyncio.wait_for(iter_stream.__anext__(), timeout=2.0)
+                            primary_failed = False
+                            service._skip_primary_until = 0.0
+                        except Exception as retry_e:
+                            retry_elapsed = round((time.monotonic() - t0) * 1000, 1)
+                            _, retry_err_str = _extract_err_details(retry_e)
+                            logger.warning(
+                                "[LLM 429] Stream init retry after 429 failed after {}ms ({}); skipping primary for 60s",
+                                retry_elapsed,
+                                retry_err_str,
+                            )
+                            service._skip_primary_until = time.monotonic() + 60.0
+                            primary_failed = True
+                    elif "failed_generation" in err_str.lower() or "failed to call a function" in err_str.lower():
+                        logger.warning(
+                            "[LLM] Primary LLM failed_generation on stream init after {}ms ({}); retrying 1 time...",
+                            elapsed_ms,
+                            err_str,
+                        )
+                        try:
+                            retry_stream = await asyncio.wait_for(orig_get_chat(context), timeout=2.0)
+                            iter_stream = retry_stream.__aiter__()
+                            first_chunk = await asyncio.wait_for(iter_stream.__anext__(), timeout=2.0)
+                            primary_failed = False
+                            service._skip_primary_until = 0.0
+                        except Exception as retry_e:
+                            retry_elapsed = round((time.monotonic() - t0) * 1000, 1)
+                            _, retry_err_str = _extract_err_details(retry_e)
+                            logger.warning(
+                                "[LLM Failover] Primary retry on stream init failed after {}ms ({}); skipping primary...",
+                                retry_elapsed,
+                                retry_err_str,
+                            )
+                            service._skip_primary_until = time.monotonic() + 60.0
+                            primary_failed = True
+                    else:
+                        skip_dur = min(60.0, max(10.0, retry_val)) if (is_429 and retry_val is not None) else 60.0
+                        service._skip_primary_until = time.monotonic() + skip_dur
+                        logger.warning(
+                            "[LLM Failover] Primary LLM provider '{}' stream creation failed after {}ms ({}); skipping primary for {:.1f}s...",
+                            provider_name,
+                            elapsed_ms,
+                            err_str,
+                            skip_dur,
+                        )
+                        primary_failed = True
 
             if not primary_failed and first_chunk is not None:
                 yield first_chunk
+                pri_tokens = 1
                 async for chunk in iter_stream:
+                    if hasattr(chunk, "choices") and chunk.choices and hasattr(chunk.choices[0], "delta"):
+                        if getattr(chunk.choices[0].delta, "content", None):
+                            pri_tokens += 1
                     yield chunk
+                if call_metrics and hasattr(call_metrics, "record_llm_token_usage"):
+                    prompt_est = max(1, sum(len(str(m.get("content", ""))) for m in msgs if isinstance(m, dict)) // 4)
+                    call_metrics.record_llm_token_usage(provider_name, getattr(service, "_model", "qwen/qwen3.8-27b"), prompt_est, pri_tokens)
                 return
 
-            # Strategy 1: Fallback to alternate Groq model (e.g. qwen/qwen3.8-27b has separate quota and 364ms TTFB)
-            if groq_key and provider_name == "groq":
-                try:
-                    from openai import AsyncOpenAI
-                    from pipecat.utils.types import assert_given
-                    fallback_client = AsyncOpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1")
-                    adapter = service.get_llm_adapter()
-                    params_from_context = adapter.get_llm_invocation_params(
-                        context,
-                        system_instruction=assert_given(service._settings.system_instruction),
-                        convert_developer_to_user=not service.supports_developer_role,
-                    )
-                    params = service.build_chat_completion_params(params_from_context)
-                    current_model = getattr(service._settings, "model", "")
-                    alt_model = "llama-3.3-70b-versatile" if "qwen" in current_model else "qwen/qwen3.8-27b"
-                    params["model"] = alt_model
-                    params["extra_body"] = {"reasoning_effort": "none"}
-                    params.pop("service_tier", None)
-                    logger.info("[LLM Failover] Successfully dispatched to alternate Groq model: {}", alt_model)
-                    fb_stream = await fallback_client.chat.completions.create(**params)
-                    async for chunk in fb_stream:
-                        yield chunk
-                    return
-                except Exception as fb_err2:
-                    logger.error("[LLM Failover] Secondary Groq model failover failed: {}", fb_err2)
+            # Primary provider failed: check if cancelled/superseded first.
+            if (
+                asyncio.current_task().cancelled()
+                or getattr(context, "_superseded", None) is True
+                or getattr(context, "_is_interrupted", None) is True
+            ):
+                return
 
-            # Strategy 2: Fallback to Cerebras if available and primary was not Cerebras
-            if cerebras_key and provider_name != "cerebras":
-                try:
-                    from openai import AsyncOpenAI
-                    from pipecat.utils.types import assert_given
-                    fallback_client = AsyncOpenAI(api_key=cerebras_key, base_url="https://api.cerebras.ai/v1")
-                    adapter = service.get_llm_adapter()
-                    params_from_context = adapter.get_llm_invocation_params(
-                        context,
-                        system_instruction=assert_given(service._settings.system_instruction),
-                        convert_developer_to_user=not service.supports_developer_role,
+            fail_count = 1
+            if isinstance(lead_mem, dict):
+                fail_count = lead_mem.get("_llm_dual_failures", 0) + 1
+                lead_mem["_llm_dual_failures"] = fail_count
+
+            if fail_count >= 3:
+                recovery_line = "I seem to be having connection trouble. Our advisor will reach out to you directly. Thank you and have a wonderful day!"
+            elif isinstance(lead_mem, dict) and (lead_mem.get("time_slot") or lead_mem.get("preferred_visit_date") or lead_mem.get("bhk")):
+                recovery_line = "I've noted your preference. Let me check the details for you."
+            else:
+                recovery_line = "I didn't quite catch that. Could you repeat that, please?"
+
+            logger.info("[LLM Fallback] Speaking deterministic recovery line (failure count={}): {!r}", fail_count, recovery_line)
+
+            from types import SimpleNamespace
+            synthetic_chunk = SimpleNamespace(
+                id="recovery-fallback",
+                object="chat.completion.chunk",
+                created=int(time.time()),
+                model="recovery-fallback",
+                choices=[
+                    SimpleNamespace(
+                        index=0,
+                        delta=SimpleNamespace(content=recovery_line, role="assistant", tool_calls=None),
+                        finish_reason="stop",
+                        message=SimpleNamespace(content=recovery_line, role="assistant", tool_calls=None),
                     )
-                    params = service.build_chat_completion_params(params_from_context)
-                    params["model"] = "qwen-3.8-27b"
-                    params["extra_body"] = {"reasoning_effort": "none"}
-                    params.pop("service_tier", None)
-                    logger.info("[LLM Failover] Successfully dispatched to Cerebras qwen-3.8-27b")
-                    fb_stream = await fallback_client.chat.completions.create(**params)
-                    async for chunk in fb_stream:
-                        yield chunk
-                    return
-                except Exception as fb_err:
-                    logger.error("[LLM Failover] Cerebras failover failed: {}", fb_err)
+                ],
+                tool_calls=None,
+                usage=None,
+            )
+            yield synthetic_chunk
 
         return _stream_wrapper()
 
@@ -693,10 +874,8 @@ class ServiceFactory:
         if service_type == "stt":
             stt_lang = params.get("language")
 
-            if not stt_lang:
-                params["language"] = "unknown" if provider_name == "sarvam" else "en-IN"
-            elif provider_name == "sarvam" and stt_lang == "unknown":
-                params["language"] = "unknown"
+            if not stt_lang or stt_lang == "unknown":
+                params["language"] = "en-IN"
 
         if "voice_id" in params and "voice" not in params:
             params["voice"] = params.pop("voice_id")
@@ -747,11 +926,6 @@ class ServiceFactory:
                                 settings_inst.extra.update(extra_val)
                             else:
                                 settings_inst.extra = extra_val
-                        if service_type == "llm" and provider_name == "cerebras":
-                            if not hasattr(settings_inst, "extra") or not isinstance(settings_inst.extra, dict):
-                                settings_inst.extra = {}
-                            settings_inst.extra["reasoning_effort"] = "none"
-                            settings_inst.extra.setdefault("extra_body", {})["reasoning_effort"] = "none"
                         kwargs["settings"] = settings_inst
                     else:
                         kwargs["settings"] = settings_cls(
@@ -817,14 +991,14 @@ class ServiceFactory:
                 return _SpokenTextGuard._normalize(text)
             service.add_text_transformer(_tts_sentence_normalizer)
 
-        # Enforce reasoning_effort='none' on Groq and Cerebras LLMs to eliminate <think> tokens and cut latency
-        if service_type == "llm" and provider_name in ("groq", "cerebras"):
+        # Enforce reasoning_effort='none' on Groq LLM to eliminate <think> tokens and cut latency
+        if service_type == "llm" and provider_name == "groq":
             if hasattr(service, "_settings") and hasattr(service._settings, "extra"):
                 if isinstance(service._settings.extra, dict):
                     service._settings.extra["reasoning_effort"] = "none"
                     logger.info("Enforced reasoning_effort='none' on {} LLM", provider_name)
 
-        if service_type == "llm" and provider_name in ("groq", "cerebras"):
+        if service_type == "llm" and provider_name == "groq":
             _attach_resilient_failover(service, provider_name, config)
 
         return service
@@ -883,8 +1057,6 @@ async def warmup_providers(
             warmup_urls.append("https://api.sarvam.ai/v1")
         if active_providers.get("llm") == "groq":
             warmup_urls.append("https://api.groq.com/openai/v1")
-        if active_providers.get("llm_fallback") == "cerebras":
-            warmup_urls.append("https://api.cerebras.ai/v1")
 
         async def _ping(url: str) -> None:
             try:
@@ -1021,10 +1193,16 @@ def _extract_lead_preferences(text: str, agent_text: str = "") -> dict[str, str]
 
     # 4. Caller Name (flexible: user intro in English/Hindi OR agent acknowledgment)
     m_name_user = re.search(
-        r"\b(?:my name is|i am|call me|myself|mera naam|main)\s+([A-Za-z]+)\b",
+        r"\b(?:my name is|i am|call me|myself|mera naam)\s+([A-Za-z]+)\b",
         text,
         re.IGNORECASE,
     )
+    if not m_name_user:
+        m_name_user = re.search(
+            r"\bmain\s+([A-Za-z]+)\s+(?:bol\s+raha|bol\s+rahi|hoon|hun)\b",
+            text,
+            re.IGNORECASE,
+        )
     if not m_name_user:
         m_name_user = re.search(
             r"\b(?:it'?s|this is)\s+(?!the\b|a\b|an\b|just\b|actually\b|not\b|my\b|our\b)([A-Za-z]+)\b",
@@ -1053,6 +1231,8 @@ def _extract_lead_preferences(text: str, agent_text: str = "") -> dict[str, str]
             "actually", "basically", "just", "really", "area", "size", "facing",
             "study", "balcony", "corporatish", "lively", "happening", "social",
             "bada", "chota", "what", "which", "where", "how", "who", "why",
+            "site", "visit", "kal", "aaj", "parso", "baje", "shaam", "subah", "dopahar",
+            "ha", "haan", "bhejo", "aa", "jaunga", "jaungi",
         }
         if candidate_name.lower() not in name_stopwords and len(candidate_name) > 1:
             extracted["spoken_name"] = candidate_name.capitalize()
@@ -1062,43 +1242,67 @@ def _extract_lead_preferences(text: str, agent_text: str = "") -> dict[str, str]
 
     # 5. Site Visit Day & Time (must be stated or confirmed by user, not hallucinated by agent)
     if not user_has_refusal and not is_farewell:
-        m_vdate = re.search(
-            r"\b(tomorrow|today|this\s+weekend|next\s+weekend|this\s+saturday|this\s+sunday|saturday|sunday|monday|tuesday|wednesday|thursday|friday|kal|aaj|parso)\b",
-            user_lower,
-        )
-        # Hindi Devanagari: \b unreliable — use Unicode-aware search
-        if not m_vdate:
-            m_vdate = re.search(r"(कल|आज|परसों)", user_lower, re.UNICODE)
-        # If user didn't state date directly, check if user affirmed an agent visit proposal
-        if not m_vdate and any(user_lower.startswith(aff) or aff in user_lower.split() for aff in ("yes", "sure", "theek hai", "chalega", "done")):
-            agent_lower = agent_text.lower()
-            if any(p in agent_lower for p in ("how about", "can you come", "would you like to visit", "free on", "available on")):
-                m_vdate = re.search(
-                    r"\b(tomorrow|today|this\s+weekend|next\s+weekend|this\s+saturday|this\s+sunday|saturday|sunday|monday|tuesday|wednesday|thursday|friday)\b",
-                    agent_lower,
-                )
+        from leads.worker import normalize_visit_date, normalize_visit_time
+        import zoneinfo as _zi
+        _now_ist = datetime.now(_zi.ZoneInfo("Asia/Kolkata"))
 
-        if m_vdate:
-            extracted["preferred_visit_date"] = m_vdate.group(1).title()
+        norm_d = normalize_visit_date(user_lower, _now_ist)
+        if norm_d:
+            extracted["visit_date_iso"] = norm_d[0]
+            extracted["preferred_visit_date"] = norm_d[0]
+        else:
+            m_vdate = re.search(
+                r"\b(tomorrow|today|this\s+weekend|next\s+weekend|this\s+saturday|this\s+sunday|saturday|sunday|monday|tuesday|wednesday|thursday|friday|kal|aaj|parso)\b",
+                user_lower,
+            )
+            # Hindi Devanagari: \b unreliable — use Unicode-aware search
+            if not m_vdate:
+                m_vdate = re.search(r"(कल|आज|परसों)", user_lower, re.UNICODE)
+            # If user didn't state date directly, check if user affirmed an agent visit proposal
+            if not m_vdate and any(user_lower.startswith(aff) or aff in user_lower.split() for aff in ("yes", "sure", "theek hai", "chalega", "done")):
+                agent_lower = agent_text.lower()
+                if any(p in agent_lower for p in ("how about", "can you come", "would you like to visit", "free on", "available on")):
+                    m_vdate = re.search(
+                        r"\b(tomorrow|today|this\s+weekend|next\s+weekend|this\s+saturday|this\s+sunday|saturday|sunday|monday|tuesday|wednesday|thursday|friday)\b",
+                        agent_lower,
+                    )
 
-        m_vtime = re.search(
-            r"\b(?:around|at|maybe)?\s*(\d{1,2}(?::\d{2})?|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b)\s*(?:o'?clock)?\s*(?:in\s+the\s+)?(morning|afternoon|evening|pm|am)\b",
-            user_lower,
-        )
-        if m_vtime:
-            hour_raw = m_vtime.group(1)
-            period = m_vtime.group(2).lower()
-            hour_val = _NUMBER_WORDS.get(hour_raw, hour_raw)
-            time_period = "AM" if period in ("am", "morning") else "PM"
-            extracted["preferred_visit_time"] = f"{hour_val} {time_period}"
-        elif re.search(r"\b(\d{1,2})\s*(?:pm|am)\b", user_lower):
-            m_am_pm = re.search(r"\b(\d{1,2})\s*(pm|am)\b", user_lower)
-            if m_am_pm:
-                extracted["preferred_visit_time"] = f"{m_am_pm.group(1)} {m_am_pm.group(2).upper()}"
+            if m_vdate:
+                raw_d = m_vdate.group(1).title()
+                norm_d2 = normalize_visit_date(raw_d, _now_ist)
+                if norm_d2:
+                    extracted["visit_date_iso"] = norm_d2[0]
+                    extracted["preferred_visit_date"] = norm_d2[0]
+                else:
+                    extracted["preferred_visit_date"] = raw_d
 
-        if "preferred_visit_time" in extracted or "preferred_visit_date" in extracted:
-            v_parts = [extracted[k] for k in ("preferred_visit_date", "preferred_visit_time") if k in extracted]
-            extracted["site_visit"] = f"Confirmed ({' '.join(v_parts)})"
+        norm_t = normalize_visit_time(user_lower)
+        if norm_t:
+            extracted["time_slot"] = norm_t
+            extracted["preferred_visit_time"] = norm_t
+        else:
+            m_vtime = re.search(
+                r"\b(?:around|at|maybe)?\s*(\d{1,2}(?::\d{2})?|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b)\s*(?:o'?clock)?\s*(?:in\s+the\s+)?(morning|afternoon|evening|pm|am)\b",
+                user_lower,
+            )
+            if m_vtime:
+                hour_raw = m_vtime.group(1)
+                period = m_vtime.group(2).lower()
+                hour_val = _NUMBER_WORDS.get(hour_raw, hour_raw)
+                time_period = "AM" if period in ("am", "morning") else "PM"
+                extracted["preferred_visit_time"] = f"{hour_val} {time_period}"
+                extracted["time_slot"] = f"{hour_val} {time_period}"
+            elif re.search(r"\b(\d{1,2})\s*(?:pm|am)\b", user_lower):
+                m_am_pm = re.search(r"\b(\d{1,2})\s*(pm|am)\b", user_lower)
+                if m_am_pm:
+                    extracted["preferred_visit_time"] = f"{m_am_pm.group(1)} {m_am_pm.group(2).upper()}"
+                    extracted["time_slot"] = f"{m_am_pm.group(1)} {m_am_pm.group(2).upper()}"
+
+        v_d = extracted.get("visit_date_iso") or extracted.get("preferred_visit_date")
+        v_t = extracted.get("time_slot") or extracted.get("preferred_visit_time")
+        if v_d or v_t:
+            parts = [p for p in (v_d, v_t) if p]
+            extracted["site_visit"] = f"Confirmed ({' at '.join(parts)})"
         elif re.search(r"\b(?:not\s*(?:available|free|possible|interested)|can'?t\s*make\s*it|busy|no\s*time)\b.*?\b(?:visit|come|weekend|today|tomorrow)\b|\b(?:visit|come)\b.*?\b(?:not\s*(?:available|free|possible)|can'?t)\b", user_lower):
             extracted["site_visit"] = "Declined/Not free right now"
         elif re.search(r"\b(?:this|next)?\s*(?:saturday|sunday|weekend|tomorrow|today)\b", user_lower) and ("visit" in user_lower or "come" in user_lower or "free" in user_lower):
@@ -1175,8 +1379,8 @@ def _sync_working_memory(
                         if len(existing) > len(v) and v.lower() in existing.lower():
                             continue
                     # Tool value always wins: never overwrite a visit date/time
-                    # already committed by book_site_visit.
-                    if k in ("preferred_visit_date", "preferred_visit_time") and k in lead_memory:
+                    # already committed by book_site_visit or set in lead_memory.
+                    if k in ("preferred_visit_date", "preferred_visit_time", "visit_date_iso", "time_slot") and lead_memory.get(k):
                         continue
                     lead_memory[k] = v
                     newly_extracted[k] = v
@@ -1212,16 +1416,24 @@ def _sync_working_memory(
 
     slots = []
     # Client name handling
+    client_name = (
+        lead_memory.get("client")
+        or lead_memory.get("name")
+        or lead_memory.get("customer_name")
+        or lead_memory.get("spoken_name")
+    )
     if lead_memory.get("identity_discrepancy"):
         slots.append(
             f"Client: {lead_memory.get('spoken_name')} "
             f"(Discrepancy: registered as {lead_memory.get('registered_name')}; confirm on dialed number without interrogating)"
         )
-    elif lead_memory.get("client"):
-        slots.append(f"Client: {lead_memory['client']}")
+    elif client_name:
+        slots.append(f"Client: {client_name}")
 
-    if "configuration" in lead_memory:
-        slots.append(f"Looking for: {lead_memory['configuration']}")
+    config_val = lead_memory.get("configuration") or lead_memory.get("bhk")
+    if config_val:
+        slots.append(f"Configuration: {config_val}")
+        slots.append(f"Looking for: {config_val}")
 
     # Preference (combines Timeline and Location if both exist, e.g. "Ready-to-move in Prime Tech Corridor")
     if "preference" in lead_memory:
@@ -1242,18 +1454,28 @@ def _sync_working_memory(
     user_msgs = [m for m in messages if m.get("role") == "user" and isinstance(m.get("content"), str)]
 
     # Site visit handling (explicit gate: day/time required before confirmation)
-    has_visit_slot = bool(lead_memory.get("preferred_visit_date") or lead_memory.get("preferred_visit_time"))
+    v_date = lead_memory.get("visit_date_iso") or lead_memory.get("preferred_visit_date")
+    v_time = lead_memory.get("time_slot") or lead_memory.get("preferred_visit_time")
+    has_visit_slot = bool(v_date or v_time)
     if "site_visit" in lead_memory:
         sv_val = lead_memory["site_visit"]
         if has_visit_slot or "Confirmed" in sv_val:
             slots.append(f"Site Visit: {sv_val}")
+            if v_date:
+                slots.append(f"Visit Date ISO: {v_date}")
+            if v_time:
+                slots.append(f"Time Slot: {v_time}")
         elif "Declined" in sv_val:
             slots.append(f"Site Visit: {sv_val}")
         else:
             slots.append("Site Visit Requested: Day/time NOT yet chosen. MANDATORY: You MUST ask what day or time (e.g. this Saturday or Sunday morning) they would prefer before confirming any visit slot. DO NOT say 'I will confirm the slot' until day/time is stated!")
     elif has_visit_slot:
-        v_parts = [lead_memory[k] for k in ("preferred_visit_date", "preferred_visit_time") if k in lead_memory]
-        slots.append(f"Site Visit: {' '.join(v_parts)}")
+        v_parts = [p for p in (v_date, v_time) if p]
+        slots.append(f"Site Visit: {' at '.join(v_parts)}")
+        if v_date:
+            slots.append(f"Visit Date ISO: {v_date}")
+        if v_time:
+            slots.append(f"Time Slot: {v_time}")
     elif any(
         re.search(r"\b(site\s*visit|visit\s*the\s*property|come\s*(?:and|to)?\s*see|schedule\s*(?:a\s*)?visit|want\s*to\s*visit)\b", m.get("content", "").lower())
         for m in user_msgs
@@ -1339,8 +1561,38 @@ def _sync_working_memory(
             for m in user_msgs
         )
     )
+    if not has_confirmed_whatsapp:
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "user" and i > 0 and messages[i - 1].get("role") == "assistant":
+                prev_agent = (messages[i - 1].get("content") or "").lower()
+                user_txt = (msg.get("content") or "").strip().lower()
+                if "whatsapp" in prev_agent:
+                    # Clear caller yes (not preceded by negation)
+                    is_clear_yes = bool(re.search(
+                        r"^(?:yes|yeah|yep|sure|definitely|absolutely|haan|ha|haanji|theek hai|send it|please do)[\.\!\?]*$",
+                        user_txt,
+                    )) or bool(
+                        re.search(r"\b(?:yes|sure|haan|send)\b", user_txt)
+                        and not re.search(r"\b(?:no|not|don'?t|dont|nahi|mat)\b", user_txt)
+                    )
+                    if is_clear_yes:
+                        has_confirmed_whatsapp = True
+                        break
+
     if has_confirmed_whatsapp and not lead_memory.get("whatsapp"):
         lead_memory["whatsapp"] = "Confirmed on dialed number"
+        lead_memory["whatsapp_opt_in"] = True
+        if stream_id:
+            try:
+                import asyncio
+                asyncio.create_task(
+                    lead_state.record_fields_async(
+                        stream_id,
+                        {"whatsapp": "Confirmed on dialed number", "whatsapp_opt_in": True},
+                    )
+                )
+            except Exception:
+                pass
 
     has_rejected_whatsapp = False
     for i, msg in enumerate(messages):
@@ -1437,51 +1689,24 @@ def _sync_working_memory(
 
 
 def _coalesce_consecutive_messages(messages: list) -> None:
-    """Coalesces consecutive same-role messages for USER turns only.
-    
-    Filters out noise/empty backchannel tokens (e.g. isolated 'um', 'uh', 'hmm')
-    when merged with substantial content, saving context tokens and preventing LLM confusion.
+    """Cleans up empty messages in context without destroying distinct turns.
+    Preserves distinct caller turns, repeated words, and revisions.
     CRITICAL: Never coalesces 'system' messages (which must remain separate for Working Memory).
     """
     if len(messages) <= 1:
         return
 
-    merged = []
-    _NOISE_TOKENS = {"uh", "um", "hmm", "hm", "ah", "oh"}
-
+    cleaned = []
     for msg in messages:
-        role = msg.get("role")
+        if not isinstance(msg, dict):
+            cleaned.append(msg)
+            continue
         content = msg.get("content")
-
-        if not isinstance(content, str):
-            merged.append(msg)
+        if isinstance(content, str) and not content.strip():
             continue
+        cleaned.append(dict(msg))
 
-        content_clean = content.strip()
-        if not content_clean:
-            continue
-
-        # Strictly coalesce consecutive USER messages only
-        if (
-            role == "user"
-            and merged
-            and merged[-1].get("role") == "user"
-            and isinstance(merged[-1].get("content"), str)
-        ):
-            prev_content = merged[-1]["content"].strip()
-            # If the new token is just an isolated filler sound, absorb or omit it
-            if content_clean.lower() in _NOISE_TOKENS:
-                continue
-            if prev_content.lower() in _NOISE_TOKENS:
-                merged[-1]["content"] = content_clean
-            else:
-                # Merge into a natural single utterance
-                sep = " " if not prev_content.endswith((".", "!", "?", ",")) else " "
-                merged[-1]["content"] = f"{prev_content}{sep}{content_clean}"
-        else:
-            merged.append(dict(msg))
-
-    messages[:] = merged
+    messages[:] = cleaned
 
 
 def _prune_history(messages: list, max_messages: int) -> None:
@@ -1497,9 +1722,16 @@ def _prune_history(messages: list, max_messages: int) -> None:
     if keep < 2:
         keep = 2
 
+    trimmed_non_system = non_system[-keep:]
+    # Ensure conversation history always starts with a user message (never an orphaned assistant message)
+    while trimmed_non_system and trimmed_non_system[0].get("role") != "user":
+        trimmed_non_system = trimmed_non_system[1:]
+    if not trimmed_non_system:
+        trimmed_non_system = non_system[-keep:]
+
     messages[:] = [
         *system_messages,
-        *non_system[-keep:],
+        *trimmed_non_system,
     ]
 
 
@@ -1547,6 +1779,7 @@ def _load_audio_cache() -> dict[int, dict[str, bytes]]:
         "clarify_repeat_hi": "clarify_repeat_hi.wav",
         "clarify_property": "clarify_property.wav",
         "visit_confirm": "visit_confirm.wav",
+        "checkin_generic": "checkin_generic.wav",
         "filler_en": "filler_en.wav",
         "filler_hi": "filler_hi.wav",
     }
@@ -1604,11 +1837,16 @@ def _match_cached_phrase(text: str, turn_count: int = 1) -> str | None:
     if "thank you for calling meridian group" in t and "assist you today" in t:
         return "inbound_greeting"
 
-    # Turn 1 Opening
-    if ("meridian" in t and ("bhk" in t or "2" in t or "3" in t)) or (turn_count == 1 and ("meridian" in t or "ananya" in t)):
+    # Turn 1 Opening - STRICTLY restricted to turn_count == 1 only
+    if turn_count == 1 and (
+        ("meridian" in t and ("bhk" in t or "2" in t or "3" in t))
+        or ("meridian" in t or "ananya" in t)
+    ):
         return "opening_intro"
 
     # Clarifications & spam check
+    if "are you still there" in t or "hello? are you there" in t or "hello are you there" in t:
+        return "checkin_generic"
     if "are you looking for a property" in t:
         return "clarify_property"
     if "didn't catch that" in t or "say that again" in t:
@@ -1628,8 +1866,8 @@ def _match_cached_phrase(text: str, turn_count: int = 1) -> str | None:
     if t in ("theek hai.", "theek hai"):
         return "ack_theek_hai"
 
-    # Site visit confirmation
-    if "preference for the site visit" in t or "scheduled your site visit" in t:
+    # Site visit confirmation (only generic preference, never override actual scheduled visit details)
+    if "preference for the site visit" in t:
         return "visit_confirm"
 
     # Objection pivot
@@ -1666,6 +1904,7 @@ _CACHED_PHRASE_TEXTS: dict[str, str] = {
     "ack_ji_bilkul": "Ji bilkul.",
     "ack_haanji": "Haanji, bilkul.",
     "ack_theek_hai": "Theek hai.",
+    "checkin_generic": "Hello? Are you still there?",
     "clarify_repeat": "Sorry, I didn't catch that. Could you say that again?",
     "clarify_repeat_hi": "Sorry, main sun nahi paayi. Kya aap repeat kar sakte hain?",
     "clarify_property": "Hello? Are you looking for a property?",
@@ -1674,6 +1913,73 @@ _CACHED_PHRASE_TEXTS: dict[str, str] = {
     "filler_hi": "Haan, ek second, main check karti hoon.",
 }
 
+
+def _find_sentence_end(text: str) -> int:
+    """Finds index right after a true sentence boundary ([.!?\n]), ignoring decimal dots
+    (e.g. '1.45', '3.5') and common abbreviations ('Rs.', 'Cr.', 'Mr.', 'Mrs.', 'Dr.', 'BHK').
+    Returns 0 if no sentence boundary is found."""
+    for m in re.finditer(r'([.!?\n])(?:\s+|$)', text):
+        punct = m.group(1)
+        idx = m.end()
+        if punct in ('!', '?', '\n'):
+            return idx
+        if punct == '.':
+            start = m.start(1)
+            # Ignore decimal dot: digit before and digit after (e.g. 1.45, 3.5)
+            if start > 0 and start + 1 < len(text):
+                if text[start - 1].isdigit() and text[start + 1].isdigit():
+                    continue
+            # Ignore common abbreviation preceding
+            prefix = text[:start].strip().split()
+            last_word = prefix[-1].lower() if prefix else ""
+            if last_word in ("rs", "cr", "dr", "mr", "mrs", "ms", "no", "sq", "ft", "bhk"):
+                continue
+            return idx
+    return 0
+
+
+def _find_clause_or_sentence_end(text: str) -> int:
+    """Finds first safe clause boundary for early TTS flushing on the first chunk of a turn.
+    Returns character index to split at (inclusive of delimiter), or -1 if no boundary found.
+    Checks:
+    1. Full sentence end (e.g. '.', '?', '!')
+    2. Clause boundary: comma or dash with space (after at least 10 characters)
+    3. Word boundary after ~6 words (at least 20 chars)
+    """
+    if not text:
+        return -1
+    # 1. Full sentence end
+    s_end = _find_sentence_end(text)
+    if s_end > 0:
+        return s_end
+
+    # 2. Clause boundary: comma + space (e.g. "Sure, ", "Yes definitely, ")
+    m_comma = re.search(r'(?<!\d),\s+', text[3:])
+    if m_comma:
+        return 3 + m_comma.end()
+
+    # 3. Dash with spaces (e.g. " - ", " – ", " — ")
+    m_dash = re.search(r'\s+[-–—]\s+', text[3:])
+    if m_dash:
+        return 3 + m_dash.end()
+
+    # 4. Word boundary after ~6 words (at least 20 chars)
+    words = text.strip().split()
+    if len(words) >= 6:
+        w_cnt = 0
+        in_word = False
+        for i, ch in enumerate(text):
+            if not ch.isspace():
+                if not in_word:
+                    w_cnt += 1
+                    in_word = True
+            else:
+                if in_word:
+                    in_word = False
+                    if w_cnt >= 6 and i >= 20:
+                        return i + 1
+
+    return -1
 
 
 class _SpokenTextGuard(FrameProcessor):
@@ -1785,49 +2091,16 @@ class _SpokenTextGuard(FrameProcessor):
 
         extracted: dict[str, str] = {}
 
-        def _replace_site_visit(m: re.Match) -> str:
-            raw_args = m.group(1)
-            m_date = re.search(r"date\s*=\s*['\"]?([^,\)\"\']+)['\"]?", raw_args, re.I)
-            m_time = re.search(r"time\s*=\s*['\"]?([^,\)\"\']+)['\"]?", raw_args, re.I)
-            date_val = m_date.group(1).strip() if m_date else ""
-            time_val = m_time.group(1).strip() if m_time else ""
-
-            if not date_val and not time_val and "," in raw_args:
-                parts = raw_args.split(",", 1)
-                date_val = parts[0].strip().strip("'\"")
-                time_val = parts[1].strip().strip("'\"")
-            elif not date_val and not time_val and raw_args.strip():
-                arg_clean = raw_args.strip().strip("'\"")
-                if any(day in arg_clean.lower() for day in ("mon", "tue", "wed", "thu", "fri", "sat", "sun", "tomorrow", "today")):
-                    date_val = arg_clean
-                else:
-                    time_val = arg_clean
-
-            extracted["site_visit"] = "booked"
-            extracted["disposition"] = "SITE_VISIT_BOOKED"
-            if date_val:
-                extracted["preferred_visit_date"] = date_val
-            if time_val:
-                extracted["preferred_visit_time"] = time_val
-
-            if date_val and time_val:
-                return f"Wonderful, I have scheduled your site visit for {date_val} at {time_val}. You will receive the details on WhatsApp!"
-            elif date_val:
-                return f"Wonderful, I have scheduled your site visit for {date_val}. You will receive the details on WhatsApp!"
-            elif time_val:
-                return f"Wonderful, I have scheduled your site visit for {time_val}. You will receive the details on WhatsApp!"
-            return "Wonderful, I have booked your site visit slot. You will receive the details on WhatsApp!"
-
+        # Delete fake-booking regex: strip any leaked code syntax without claiming booking
         text = re.sub(
-            r"(?:call\s+)?\b(?:book_?site_?visit|booksitevisit)\s*\(([^\)]*)\)",
-            _replace_site_visit,
+            r"(?:call\s+)?\b(?:book_?site_?visit|booksitevisit)\s*\([^\)]*\)",
+            "",
             text,
             flags=re.IGNORECASE,
         )
 
         def _replace_brochure(m: re.Match) -> str:
-            extracted["brochure"] = "sent"
-            return "I will share the brochure and floor plans on WhatsApp right away."
+            return ""
 
         text = re.sub(
             r"(?:call\s+)?\b(?:send_?brochure|sendbrochure)\s*\([^\)]*\)",
@@ -1911,6 +2184,32 @@ class _SpokenTextGuard(FrameProcessor):
             text = re.sub(r"<[^>]+>", "", text)
             text = text.replace("<", "").replace(">", "")
 
+        # FIX 6: Safety net for dates and hyphens
+        # 1. Convert any residual ISO date YYYY-MM-DD into natural conversational spoken date
+        def _rep_iso_date(m: re.Match) -> str:
+            iso_val = m.group(0)
+            try:
+                import zoneinfo
+                _now = datetime.now(zoneinfo.ZoneInfo("Asia/Kolkata"))
+            except Exception:
+                _now = datetime.now()
+            from leads.worker import format_spoken_date
+            lang = getattr(self, "_language", "en") if self is not None else "en"
+            return format_spoken_date(iso_val, _now, lang)
+
+        text = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", _rep_iso_date, text)
+
+        # 2. Drop 4-digit year from spoken dates (e.g. "09 Oct 2026" -> "09 Oct")
+        text = re.sub(
+            r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+20\d\d\b",
+            r"\1 \2",
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        # 3. Replace hyphens and dashes between words with commas so "Tomorrow - Thursday" never becomes "Tomorrow to Thursday"
+        text = re.sub(r"(?<=[a-zA-Z])\s*[-–—]\s*(?=[a-zA-Z])", ", ", text)
+
         text = (
             text
             .replace("’", "'")
@@ -1918,10 +2217,12 @@ class _SpokenTextGuard(FrameProcessor):
             .replace("“", '"')
             .replace("”", '"')
             .replace("—", ", ")
-            .replace("–", " to ")
             .replace(": ", ". ")
             .replace("; ", ". ")
         )
+        # Convert en-dash to "to" only between numbers; otherwise comma
+        text = re.sub(r"(?<=\d)\s*–\s*(?=\d)", " to ", text)
+        text = text.replace("–", ", ")
 
         # Split options/clauses joined by ', or ' or ', and ' into separate sentences
         # so TTS begins synthesizing the first option immediately instead of waiting for a 100+ character compound sentence.
@@ -2010,10 +2311,90 @@ class _SpokenTextGuard(FrameProcessor):
         self._current_turn_spoken_text: str = ""
         self._suppressing_duplicate_turn: bool = False
         self._stale_regeneration_attempted: bool = False
+        self._site_visit_succeeded_this_turn: bool = False
+        self._whatsapp_succeeded_this_turn: bool = False
+        self._confirmation_queued_to_tts: bool = False
+        self._confirmation_actually_played: bool = False
+        self._confirmation_spoken: bool = False
         self._task: Any = None
 
     def bind_task(self, task: Any) -> None:
         self._task = task
+
+    def mark_tool_succeeded(
+        self,
+        tool_name: str,
+        whatsapp_confirmed: bool = False,
+        confirm_msg: str | None = None,
+    ) -> None:
+        if tool_name == "book_site_visit":
+            self._site_visit_succeeded_this_turn = True
+            self._whatsapp_succeeded_this_turn = whatsapp_confirmed
+            self._confirmation_queued_to_tts = True
+            self._confirmation_actually_played = False
+            self._confirmation_spoken = False
+            if confirm_msg and self._task:
+                logger.info("SpokenTextGuard: Queueing deterministic booking confirmation directly to TTS: {!r}", confirm_msg)
+                conf_frame = TTSSpeakFrame(text=confirm_msg, append_to_context=True)
+                setattr(conf_frame, "is_deterministic_confirmation", True)
+                asyncio.create_task(
+                    self._task.queue_frames([conf_frame])
+                )
+        elif tool_name == "send_brochure":
+            self._whatsapp_succeeded_this_turn = True
+
+    def _filter_unverified_claims(self, text: str) -> str:
+        if not text:
+            return text
+
+        parts = re.split(r'(?<=[.!?\n\u0964])\s+', text)
+        kept = []
+        dropped_any = False
+        for p in parts:
+            p_clean = p.strip()
+            if not p_clean:
+                continue
+            lower_p = p_clean.lower()
+            is_booking = bool(re.search(
+                r"\b(?:have\s+)?(?:booked|scheduled|confirmed)\b|\b(?:site\s+visit|visit)\s+(?:is|has\s+been)\s+(?:booked|scheduled|confirmed)\b|बुक|कन्फर्म|शिड्यूल",
+                lower_p,
+            ))
+            if is_booking:
+                dropped_any = True
+                if self._site_visit_succeeded_this_turn:
+                    logger.info(
+                        "SpokenTextGuard: Suppressed duplicate LLM booking claim sentence: {!r} (already queued directly)",
+                        p_clean,
+                    )
+                else:
+                    logger.warning(
+                        "SpokenTextGuard: Dropped unverified booking claim sentence: {!r} (tool did not succeed this turn)",
+                        p_clean,
+                    )
+                continue
+
+            is_wa = bool(re.search(
+                r"\b(?:receive|sending|sent)\s+(?:the\s+)?(?:location|details|brochure|link)\s+(?:on|via)\s+whatsapp\b|\b(?:location|details)\s+on\s+whatsapp\b|whatsapp|व्हाट्सएप",
+                lower_p,
+            ))
+            if is_wa and not self._whatsapp_succeeded_this_turn:
+                is_wa_question = bool(re.search(r"\b(?:shall|can|may|would|should)\s+(?:i|we)\b|(?:\?)$", lower_p.strip()))
+                if not is_wa_question:
+                    dropped_any = True
+                    logger.warning(
+                        "SpokenTextGuard: Dropped unverified WhatsApp claim sentence: {!r} (WhatsApp not confirmed this turn)",
+                        p_clean,
+                    )
+                    continue
+
+            kept.append(p)
+
+        if not dropped_any:
+            return text
+
+        leading_ws = text[:len(text) - len(text.lstrip())]
+        trailing_ws = text[len(text.rstrip()):]
+        return leading_ws + " ".join(kept) + trailing_ws
 
     def _record_assistant_spoken(self, text: str, cached_key: str | None = None) -> None:
         if not text:
@@ -2022,22 +2403,33 @@ class _SpokenTextGuard(FrameProcessor):
         self._last_spoken_turn_text = clean_text
         self._last_spoken_turn_time = time.monotonic()
         if self._context and hasattr(self._context, "messages"):
-            last_msg = self._context.messages[-1] if self._context.messages else None
-            if not (
-                last_msg
-                and last_msg.get("role") == "assistant"
-                and clean_text.lower() in str(last_msg.get("content", "")).lower()
-            ):
-                self._context.messages.append({"role": "assistant", "content": clean_text})
+            clean_norm = " ".join(clean_text.lower().split())
+            already_present = any(
+                isinstance(m, dict)
+                and m.get("role") == "assistant"
+                and clean_norm == " ".join(str(m.get("content", "")).lower().split())
+                for m in self._context.messages
+            )
+            if already_present:
                 logger.info(
-                    "SpokenTextGuard: Recorded assistant message in context.messages: {!r}",
-                    clean_text[:60],
+                    "DUPLICATE_ASSISTANT_RECORD text={!r} key={!r} - skipping append",
+                    clean_text[:80],
+                    cached_key,
                 )
+                if self._call_metrics and hasattr(self._call_metrics, "record_duplicate_assistant"):
+                    self._call_metrics.record_duplicate_assistant()
+                return
 
-        if cached_key in ("objection_pivot", "de_objection_pivot") and self._lead_memory is not None:
+            self._context.messages.append({"role": "assistant", "content": clean_text})
+            logger.info(
+                "SpokenTextGuard: Recorded assistant message in context.messages: {!r}",
+                clean_text[:60],
+            )
+
+        if cached_key == "objection_pivot" and self._lead_memory is not None:
             self._lead_memory["_objection_pivot_spoken"] = True
             self._lead_memory["_objection_count"] = max(self._lead_memory.get("_objection_count", 0), 1)
-        elif cached_key in ("final_farewell", "de_final_farewell") and self._lead_memory is not None:
+        elif cached_key == "final_farewell" and self._lead_memory is not None:
             self._lead_memory["_farewell_spoken"] = True
 
     async def process_frame(
@@ -2056,6 +2448,12 @@ class _SpokenTextGuard(FrameProcessor):
                 self._in_llm_turn = False
                 self._leading_buffer = ""
                 self._leading_flushed = False
+                self._site_visit_succeeded_this_turn = False
+                self._whatsapp_succeeded_this_turn = False
+                if getattr(self, "_confirmation_queued_to_tts", False) and not getattr(self, "_confirmation_actually_played", False):
+                    logger.info("SpokenTextGuard: Booking confirmation interrupted before completion")
+                    self._confirmation_queued_to_tts = False
+                    self._confirmation_speaking = False
                 if self._cached_audio_task and not self._cached_audio_task.done():
                     self._cached_audio_task.cancel()
                     self._cached_audio_task = None
@@ -2074,6 +2472,8 @@ class _SpokenTextGuard(FrameProcessor):
                 self._current_turn_spoken_text = ""
                 self._suppressing_duplicate_turn = False
                 self._stale_regeneration_attempted = False
+                self._site_visit_succeeded_this_turn = False
+                self._whatsapp_succeeded_this_turn = False
             elif isinstance(frame, LLMFullResponseStartFrame):
                 self._in_llm_turn = True
                 self._turn_tokens = 0
@@ -2086,10 +2486,19 @@ class _SpokenTextGuard(FrameProcessor):
                 # Called here because this frame reliably passes through SpokenTextGuard.
                 if self._on_new_bot_turn:
                     self._on_new_bot_turn()
+            elif isinstance(frame, BotStoppedSpeakingFrame):
+                if getattr(self, "_confirmation_speaking", False) or (getattr(self, "_confirmation_queued_to_tts", False) and not getattr(self, "_confirmation_spoken", False)):
+                    self._confirmation_speaking = False
+                    self._confirmation_actually_played = True
+                    self._confirmation_spoken = True
+                    self._confirmation_queued_to_tts = False
+                    if self._lead_memory is not None:
+                        self._lead_memory["confirmation_spoken"] = True
+                    logger.info("SpokenTextGuard: Booking confirmation playback completed (actually_played=True)")
             elif isinstance(frame, TTSSpeakFrame):
                 is_silence_nudge = any(
-                    nudge in getattr(frame, "text", "")
-                    for nudge in ("Hello? Are you there?", "can you hear me", "Looks like you're busy")
+                    nudge.lower() in getattr(frame, "text", "").lower()
+                    for nudge in ("Hello? Are you there?", "are you still there", "can you hear me", "Looks like you're busy")
                 )
                 # Drop silence nudges ONLY if the LLM is actively streaming response tokens right now
                 if is_silence_nudge and self._in_llm_turn:
@@ -2115,10 +2524,10 @@ class _SpokenTextGuard(FrameProcessor):
                     cached_key = _match_cached_phrase(original, turn_count=self._turn_count)
                     if cached_key and self._interruption_audio_gate:
                         # Never repeat objection_pivot if it has already been spoken in this call
-                        if cached_key in ("objection_pivot", "de_objection_pivot") and (self._lead_memory or {}).get("_objection_pivot_spoken"):
+                        if cached_key == "objection_pivot" and (self._lead_memory or {}).get("_objection_pivot_spoken"):
                             cached_key = None
                         elif (
-                            cached_key in ("final_farewell", "de_final_farewell")
+                            cached_key == "final_farewell"
                             and self._termination_processor
                             and not self._termination_processor.is_termination_allowed()
                         ):
@@ -2127,17 +2536,12 @@ class _SpokenTextGuard(FrameProcessor):
                                 logger.warning(
                                     "SpokenTextGuard: Suppressed TTSSpeakFrame farewell because termination is not allowed; playing objection_pivot"
                                 )
-                                cached_key = "de_objection_pivot" if "de_" in cached_key else "objection_pivot"
+                                cached_key = "objection_pivot"
                             else:
                                 cached_key = None
                         if cached_key:
                             pcm = _AUDIO_CACHE.get(self._sample_rate, {}).get(cached_key)
                             if pcm:
-                                # Guard: if we are already streaming cached audio for this guard
-                                # (e.g. a stale re-delivered TTSSpeakFrame arrived while the opening
-                                # greeting is playing), drop it. Use our own _cached_playback_active
-                                # flag — NOT the gate's generation ID, which is set by next_generation()
-                                # before the first frame is queued and would wrongly drop the greeting.
                                 if self._cached_playback_active:
                                     logger.debug(
                                         "SpokenTextGuard: dropping TTSSpeakFrame '{}' — cached audio already active",
@@ -2157,13 +2561,21 @@ class _SpokenTextGuard(FrameProcessor):
                                 )
                                 if self._call_metrics and hasattr(self._call_metrics, "record_cached_audio_ttfa"):
                                     self._call_metrics.record_cached_audio_ttfa(cached_key)
-                                if cached_key in ("final_farewell", "de_final_farewell") and self._call_end_coordinator:
+                                if cached_key == "final_farewell" and self._call_end_coordinator:
                                     self._call_end_coordinator.request_ending()
                                 return
 
-                    frame.text = self._normalize(original)
+                    if getattr(frame, "is_deterministic_confirmation", False):
+                        filtered = original
+                        self._confirmation_speaking = True
+                    else:
+                        filtered = self._filter_unverified_claims(original)
+                    frame.text = self._normalize(filtered)
             elif isinstance(frame, TextFrame):
                 if self._cached_playback_active:
+                    return
+                if self._site_visit_succeeded_this_turn:
+                    logger.info("SpokenTextGuard: Suppressed post-booking LLM TextFrame {!r} (deterministic confirmation active)", str(getattr(frame, "text", ""))[:60])
                     return
                 original = getattr(frame, "text", None)
                 if isinstance(original, str) and original:
@@ -2172,10 +2584,10 @@ class _SpokenTextGuard(FrameProcessor):
                         cached_key = _match_cached_phrase(self._leading_buffer, turn_count=self._turn_count)
                         if cached_key and self._interruption_audio_gate:
                             # Never repeat objection_pivot if it has already been spoken in this call
-                            if cached_key in ("objection_pivot", "de_objection_pivot") and (self._lead_memory or {}).get("_objection_pivot_spoken"):
+                            if cached_key == "objection_pivot" and (self._lead_memory or {}).get("_objection_pivot_spoken"):
                                 cached_key = None
                             elif (
-                                cached_key in ("final_farewell", "de_final_farewell")
+                                cached_key == "final_farewell"
                                 and self._termination_processor
                                 and not self._termination_processor.is_termination_allowed()
                             ):
@@ -2184,7 +2596,7 @@ class _SpokenTextGuard(FrameProcessor):
                                     logger.warning(
                                         "SpokenTextGuard: Suppressed TextFrame farewell because termination is not allowed; playing objection_pivot"
                                     )
-                                    cached_key = "de_objection_pivot" if "de_" in cached_key else "objection_pivot"
+                                    cached_key = "objection_pivot"
                                 else:
                                     cached_key = None
                             if cached_key:
@@ -2211,13 +2623,26 @@ class _SpokenTextGuard(FrameProcessor):
                                         self._call_end_coordinator.request_ending()
                                     return
 
-                        # First-chunk optimization: flush immediately on sentence boundary ([.!?\n]) or at >=25 chars
-                        sentence_match = re.search(r'[^.!?\n]+[.!?\n]', self._leading_buffer)
-                        if sentence_match or len(self._leading_buffer) >= 25:
-                            cleaned = self._strip_meta_announcements(self._leading_buffer)
+                        # FIX 3: Start TTS earlier without making the bot dumber.
+                        # Flush first chunk at first clause boundary (comma, "-", ~6 words, or sentence end).
+                        split_idx = _find_clause_or_sentence_end(self._leading_buffer)
+                        if split_idx > 0 or len(self._leading_buffer) >= 60:
+                            if split_idx > 0:
+                                chunk_to_flush = self._leading_buffer[:split_idx]
+                                self._leading_buffer = self._leading_buffer[split_idx:]
+                            else:
+                                last_space = self._leading_buffer.rfind(" ")
+                                if last_space > 25:
+                                    chunk_to_flush = self._leading_buffer[:last_space]
+                                    self._leading_buffer = self._leading_buffer[last_space:]
+                                else:
+                                    chunk_to_flush = self._leading_buffer
+                                    self._leading_buffer = ""
+
+                            cleaned = self._strip_meta_announcements(chunk_to_flush)
                             cleaned = self._strip_repeated_opening(cleaned)
+                            cleaned = self._filter_unverified_claims(cleaned)
                             self._leading_flushed = True
-                            self._leading_buffer = ""
                             if cleaned.strip():
                                 norm = self._normalize(cleaned)
                                 if norm.strip():
@@ -2236,7 +2661,6 @@ class _SpokenTextGuard(FrameProcessor):
                                         )
                                         self._suppressing_duplicate_turn = True
 
-                                        # Fix 3: Fresh user input was ignored by duplicate LLM output -> re-trigger once
                                         latest_user_text = ""
                                         if self._context and hasattr(self._context, "messages"):
                                             for m in reversed(self._context.messages):
@@ -2261,7 +2685,7 @@ class _SpokenTextGuard(FrameProcessor):
                                                     logger.warning("SpokenTextGuard: Failed to queue re-trigger frame: {}", _re_err)
                                         return
 
-                                    self._current_turn_spoken_text += " " + norm
+                                    self._current_turn_spoken_text += norm
                                     self._turn_has_spoken_or_generated = True
                                     self._turn_tokens += len(norm.split())
                                     await self.push_frame(TextFrame(text=norm), direction)
@@ -2271,9 +2695,19 @@ class _SpokenTextGuard(FrameProcessor):
                     else:
                         if self._suppressing_duplicate_turn:
                             return
-                        norm = self._normalize(original)
+                        to_process = original
+                        if self._leading_buffer:
+                            to_process = self._leading_buffer + original
+                            self._leading_buffer = ""
+                        filtered = self._filter_unverified_claims(to_process)
+                        if not filtered.strip():
+                            if not to_process.strip():
+                                frame.text = to_process
+                                await self.push_frame(frame, direction)
+                            return
+                        norm = self._normalize(filtered)
                         if norm.strip():
-                            self._current_turn_spoken_text += " " + norm
+                            self._current_turn_spoken_text += norm
                             self._turn_has_spoken_or_generated = True
                         if self._in_llm_turn and norm.strip():
                             self._turn_tokens += len(norm.split())
@@ -2292,9 +2726,10 @@ class _SpokenTextGuard(FrameProcessor):
                     await self.push_frame(frame, direction)
                     return
 
-                if not self._leading_flushed and self._leading_buffer:
+                if self._leading_buffer:
                     cleaned = self._strip_meta_announcements(self._leading_buffer)
                     cleaned = self._strip_repeated_opening(cleaned)
+                    cleaned = self._filter_unverified_claims(cleaned)
                     self._leading_flushed = True
                     self._leading_buffer = ""
                     if cleaned.strip():
@@ -2308,7 +2743,7 @@ class _SpokenTextGuard(FrameProcessor):
                                 and (clean_norm == clean_last or clean_norm in clean_last or clean_last in clean_norm)
                             )
                             if not is_dup:
-                                self._current_turn_spoken_text += " " + norm
+                                self._current_turn_spoken_text += norm
                                 self._turn_has_spoken_or_generated = True
                                 self._turn_tokens += len(norm.split())
                                 await self.push_frame(TextFrame(text=norm), direction)
@@ -2321,12 +2756,10 @@ class _SpokenTextGuard(FrameProcessor):
                                 self._suppressing_duplicate_turn = True
 
                 if not self._suppressing_duplicate_turn and self._current_turn_spoken_text.strip():
-                    self._last_spoken_turn_text = self._current_turn_spoken_text.strip()
+                    self._last_spoken_turn_text = " ".join(self._current_turn_spoken_text.split())
                     self._last_spoken_turn_time = time.monotonic()
                 self._current_turn_spoken_text = ""
                 self._suppressing_duplicate_turn = False
-                # Fix 1 / Ponytail: Deleted old harmful recovery-frame path ("Could you please say that again?")
-                # When duplicate is suppressed or LLM produces 0 tokens, stay silent and listen.
                 self._in_llm_turn = False
                 self._turn_tokens = 0
                 self._leading_buffer = ""
@@ -2393,10 +2826,13 @@ class _InterruptionAudioGate(FrameProcessor):
         llm: Any = None,
         tts: Any = None,
         websocket: Any = None,
+        call_end_coordinator: Any = None,
+        max_trim_ms: float = 500.0,
     ) -> None:
         super().__init__()
 
         self._stream_id = stream_id
+        self._max_trim_ms = max_trim_ms
         self._current_gen_id = 0
         self._active_playing_gen_id = 0
         self._is_interrupted = False
@@ -2406,6 +2842,7 @@ class _InterruptionAudioGate(FrameProcessor):
         self._llm = llm
         self._tts = tts
         self._websocket = websocket
+        self._call_end_coordinator = call_end_coordinator
         self._awaiting_first_audio_of_turn = False
         self._accumulated_trimmed_bytes = 0
         self._pre_roll_buffer = b""
@@ -2483,48 +2920,61 @@ class _InterruptionAudioGate(FrameProcessor):
         direction: FrameDirection,
     ) -> None:
         if isinstance(frame, InterruptionFrame):
-            self._is_interrupted = True
-            self._active_playing_gen_id = 0
-            self._awaiting_first_audio_of_turn = False
-            self._accumulated_trimmed_bytes = 0
-            self._pre_roll_buffer = b""
+            is_closing = False
+            if self._call_end_coordinator:
+                is_closing = (
+                    getattr(self._call_end_coordinator, "is_closing_in_progress", False)
+                    or getattr(self._call_end_coordinator, "_in_grace", False)
+                )
 
-            # Fix 2: Immediately purge and log stale frames at interruption time
-            purged = self._dropped_frames
-            self._dropped_frames = 0
-            logger.info(
-                "[{}] Barge-in interruption: purged {} stale audio frames immediately",
-                self._stream_id,
-                purged,
-            )
+            if not is_closing:
+                self._is_interrupted = True
+                self._active_playing_gen_id = 0
+                self._awaiting_first_audio_of_turn = False
+                self._accumulated_trimmed_bytes = 0
+                self._pre_roll_buffer = b""
 
-            # (a) Cancel in-flight LLM generation
-            if self._llm and hasattr(self._llm, "_handle_interruptions"):
-                try:
-                    await self._llm._handle_interruptions(frame)
-                except Exception as _e:
-                    logger.debug("[{}] Error interrupting LLM: {}", self._stream_id, _e)
+                # Fix 2: Immediately purge and log stale frames at interruption time
+                purged = self._dropped_frames
+                self._dropped_frames = 0
+                logger.info(
+                    "[{}] Barge-in interruption: purged {} stale audio frames immediately",
+                    self._stream_id,
+                    purged,
+                )
 
-            # (b) Stop TTS
-            if self._tts and hasattr(self._tts, "_handle_interruption"):
-                try:
-                    await self._tts._handle_interruption(frame, direction)
-                except Exception as _e:
-                    logger.debug("[{}] Error interrupting TTS: {}", self._stream_id, _e)
+                # (a) Cancel in-flight LLM generation
+                if self._llm and hasattr(self._llm, "_handle_interruptions"):
+                    try:
+                        await self._llm._handle_interruptions(frame)
+                    except Exception as _e:
+                        logger.debug("[{}] Error interrupting LLM: {}", self._stream_id, _e)
 
-            # (c) Flush client-side playback buffer via WebSocket clearAudio
-            if self._websocket:
-                try:
-                    payload = json.dumps({"event": "clearAudio", "streamId": self._stream_id})
-                    if hasattr(self._websocket, "send_text"):
-                        await self._websocket.send_text(payload)
-                    elif hasattr(self._websocket, "send_json"):
-                        await self._websocket.send_json({"event": "clearAudio", "streamId": self._stream_id})
-                except Exception as _ws_err:
-                    logger.debug("[{}] Error sending clearAudio to websocket: {}", self._stream_id, _ws_err)
+                # (b) Stop TTS
+                if self._tts and hasattr(self._tts, "_handle_interruption"):
+                    try:
+                        await self._tts._handle_interruption(frame, direction)
+                    except Exception as _e:
+                        logger.debug("[{}] Error interrupting TTS: {}", self._stream_id, _e)
 
-            if self._on_interruption:
-                self._on_interruption()
+                # (c) Flush client-side playback buffer via WebSocket clearAudio
+                if self._websocket:
+                    try:
+                        payload = json.dumps({"event": "clearAudio", "streamId": self._stream_id})
+                        if hasattr(self._websocket, "send_text"):
+                            await self._websocket.send_text(payload)
+                        elif hasattr(self._websocket, "send_json"):
+                            await self._websocket.send_json({"event": "clearAudio", "streamId": self._stream_id})
+                    except Exception as _ws_err:
+                        logger.debug("[{}] Error sending clearAudio to websocket: {}", self._stream_id, _ws_err)
+
+                if self._on_interruption:
+                    self._on_interruption()
+            else:
+                logger.info(
+                    "[{}] Closing audio active; suppressed clearAudio and interruption cancellation to protect farewell playback",
+                    self._stream_id,
+                )
 
             # Forward downstream if arriving upstream so transport.output sees it
             if direction == FrameDirection.UPSTREAM:
@@ -2557,49 +3007,45 @@ class _InterruptionAudioGate(FrameProcessor):
                     self._dropped_frames += 1
                     return
 
-                # Shave leading silence from audio onset with safety-bounded lookback
+                # Shave leading silence from audio onset capped strictly at max_trim_ms
                 if self._awaiting_first_audio_of_turn:
                     sample_rate = getattr(frame, "sample_rate", 16000)
-                    max_trim_bytes = int(sample_rate * 2 * 0.08)  # Safety limit: never trim more than 80ms
-                    pre_roll_bytes = int(sample_rate * 2 * (15.0 / 1000.0))  # 15ms lookback
-                    
-                    combined_audio = self._pre_roll_buffer + frame.audio
-                    num_samples = len(combined_audio) // 2
+                    max_trim_bytes = int(sample_rate * 2 * (self._max_trim_ms / 1000.0))
+                    remaining_budget_bytes = max(0, max_trim_bytes - self._accumulated_trimmed_bytes)
+
+                    audio_bytes = frame.audio
+                    num_samples = len(audio_bytes) // 2
                     speech_idx = None
                     if num_samples >= 2:
-                        samples = struct.unpack(f"<{num_samples}h", combined_audio[:num_samples * 2])
+                        samples = struct.unpack(f"<{num_samples}h", audio_bytes[:num_samples * 2])
                         for i, s in enumerate(samples):
-                            if abs(s) > 40:  # Sensitive to soft speech/vowels
+                            if abs(s) > 200:  # Robust speech threshold (above noise/dither floor)
                                 speech_idx = i
                                 break
 
                     if speech_idx is None:
-                        if self._accumulated_trimmed_bytes + len(frame.audio) < max_trim_bytes:
-                            # Pure silence under budget: keep small lookback buffer
-                            self._accumulated_trimmed_bytes += len(frame.audio)
-                            self._pre_roll_buffer = combined_audio[-pre_roll_bytes:] if len(combined_audio) >= pre_roll_bytes else combined_audio
+                        # Pure silence
+                        if len(audio_bytes) <= remaining_budget_bytes:
+                            self._accumulated_trimmed_bytes += len(audio_bytes)
                             return
                         else:
-                            # Reached max trim limit: pass through without discarding speech
-                            self._awaiting_first_audio_of_turn = False
+                            trim_now = remaining_budget_bytes
+                            self._accumulated_trimmed_bytes += trim_now
+                            frame.audio = _apply_soft_fade_in(audio_bytes[trim_now:], sample_rate)
                             total_trimmed = self._accumulated_trimmed_bytes
-                            self._accumulated_trimmed_bytes = 0
-                            self._pre_roll_buffer = b""
-                            frame.audio = _apply_soft_fade_in(combined_audio, sample_rate)
+                            self._awaiting_first_audio_of_turn = False
                     else:
-                        # Speech detected! Keep 15ms pre-roll lookback
-                        pre_roll_samples = int(sample_rate * (15.0 / 1000.0))
-                        keep_idx = max(0, speech_idx - pre_roll_samples)
-                        trimmed_audio = combined_audio[keep_idx * 2 :]
-
-                        total_trimmed = self._accumulated_trimmed_bytes + (keep_idx * 2) - len(self._pre_roll_buffer)
-                        total_trimmed = max(0, total_trimmed)
-                        self._accumulated_trimmed_bytes = 0
-                        self._pre_roll_buffer = b""
-                        frame.audio = _apply_soft_fade_in(trimmed_audio, sample_rate)
+                        pre_roll_samples = int(sample_rate * 0.020)  # Keep ~20ms pad before speech
+                        trim_samples = max(0, speech_idx - pre_roll_samples)
+                        speech_bytes = trim_samples * 2
+                        trim_now = min(speech_bytes, remaining_budget_bytes)
+                        self._accumulated_trimmed_bytes += trim_now
+                        if trim_now > 0:
+                            frame.audio = _apply_soft_fade_in(audio_bytes[trim_now:], sample_rate)
+                        total_trimmed = self._accumulated_trimmed_bytes
                         self._awaiting_first_audio_of_turn = False
 
-                    saved_ms = (total_trimmed / (sample_rate * 2)) * 1000.0
+                    saved_ms = min(self._max_trim_ms, round((total_trimmed / (sample_rate * 2)) * 1000.0, 1))
                     if saved_ms > 0:
                         logger.info(
                             "METRIC call_id={} event=tts_silence_trimmed raw_silence_bytes={} saved_ms={:.1f}",
@@ -2608,7 +3054,7 @@ class _InterruptionAudioGate(FrameProcessor):
                             saved_ms,
                         )
                         if self._metrics_collector and hasattr(self._metrics_collector, "record_tts_silence_trimmed"):
-                            self._metrics_collector.record_tts_silence_trimmed(saved_ms)
+                            self._metrics_collector.record_tts_silence_trimmed(saved_ms, gen_id=self._current_gen_id)
 
         await super().process_frame(frame, direction)
         await self.push_frame(frame, direction)
@@ -2725,11 +3171,17 @@ class _FastPathRouter(FrameProcessor):
         stream_id: str = "",
         lead_memory: dict[str, str] | None = None,
         config: dict | None = None,
+        history_pruner: Any = None,
+        call_metrics: Any = None,
+        delayed_race_filler: Any = None,
     ):
         super().__init__()
         self._stream_id = stream_id
         self._lead_memory = lead_memory if lead_memory is not None else {}
         self._config = config or {}
+        self._history_pruner = history_pruner
+        self._call_metrics = call_metrics
+        self._delayed_race_filler = delayed_race_filler
         self._turn_count = 0
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
@@ -2742,6 +3194,21 @@ class _FastPathRouter(FrameProcessor):
             context = frame.context
             messages = getattr(context, "messages", [])
             _coalesce_consecutive_messages(messages)
+            _sync_working_memory(messages, self._lead_memory, self._stream_id)
+
+            # EDIT 1: Check for unexplained context drops (CONTEXT_REWIND)
+            if self._history_pruner and getattr(self._history_pruner, "_last_pruned_len", 0) > 0:
+                last_pruned = self._history_pruner._last_pruned_len
+                if len(messages) < last_pruned:
+                    logger.error(
+                        "[{}] CONTEXT_REWIND unexplained drop in context: {} < last_pruned={}",
+                        self._stream_id,
+                        len(messages),
+                        last_pruned,
+                    )
+                    if self._call_metrics and hasattr(self._call_metrics, "record_context_rewind"):
+                        self._call_metrics.record_context_rewind()
+
             latest_user_text = ""
             for msg in reversed(messages):
                 if msg.get("role") == "user":
@@ -2754,13 +3221,15 @@ class _FastPathRouter(FrameProcessor):
                 assistant_msgs = [m for m in messages if m.get("role") == "assistant"]
 
                 # Priority 5: Turn-1 Affirmative confirmation
-                if len(assistant_msgs) <= 1 and _is_name_confirmation_affirmative(latest_user_text):
+                if self._turn_count <= 1 and len(assistant_msgs) <= 1 and _is_name_confirmation_affirmative(latest_user_text):
                     fast_reply = _CACHED_PHRASE_TEXTS["opening_intro"]
                     logger.info(
                         "[{}] FastPath: Intercepted Turn-1 name affirmation ({!r}) -> 0ms LLM fast-path",
                         self._stream_id,
                         latest_user_text,
                     )
+                    if self._call_metrics and hasattr(self._call_metrics, "record_cached_answer"):
+                        self._call_metrics.record_cached_answer("opening_intro")
                     await self.push_frame(LLMFullResponseStartFrame(), direction)
                     await self.push_frame(TextFrame(text=fast_reply), direction)
                     await self.push_frame(LLMFullResponseEndFrame(), direction)
@@ -2789,6 +3258,8 @@ class _FastPathRouter(FrameProcessor):
                     return
 
                 # All property and consultative queries pass through to the LLM with active language prompt
+                if self._delayed_race_filler is not None:
+                    self._delayed_race_filler.arm_llm_request(self._turn_count)
 
         await self.push_frame(frame, direction)
 
@@ -2880,6 +3351,8 @@ class _DelayedRaceFiller(FrameProcessor):
         language_state: Any = None,
         hangup_state: dict | None = None,
         timeout_seconds: float = 0.700,
+        llm_service: Any = None,
+        context: Any = None,
     ):
         super().__init__()
         self._stream_id = stream_id
@@ -2888,44 +3361,110 @@ class _DelayedRaceFiller(FrameProcessor):
         self._language_state = language_state
         self._hangup_state = hangup_state
         self._timeout_seconds = timeout_seconds
+        self._llm_service = llm_service
+        self._context = context
         self._turn_index = 0
         self._race_task: asyncio.Task | None = None
+        self._watchdog_task: asyncio.Task | None = None
         self._turn_in_flight = False
         self._filler_dispatched = False
+        self._watchdog_retried = False
 
-    def _cancel_race(self, reason: str = "") -> None:
+    def cancel_all_timers(self, reason: str = "") -> None:
+        self._turn_in_flight = False
+        self._filler_dispatched = False
+        self._watchdog_retried = False
+        self._cancel_timers(reason)
+
+    def arm_llm_request(self, turn_id: int | None = None) -> None:
+        """Arm race and watchdog timers ONLY after an LLM request was actually sent for the turn."""
+        if self._hangup_state and self._hangup_state.get("done", False):
+            return
+        if turn_id is not None:
+            self._turn_index = turn_id
+        self._turn_in_flight = True
+        self._filler_dispatched = False
+        self._watchdog_retried = False
+        self._cancel_timers("arm LLM request")
+        if self._turn_index > 1:
+            self._race_task = asyncio.create_task(self._race_timer(self._turn_index))
+        self._watchdog_task = asyncio.create_task(self._watchdog_timer(self._turn_index))
+        logger.debug("[{}] Armed race filler & 3s watchdog for turn {}", self._stream_id, self._turn_index)
+
+    def _cancel_timers(self, reason: str = "") -> None:
         if self._race_task and not self._race_task.done():
             self._race_task.cancel()
             self._race_task = None
+        if self._watchdog_task and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+            self._watchdog_task = None
+
+    async def _play_filler(self, reason: str) -> None:
+        if self._filler_dispatched or (self._hangup_state and self._hangup_state.get("done", False)):
+            return
+        lang = (
+            self._language_state.get_language()
+            if self._language_state and hasattr(self._language_state, "get_language")
+            else "en"
+        )
+        filler_key = "filler_hi" if lang in ("hi", "Hindi") else "filler_en"
+        pcm = _AUDIO_CACHE.get(self._sample_rate, {}).get(filler_key) or _AUDIO_CACHE.get(self._sample_rate, {}).get("filler_en")
+        if pcm and self._interruption_audio_gate:
+            logger.info(
+                "[{}] Playing cached filler '{}' (reason: {})",
+                self._stream_id,
+                filler_key,
+                reason,
+            )
+            self._filler_dispatched = True
+            asyncio.create_task(
+                self._interruption_audio_gate.play_cached_audio(pcm, self._sample_rate)
+            )
 
     async def _race_timer(self, turn_id: int) -> None:
         try:
             await asyncio.sleep(self._timeout_seconds)
-            # If still waiting for LLM on this exact turn, fire filler!
             if (
                 self._turn_in_flight
                 and not self._filler_dispatched
                 and self._turn_index == turn_id
                 and not (self._hangup_state and self._hangup_state.get("done", False))
             ):
-                lang = (
-                    self._language_state.get_language()
-                    if self._language_state and hasattr(self._language_state, "get_language")
-                    else "en"
-                )
-                filler_key = "filler_hi" if lang in ("hi", "Hindi") else "filler_en"
-                pcm = _AUDIO_CACHE.get(self._sample_rate, {}).get(filler_key) or _AUDIO_CACHE.get(self._sample_rate, {}).get("filler_en")
-                if pcm and self._interruption_audio_gate:
+                await self._play_filler(f"TTFT crossed {self._timeout_seconds*1000:.0f}ms on turn {turn_id}")
+        except asyncio.CancelledError:
+            pass
+
+    async def _watchdog_timer(self, turn_id: int) -> None:
+        try:
+            await asyncio.sleep(3.0)
+            if (
+                self._turn_in_flight
+                and self._turn_index == turn_id
+                and not self._watchdog_retried
+                and not (self._hangup_state and self._hangup_state.get("done", False))
+            ):
+                # FIX 1: The watchdog retry must never run when the last context message is an assistant message
+                last_msg = None
+                if self._context and hasattr(self._context, "messages") and self._context.messages:
+                    last_msg = self._context.messages[-1]
+                if isinstance(last_msg, dict) and last_msg.get("role") == "assistant":
                     logger.info(
-                        "[{}] Slow-Turn Filler: LLM TTFT wait crossed {:.0f}ms on turn {} -> playing filler '{}'",
+                        "[{}] 3s LLM Watchdog turn {}: last context message is assistant, skipping retry",
                         self._stream_id,
-                        self._timeout_seconds * 1000,
                         turn_id,
-                        filler_key,
                     )
-                    self._filler_dispatched = True
+                    return
+
+                self._watchdog_retried = True
+                logger.warning(
+                    "[{}] 3s LLM Watchdog fired on turn {}: no LLM response within 3.0s -> playing filler and retrying LLM",
+                    self._stream_id,
+                    turn_id,
+                )
+                await self._play_filler("3s watchdog timeout")
+                if self._llm_service and self._context:
                     asyncio.create_task(
-                        self._interruption_audio_gate.play_cached_audio(pcm, self._sample_rate)
+                        self._llm_service.process_frame(LLMContextFrame(self._context), FrameDirection.DOWNSTREAM)
                     )
         except asyncio.CancelledError:
             pass
@@ -2933,24 +3472,26 @@ class _DelayedRaceFiller(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         if direction == FrameDirection.DOWNSTREAM:
             if isinstance(frame, UserStartedSpeakingFrame):
-                self._cancel_race("user started speaking")
+                self._cancel_timers("user started speaking")
                 self._turn_in_flight = False
                 self._filler_dispatched = False
+                self._watchdog_retried = False
             elif isinstance(frame, InterruptionFrame):
-                self._cancel_race("interruption")
+                self._cancel_timers("interruption")
                 self._turn_in_flight = False
                 self._filler_dispatched = False
+                self._watchdog_retried = False
             elif isinstance(frame, UserStoppedSpeakingFrame):
                 self._turn_index += 1
-                self._turn_in_flight = True
+                self._turn_in_flight = False
                 self._filler_dispatched = False
-                self._cancel_race("new user turn")
-                # Do not play filler on Turn 1 (greeting confirmation)
-                if self._turn_index > 1 and not (self._hangup_state and self._hangup_state.get("done", False)):
-                    self._race_task = asyncio.create_task(self._race_timer(self._turn_index))
+                self._watchdog_retried = False
+                self._cancel_timers("new user turn")
+                # Timers arm ONLY when LLM request is actually dispatched
+            elif isinstance(frame, LLMContextFrame):
+                self.arm_llm_request(self._turn_index)
             elif isinstance(frame, (TextFrame, LLMFullResponseStartFrame, TTSSpeakFrame)):
-                # LLM response or FastPath arrived! Cancel the race timer immediately.
-                self._cancel_race("LLM token arrived")
+                self._cancel_timers("LLM token arrived")
                 self._turn_in_flight = False
 
         await super().process_frame(frame, direction)
@@ -2981,6 +3522,7 @@ class _SilenceChecker(FrameProcessor):
         force_hangup_fn: Callable[[str], Awaitable[None]] | None = None,
         poll_interval_secs: float = 1.0,
         call_metrics: Any = None,
+        lead_memory: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self._stream_id = stream_id
@@ -2996,6 +3538,7 @@ class _SilenceChecker(FrameProcessor):
         self._force_hangup_fn = force_hangup_fn
         self._poll_interval_secs = poll_interval_secs
         self._call_metrics = call_metrics
+        self._lead_memory = lead_memory
         self._shutdown_state: dict[str, bool] | None = None
         self._termination_processor: Any = None
 
@@ -3008,6 +3551,7 @@ class _SilenceChecker(FrameProcessor):
         self._bot_is_speaking = False
         self._user_is_speaking = False
         self._turn_in_flight = False
+        self._bot_owes_response = False
 
     def bind_state(
         self,
@@ -3088,9 +3632,10 @@ class _SilenceChecker(FrameProcessor):
             ):
                 self._turn_in_flight = False
 
-            # Freeze the timer if the bot is active, turning, user is talking, or call ending is requested
+            # Freeze the timer if the bot owes a response, is active, turning, user is talking, or call ending is requested
             if (
                 self._is_call_ending
+                or self._bot_owes_response
                 or self._bot_is_speaking
                 or self._user_is_speaking
                 or self._turn_in_flight
@@ -3106,7 +3651,7 @@ class _SilenceChecker(FrameProcessor):
 
             # Stage 1: Send first soft check-in nudge
             if self._stage == 0 and elapsed >= self._silence_threshold_secs and not self._is_call_ending:
-                if self._turn_in_flight or self._bot_is_speaking or self._user_is_speaking:
+                if self._bot_owes_response or self._turn_in_flight or self._bot_is_speaking or self._user_is_speaking:
                     continue
                 self._stage = 1
                 now = time.monotonic()
@@ -3125,7 +3670,7 @@ class _SilenceChecker(FrameProcessor):
 
             # Stage 2: Send second soft check-in nudge if still silent
             elif self._stage == 1 and elapsed >= self._second_threshold_secs and not self._is_call_ending:
-                if self._turn_in_flight or self._bot_is_speaking or self._user_is_speaking:
+                if self._bot_owes_response or self._turn_in_flight or self._bot_is_speaking or self._user_is_speaking:
                     continue
                 self._stage = 2
                 now = time.monotonic()
@@ -3147,8 +3692,13 @@ class _SilenceChecker(FrameProcessor):
                 self._stage = 3
                 logger.info("[{}] SilenceChecker: Silence threshold reached after 2 soft nudges -> scheduling auto-termination", self._stream_id)
 
-                if self._call_metrics and hasattr(self._call_metrics, "mark_silence_nudge"):
-                    self._call_metrics.mark_silence_nudge(stage=3)
+                if self._lead_memory is not None:
+                    self._lead_memory["disposition"] = "NO_RESPONSE"
+                try:
+                    import lead_state
+                    lead_state.set_disposition(self._stream_id, "NO_RESPONSE")
+                except Exception:
+                    pass
 
                 if self._call_end_coordinator is not None:
                     if self._goodbye_message and self._task and not self._is_call_ending:
@@ -3181,23 +3731,29 @@ class _SilenceChecker(FrameProcessor):
         
         if frame_name in ("UserStartedSpeakingFrame", "InterruptionFrame"):
             self.on_user_speech()
+            self._bot_owes_response = True
         elif frame_name == "UserStoppedSpeakingFrame":
             self._user_is_speaking = False
             self._last_user_speech_time = time.monotonic()
+            self._bot_owes_response = True
         elif isinstance(frame, TranscriptionFrame) and frame.text.strip():
             self._last_user_speech_time = time.monotonic()
             self._stage = 0
             self._turn_in_flight = True
-        elif frame_name == "LLMFullResponseStartFrame":
+            self._bot_owes_response = True
+        elif frame_name in ("LLMFullResponseStartFrame", "TTSSpeakFrame"):
             self._turn_in_flight = True
+            self._bot_owes_response = False
         elif frame_name == "BotStartedSpeakingFrame":
             self._bot_is_speaking = True
             self._turn_in_flight = False
+            self._bot_owes_response = False
             # NOTE: DO NOT reset self._stage here!
             # Stage represents caller silence progression and must only be reset to 0 by caller speech.
         elif frame_name == "BotStoppedSpeakingFrame":
             self._bot_is_speaking = False
             self._turn_in_flight = False
+            self._bot_owes_response = False
             self._bot_speaking_finish_time = time.monotonic()
         elif frame_name == "LLMFullResponseEndFrame":
             if not self._bot_is_speaking:
@@ -3292,22 +3848,10 @@ class _SpamQualifyGate(FrameProcessor):
             await self._force_hangup_fn(f"spam_gate:{verdict}")
 
     async def _monitor_loop(self) -> None:
-        """Background checker for early VAD anomalies (0-8s dead line / machine burst)."""
+        """Background checker for 15s intent check."""
         try:
-            # Check 1: dead line silence at 7.0s
-            await asyncio.sleep(7.0)
-            if not self._gate_resolved and not self._is_call_ending():
-                if not self._user_ever_spoke and self._user_turn_count == 0:
-                    await self._hangup_with_verdict(
-                        "dead_line",
-                        "no_speech_within_7s",
-                        speech_detected=False,
-                        max_burst=0.0,
-                    )
-                    return
-
-            # Check 2: check at 15.0s if turn 1 occurred but had zero intent
-            await asyncio.sleep(8.0)  # total 15.0s
+            # Check at 15.0s if turn 1 occurred but had zero intent
+            await asyncio.sleep(15.0)
             if not self._gate_resolved and not self._is_call_ending():
                 if self._user_turn_count >= 1 and not self._clarifying_nudge_sent:
                     logger.info(
@@ -3389,6 +3933,139 @@ class _SpamQualifyGate(FrameProcessor):
         if self._monitor_task and not self._monitor_task.done():
             self._monitor_task.cancel()
         await super().cleanup()
+
+
+class _TranscriptionTap(FrameProcessor):
+    """Passively taps TranscriptionFrame and ProposedUserStoppedSpeakingFrame for call_metrics.
+
+    Sits immediately downstream of STT (upstream of context_aggregator.user() which
+    absorbs TranscriptionFrame). Notifies call_metrics directly without pushing any
+    new frames or forwarding MetricsFrame, ensuring zero chance of a replay loop.
+    """
+
+    def __init__(self, collector: Any = None) -> None:
+        super().__init__()
+        self._collector = collector
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if self._collector and direction == FrameDirection.DOWNSTREAM:
+            if isinstance(frame, ProposedUserStoppedSpeakingFrame):
+                self._collector._speech_stop_at = time.monotonic()
+            elif isinstance(frame, TranscriptionFrame):
+                if hasattr(self._collector, "record_transcription_metrics"):
+                    self._collector.record_transcription_metrics(frame)
+        await self.push_frame(frame, direction)
+
+
+
+class SarvamSmartTurnStopStrategy(TurnAnalyzerUserTurnStopStrategy):
+    """
+    Bridges Sarvam STT's ProposedUserStarted/StoppedSpeakingFrame into TurnAnalyzerUserTurnStopStrategy.
+    Sarvam STT emits ProposedUserStarted/StoppedSpeakingFrame without Silero VAD.
+    Resolves turns immediately when (Smart Turn COMPLETE) AND (final transcript received), in either order.
+    Fallback timeout (250ms) fires if transcript never arrives.
+    Cancels in-flight inference and fallback timer on renewed speech or barge-in.
+    """
+
+    def __init__(self, *args, fallback_timeout: float = 0.25, stream_id: str = "", **kwargs):
+        super().__init__(*args, **kwargs)
+        self._analysis_task: asyncio.Task | None = None
+        self._fallback_timeout_task: asyncio.Task | None = None
+        self._fallback_timeout_seconds: float = fallback_timeout
+        self._has_transcript: bool = False
+        self._turn_complete: bool = False
+        self._turn_stopped: bool = False
+        self._stream_id: str = stream_id
+
+    @property
+    def resolves_proposed_turn_stop_frames(self) -> bool:
+        return True
+
+    def cancel_inference(self) -> None:
+        """Cancels any in-flight Smart Turn inference task and fallback timeout."""
+        if self._analysis_task and not self._analysis_task.done():
+            self._analysis_task.cancel()
+            self._analysis_task = None
+        if self._fallback_timeout_task and not self._fallback_timeout_task.done():
+            self._fallback_timeout_task.cancel()
+            self._fallback_timeout_task = None
+
+    async def _discard_pending_end_of_turn(self):
+        self.cancel_inference()
+        self._has_transcript = False
+        self._turn_complete = False
+        self._turn_stopped = False
+        await super()._discard_pending_end_of_turn()
+
+    async def _check_and_trigger(self, source: str = "strategy"):
+        if self._turn_stopped:
+            return
+        if self._turn_complete and self._has_transcript:
+            self._turn_stopped = True
+            if self._fallback_timeout_task and not self._fallback_timeout_task.done():
+                self._fallback_timeout_task.cancel()
+                self._fallback_timeout_task = None
+            logger.info("[{}] turn_stop source={}", self._stream_id, source)
+            await self.trigger_user_turn_stopped()
+
+    async def _handle_vad_user_stopped_speaking(self, frame: VADUserStoppedSpeakingFrame):
+        self._vad_user_speaking = False
+        self._stop_secs = frame.stop_secs
+        self._vad_stopped = True
+
+        async def _run_analysis():
+            try:
+                state, prediction = await self._turn_analyzer.analyze_end_of_turn()
+                await self._handle_prediction_result(prediction)
+                self._turn_complete = (state == EndOfTurnState.COMPLETE)
+                await self._check_and_trigger("strategy")
+            except asyncio.CancelledError:
+                pass
+            except Exception as _e:
+                logger.debug(f"{self}: Error during turn analysis: {_e}")
+
+        self.cancel_inference()
+        self._analysis_task = self.task_manager.create_task(
+            _run_analysis(), f"{self}::_run_analysis"
+        )
+
+        async def _fallback_timeout_handler():
+            try:
+                await asyncio.sleep(self._fallback_timeout_seconds)
+                if not self._turn_stopped:
+                    self._turn_stopped = True
+                    logger.info("[{}] turn_stop source=timeout", self._stream_id)
+                    await self.trigger_user_turn_stopped()
+            except asyncio.CancelledError:
+                pass
+
+        self._fallback_timeout_task = self.task_manager.create_task(
+            _fallback_timeout_handler(), f"{self}::_fallback_timeout_handler"
+        )
+
+    async def process_frame(self, frame: Frame) -> ProcessFrameResult:
+        if isinstance(frame, ProposedUserStartedSpeakingFrame):
+            self.cancel_inference()
+            self._turn_stopped = False
+            self._has_transcript = False
+            self._turn_complete = False
+            await self._handle_vad_user_started_speaking(
+                VADUserStartedSpeakingFrame(start_secs=0.0, timestamp=time.time())
+            )
+        elif isinstance(frame, ProposedUserStoppedSpeakingFrame):
+            await self._handle_vad_user_stopped_speaking(
+                VADUserStoppedSpeakingFrame(stop_secs=0.0, timestamp=time.time())
+            )
+        elif isinstance(frame, (UserStartedSpeakingFrame, InterruptionFrame)):
+            self.cancel_inference()
+        elif isinstance(frame, TranscriptionFrame):
+            if frame.text and frame.text.strip():
+                self._has_transcript = True
+                self._text = frame.text
+                await self._check_and_trigger("strategy")
+        return await super().process_frame(frame)
+
 
 
 class DebouncedExternalUserTurnStopStrategy(ExternalUserTurnStopStrategy):
@@ -3632,6 +4309,7 @@ class _TerminationProcessor(FrameProcessor):
         self._call_end_coordinator: Any = None
         self._lead_memory: dict[str, str] | None = None
         self._rejection_attempts: dict[str, int] | None = None
+        self._post_farewell_replies: int = 0
 
         self.silent_termination_patterns = [
             (
@@ -3806,8 +4484,12 @@ class _TerminationProcessor(FrameProcessor):
             await asyncio.sleep(self._grace_seconds)
 
             if not self._provider_hangup_sent:
+                logger.info(
+                    "[{}] Hangup completed reason=farewell",
+                    self._stream_id,
+                )
                 await self._force_hangup_fn(
-                    "farewell_complete"
+                    "farewell"
                 )
                 self._provider_hangup_sent = True
 
@@ -3827,8 +4509,12 @@ class _TerminationProcessor(FrameProcessor):
             await asyncio.sleep(delay)
 
             if not self._provider_hangup_sent:
+                logger.info(
+                    "[{}] Hangup completed reason=farewell",
+                    self._stream_id,
+                )
                 await self._force_hangup_fn(
-                    "termination_immediate"
+                    "farewell"
                 )
                 self._provider_hangup_sent = True
 
@@ -3857,7 +4543,11 @@ class _TerminationProcessor(FrameProcessor):
             self._safety_seconds,
         )
 
-        await self._force_hangup_fn("termination_safety_timeout")
+        logger.info(
+            "[{}] Hangup completed reason=farewell",
+            self._stream_id,
+        )
+        await self._force_hangup_fn("farewell")
         self._provider_hangup_sent = True
 
         await self.push_frame(
@@ -3910,9 +4600,23 @@ class _TerminationProcessor(FrameProcessor):
     ) -> None:
         await super().process_frame(frame, direction)
 
-        # A caller interruption cancels a pending farewell immediately so the caller can barge in and be heard
+        # FIX 7: In _TerminationProcessor, do not cancel hangup on caller interruption; allow max 1 post-farewell reply, then hang up logging "hangup completed reason=farewell"
         if isinstance(frame, (InterruptionFrame, UserStartedSpeakingFrame)):
-            self.cancel_pending_termination("caller interrupted")
+            if self._termination_requested:
+                if self._post_farewell_replies >= 1:
+                    logger.info("[{}] Hangup completed reason=farewell", self._stream_id)
+                    if not self._provider_hangup_sent:
+                        await self._force_hangup_fn("farewell")
+                        self._provider_hangup_sent = True
+                    await self.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+                    return
+                else:
+                    self._post_farewell_replies += 1
+                    logger.info(
+                        "[{}] Caller interrupted after farewell; allowing max 1 post-farewell reply (reply #{})",
+                        self._stream_id,
+                        self._post_farewell_replies,
+                    )
             await self.push_frame(frame, direction)
             return
 
@@ -3921,7 +4625,7 @@ class _TerminationProcessor(FrameProcessor):
             and isinstance(frame, LLMFullResponseStartFrame)
         ):
             self._current_turn_text = ""
-            if self._hangup_task or self._waiting_for_bot_stop or self._termination_requested:
+            if (self._hangup_task or self._waiting_for_bot_stop) and not self._termination_requested:
                 self.cancel_pending_termination("new LLM response started")
 
         # Inspect bot speech for explicit termination.
@@ -4088,6 +4792,7 @@ class _CallEndCoordinator(FrameProcessor):
         self._in_grace = False
         self._ended = False
         self._current_audio_active = False
+        self._extra_reply_count = 0
 
         self._grace_task: asyncio.Task | None = None
         self._safety_task: asyncio.Task | None = None
@@ -4274,12 +4979,9 @@ class _CallEndCoordinator(FrameProcessor):
                 or self._in_grace
             )
         ):
-            was_speaking = self._closing_in_progress or self._current_audio_active
-            if was_speaking:
-                self._current_audio_active = False
-                await self.push_frame(InterruptionFrame(), FrameDirection.UPSTREAM)
-                await self.push_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
-            self.cancel_ending("caller interrupted")
+            # Prior late-barge-in contract:
+            # Does NOT cancel the final hangup. Closing audio is preserved by AudioGate.
+            pass
 
         if isinstance(frame, (TTSStartedFrame, TTSAudioRawFrame, BotStartedSpeakingFrame)):
             self._current_audio_active = True
@@ -4313,7 +5015,7 @@ class _CallEndCoordinator(FrameProcessor):
 
         # During grace window or closing, inspect transcription text.
         # If caller reciprocates farewell/signs off, complete the call cleanly without speaking again.
-        # If caller says something meaningful/question/continuation, cancel the hangup and continue.
+        # If caller says something meaningful/question/continuation, allow at most ONE extra reply without cancelling hangup.
         if (
             isinstance(frame, TranscriptionFrame)
             and (self._in_grace or self._closing_in_progress or self._awaiting_closing)
@@ -4329,19 +5031,26 @@ class _CallEndCoordinator(FrameProcessor):
                 await self._finish()
                 return
             elif text and len(text) > 2:
-                was_speaking = self._closing_in_progress or self._current_audio_active
-                logger.info(
-                    "[{}] Caller spoke meaningfully during closing/grace "
-                    "(text={!r}); cancelling hangup",
-                    self._stream_id,
-                    text,
-                )
-                self.cancel_ending(
-                    "caller spoke meaningfully during closing/grace window"
-                )
-                if was_speaking:
-                    await self.push_frame(InterruptionFrame(), FrameDirection.UPSTREAM)
-                    await self.push_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+                # Late-barge-in contract: does NOT cancel the final hangup; allows at most ONE extra reply!
+                if getattr(self, "_extra_reply_count", 0) < 1:
+                    self._extra_reply_count = getattr(self, "_extra_reply_count", 0) + 1
+                    logger.info(
+                        "[{}] Caller spoke meaningfully during closing/grace ({!r}); allowing at most 1 extra reply (count={}) without cancelling hangup",
+                        self._stream_id,
+                        text,
+                        self._extra_reply_count,
+                    )
+                    self._closing_in_progress = False
+                    self._in_grace = False
+                    self._awaiting_closing = True
+                    self._cancel_task("_grace_task")
+                    # Do NOT cancel self._safety_task - hard safety timer remains running as backstop!
+                else:
+                    logger.info(
+                        "[{}] Caller spoke during closing/grace ({!r}) but extra reply budget exhausted; proceeding to hangup",
+                        self._stream_id,
+                        text,
+                    )
             elif not text:
                 if not self._grace_task or self._grace_task.done():
                     self._grace_task = asyncio.create_task(self._run_grace_timeout())
@@ -4374,24 +5083,60 @@ class _HistoryPruner(FrameProcessor):
         self._full_transcript = full_transcript
         self._call_end_coordinator = call_end_coordinator
         self._lead_memory = lead_memory if lead_memory is not None else {}
-        # Track recorded messages by (role, content) to survive context pruning
-        self._recorded: set[tuple[str, str]] = set()
+        # Track recorded messages by object identity + strong reference to allow repeated words across turns
+        self._recorded_ids: set[int] = set()
+        self._recorded_refs: list[Any] = []
+        self._last_pruned_len: int = 0
 
     def _record_full_transcript(self) -> None:
         if self._full_transcript is None:
             return
-        msgs = self._context.get_messages() if hasattr(self._context, "get_messages") else getattr(self._context, "messages", [])
+        msgs = getattr(self._context, "messages", None)
+        if not isinstance(msgs, list):
+            if hasattr(self._context, "get_messages") and callable(self._context.get_messages):
+                res = self._context.get_messages()
+                msgs = res if isinstance(res, list) else []
+            else:
+                msgs = []
+        dialogue: list[dict[str, str]] = []
         for msg in msgs:
+            if not isinstance(msg, dict):
+                continue
             role = msg.get("role")
             content = msg.get("content")
             if isinstance(content, list):
                 content = " ".join(part.get("text", "") for part in content if isinstance(part, dict))
             if not isinstance(content, str) or not content.strip() or role not in ("user", "assistant"):
                 continue  # skip tool-call/tool-result/developer bookkeeping messages
-            key = (role, content.strip())
-            if key not in self._recorded:
-                self._recorded.add(key)
-                self._full_transcript.append({"role": role, "content": content.strip()})
+            dialogue.append({"role": role, "content": content.strip()})
+
+        if not dialogue:
+            return
+
+        if not self._full_transcript:
+            self._full_transcript.extend(dialogue)
+            logger.debug("[{}] Initialized full transcript ({} messages)", self._stream_id, len(self._full_transcript))
+            return
+
+        # Content-based deduplication: align dialogue slice to suffix of full_transcript
+        # by matching (role, normalized_content) to prevent duplicate recordings across prune cycles
+        norm = lambda item: (item.get("role"), " ".join(str(item.get("content", "")).lower().split()))
+        m = min(len(self._full_transcript), len(dialogue))
+        match_len = 0
+        for k in range(m, 0, -1):
+            if all(norm(self._full_transcript[-(k - i)]) == norm(dialogue[i]) for i in range(k)):
+                match_len = k
+                break
+
+        new_items = dialogue[match_len:]
+        if new_items:
+            self._full_transcript.extend(new_items)
+            logger.debug(
+                "[{}] Appended {} new messages to full transcript (total {})",
+                self._stream_id,
+                len(new_items),
+                len(self._full_transcript),
+            )
 
     async def process_frame(
         self,
@@ -4404,6 +5149,22 @@ class _HistoryPruner(FrameProcessor):
         )
 
         if direction == FrameDirection.DOWNSTREAM:
+            # Observability & CPU fix: only run pruning & transcript recording on turn boundary / LLM trigger frames!
+            # 20ms AudioRawFrames (~50 per second) must NEVER trigger history pruning.
+            if not isinstance(
+                frame,
+                (
+                    LLMFullResponseEndFrame,
+                    UserStoppedSpeakingFrame,
+                    TranscriptionFrame,
+                    LLMContextFrame,
+                    FunctionCallResultFrame,
+                    LLMRunFrame,
+                ),
+            ):
+                await self.push_frame(frame, direction)
+                return
+
             before = len(self._context.messages)
 
             # Capture BEFORE pruning -- this is the only point where
@@ -4426,6 +5187,10 @@ class _HistoryPruner(FrameProcessor):
             )
 
             after = len(self._context.messages)
+            self._last_pruned_len = after
+
+            # Re-sync working memory after pruning so [ACTIVE LEAD STATE: ...] is always present
+            _sync_working_memory(self._context.messages, self._lead_memory, self._stream_id)
 
             if after < before:
                 logger.debug(
@@ -4548,6 +5313,335 @@ async def get_provider_services(
         sample_rate=sample_rate,
         aiohttp_session=aiohttp_session,
     )
+
+
+async def execute_book_site_visit(
+    params: Any,
+    *,
+    stream_id: str,
+    call_metrics: Any = None,
+    spoken_text_guard: Any = None,
+    lead_memory: dict | None = None,
+    call_type: str = "web",
+    config: dict | None = None,
+) -> None:
+    """Execute site visit booking with strict date normalization, idempotency, and WhatsApp coordination."""
+    tool_call_started_at = time.monotonic()
+    args = getattr(params, "arguments", None) or {}
+    date_raw = str(args.get("date", "")).strip()
+    time_raw = str(args.get("time", "")).strip()
+    logger.info(f"[{stream_id}] Tool book_site_visit called: date={date_raw!r}, time={time_raw!r}")
+
+    # 1. Require explicit date AND time — no default fallbacks
+    if not date_raw or not time_raw:
+        missing = []
+        if not date_raw:
+            missing.append("date")
+        if not time_raw:
+            missing.append("time")
+        logger.warning(
+            f"[{stream_id}] book_site_visit missing required argument(s): {missing}"
+        )
+        if call_metrics and hasattr(call_metrics, "record_tool_call"):
+            call_metrics.record_tool_call(
+                "book_site_visit",
+                success=False,
+                latency_ms=(time.monotonic() - tool_call_started_at) * 1000,
+            )
+        msg = (
+            "Please confirm what time works best for the site visit."
+            if "time" in missing and "date" not in missing
+            else "Please confirm which day and time work best for the site visit."
+        )
+        await params.result_callback({
+            "status": "needs_confirmation",
+            "missing": missing,
+            "message": msg,
+        })
+        return
+
+    # 2. Normalize date and time before storage — fail closed on unparseable input
+    try:
+        import zoneinfo as _zi
+        from leads.worker import normalize_visit_date, normalize_visit_time, _resolve_visit_datetime, format_spoken_date, format_spoken_time
+        _now_ist = datetime.now(_zi.ZoneInfo("Asia/Kolkata"))
+        date_result = normalize_visit_date(date_raw, _now_ist)
+        norm_time = normalize_visit_time(time_raw)
+        vague_times = {"morning", "afternoon", "evening", "night", "subah", "dopahar", "shaam", "raat", "anytime", "any time"}
+        if time_raw.lower().strip() in vague_times:
+            norm_time = None
+    except Exception as _norm_exc:
+        logger.warning(f"[{stream_id}] Normalization error: {_norm_exc}; treating as unparseable")
+        date_result = None
+        norm_time = None
+
+    if date_result is None or norm_time is None:
+        missing_part = "date" if date_result is None else "time"
+        logger.warning(
+            f"[{stream_id}] book_site_visit: unparseable {missing_part} (date={date_raw!r}, time={time_raw!r})"
+        )
+        if call_metrics and hasattr(call_metrics, "record_tool_call"):
+            call_metrics.record_tool_call(
+                "book_site_visit",
+                success=False,
+                latency_ms=(time.monotonic() - tool_call_started_at) * 1000,
+            )
+        err_msg = (
+            "Date is unclear — please confirm a specific day (e.g. Saturday, tomorrow, Monday)."
+            if date_result is None
+            else "Time is unclear — please confirm a specific time (e.g. 11:00 AM, 4:00 PM)."
+        )
+        await params.result_callback({
+            "status": "needs_confirmation",
+            "message": err_msg,
+        })
+        return
+
+    iso_date, date_label = date_result
+    active_lang = "en"
+    if spoken_text_guard and hasattr(spoken_text_guard, "_language"):
+        active_lang = getattr(spoken_text_guard, "_language", "en") or "en"
+    spoken_date = format_spoken_date(iso_date, _now_ist, active_lang)
+    spoken_time = format_spoken_time(norm_time, active_lang)
+    logger.info(f"[{stream_id}] book_site_visit normalized: date={date_label!r} ({iso_date} -> {spoken_date!r}), time={norm_time!r} ({spoken_time!r})")
+
+    try:
+        from sqlalchemy import select
+        from leads.db import get_session
+        from leads.models import Lead, SiteVisit, Touchpoint
+        from services.whatsapp_sender import send_whatsapp_location
+
+        slot_dt = _resolve_visit_datetime(date_label, norm_time)
+
+        async with get_session() as session:
+            # 3. Enforce idempotency by call_id only
+            stmt_idemp = select(SiteVisit).where(SiteVisit.call_id == stream_id)
+            existing_sv = (await session.execute(stmt_idemp)).scalars().first()
+            if existing_sv:
+                logger.info(f"[{stream_id}] book_site_visit: idempotent replay detected for site_visit_id={existing_sv.id}")
+                if call_metrics and hasattr(call_metrics, "record_tool_call"):
+                    call_metrics.record_tool_call(
+                        "book_site_visit",
+                        success=True,
+                        latency_ms=(time.monotonic() - tool_call_started_at) * 1000,
+                    )
+                stored_date = existing_sv.visit_date_iso or iso_date
+                stored_time = existing_sv.time_slot or norm_time
+                idemp_spoken_date = format_spoken_date(stored_date, _now_ist, active_lang)
+                idemp_spoken_time = format_spoken_time(stored_time, active_lang)
+                confirm_msg = f"Site visit confirmed for {idemp_spoken_date} at {idemp_spoken_time}."
+                if existing_sv.whatsapp_status == "sent":
+                    confirm_msg += " You will receive the location on WhatsApp."
+                elif existing_sv.whatsapp_status == "queued":
+                    confirm_msg += " We have queued the location details to your WhatsApp."
+                elif not existing_sv.whatsapp_opt_in:
+                    confirm_msg += " Shall I send the details on WhatsApp?"
+
+                wa_confirmed = existing_sv.whatsapp_status in ("sent", "queued")
+                if spoken_text_guard and hasattr(spoken_text_guard, "mark_tool_succeeded"):
+                    spoken_text_guard.mark_tool_succeeded("book_site_visit", whatsapp_confirmed=wa_confirmed, confirm_msg=confirm_msg)
+                await params.result_callback(
+                    {
+                        "status": "confirmed",
+                        "date": stored_date,
+                        "spoken_date": idemp_spoken_date,
+                        "time": stored_time,
+                        "spoken_time": idemp_spoken_time,
+                        "whatsapp_status": existing_sv.whatsapp_status,
+                        "message": confirm_msg,
+                    },
+                    properties=FunctionCallResultProperties(run_llm=False),
+                )
+                return
+
+            # 4. Check for lead ID or phone
+            call_rec = (await lead_state.get_call_async(stream_id)) or {}
+            lead_id_val = call_rec.get("lead_id") or (lead_memory.get("lead_id") if lead_memory else None)
+            phone = call_rec.get("customer_phone") or call_rec.get("phone") or (lead_memory.get("phone") if lead_memory else None)
+            lead_obj = None
+
+            if lead_id_val:
+                try:
+                    lead_obj = await session.get(Lead, uuid.UUID(str(lead_id_val)))
+                except Exception:
+                    lead_obj = None
+
+            if not lead_obj and phone:
+                stmt_lead = select(Lead).where(Lead.phone == phone)
+                lead_obj = (await session.execute(stmt_lead)).scalars().first()
+
+            if not lead_obj:
+                is_web_or_test = (
+                    call_type == "web"
+                    or call_rec.get("source") == "web-test"
+                    or os.getenv("LOCAL_DEMO", "").lower() == "true"
+                )
+                if is_web_or_test:
+                    test_phone = phone or "+919999999999"
+                    lead_obj = Lead(
+                        name=call_rec.get("customer_name") or (config.get("test_customer_name", "Alex") if config else "Alex"),
+                        phone=test_phone,
+                        status="visit_booked",
+                        visit_genuine=True,
+                        source="web-test",
+                    )
+                    session.add(lead_obj)
+                    await session.flush()
+                    logger.info(f"[{stream_id}] Created web-test Lead {lead_obj.id}")
+                else:
+                    logger.error(f"[{stream_id}] book_site_visit failed: missing phone on real call")
+                    if call_metrics and hasattr(call_metrics, "record_tool_call"):
+                        call_metrics.record_tool_call(
+                            "book_site_visit",
+                            success=False,
+                            latency_ms=(time.monotonic() - tool_call_started_at) * 1000,
+                        )
+                    await params.result_callback({
+                        "status": "needs_phone",
+                        "message": "Please provide your phone number so we can confirm the booking.",
+                    })
+                    return
+
+            # 5. WhatsApp opt-in and dispatch
+            whatsapp_opt_in = bool(
+                (lead_memory and lead_memory.get("whatsapp"))
+                or call_rec.get("whatsapp_opt_in")
+            )
+            wa_status = "not_requested"
+            wa_msg_id = None
+
+            if whatsapp_opt_in and lead_obj.phone:
+                from leads.outbox import is_outbox_worker_running, queue_outbox_item
+                if is_outbox_worker_running():
+                    await queue_outbox_item(
+                        lead_id=lead_obj.id,
+                        target="whatsapp",
+                        payload={
+                            "phone": lead_obj.phone,
+                            "visit_date_iso": iso_date,
+                            "time_slot": norm_time,
+                            "name": lead_obj.name,
+                            "call_id": stream_id,
+                        },
+                        session=session,
+                    )
+                    wa_status = "queued"
+                else:
+                    try:
+                        wa_res = await send_whatsapp_location(
+                            to_phone=lead_obj.phone,
+                            visit_date=iso_date,
+                            visit_time=norm_time,
+                            client_name=lead_obj.name or "Valued Customer",
+                        )
+                        wa_status = wa_res.get("status", "failed")
+                        wa_msg_id = wa_res.get("message_id")
+                    except Exception as wa_err:
+                        logger.warning(f"[{stream_id}] WhatsApp dispatch exception: {wa_err}")
+                        wa_status = "failed"
+
+            # 6. Commit SiteVisit and Touchpoint to DB
+            lead_obj.status = "visit_booked"
+            lead_obj.visit_genuine = True
+
+            sv = SiteVisit(
+                lead_id=lead_obj.id,
+                call_id=stream_id,
+                visit_date_iso=iso_date,
+                visit_date_original=date_raw,
+                time_slot=norm_time,
+                configuration=lead_memory.get("configuration") if lead_memory else None,
+                slot_start=slot_dt,
+                status="booked",
+                whatsapp_opt_in=whatsapp_opt_in,
+                whatsapp_opt_in_at=datetime.now(timezone.utc) if whatsapp_opt_in else None,
+                whatsapp_status=wa_status,
+                whatsapp_message_id=wa_msg_id,
+                created_at=datetime.now(timezone.utc),
+            )
+            session.add(sv)
+
+            tp = Touchpoint(
+                lead_id=lead_obj.id,
+                kind="site_visit",
+                call_id=stream_id,
+                summary=f"Site visit booked for {iso_date} at {norm_time}",
+                occurred_at=datetime.now(timezone.utc),
+            )
+            session.add(tp)
+            await session.commit()
+
+            # 7. SELECT read-back verification
+            read_stmt = select(SiteVisit).where(SiteVisit.id == sv.id)
+            verified_sv = (await session.execute(read_stmt)).scalars().first()
+            if not verified_sv:
+                raise RuntimeError(f"Database read-back verification failed for SiteVisit id={sv.id}")
+            logger.info(
+                f"[{stream_id}] Verified SiteVisit in DB: id={verified_sv.id} call_id={verified_sv.call_id} date={verified_sv.visit_date_iso} slot={verified_sv.time_slot}"
+            )
+
+        # 8. Persist lead_state and lead_memory only after DB verification
+        await lead_state.record_fields_async(
+            stream_id,
+            {
+                "preferred_visit_date": iso_date,
+                "preferred_visit_time": norm_time,
+                "visit_date_iso": iso_date,
+                "time_slot": norm_time,
+                "site_visit": f"Confirmed ({iso_date} at {norm_time})",
+                "disposition": "SITE_VISIT_BOOKED",
+                "lead_id": str(lead_obj.id),
+            },
+        )
+        if lead_memory is not None:
+            lead_memory["preferred_visit_date"] = iso_date
+            lead_memory["preferred_visit_time"] = norm_time
+            lead_memory["visit_date_iso"] = iso_date
+            lead_memory["time_slot"] = norm_time
+            lead_memory["site_visit"] = f"Confirmed ({iso_date} at {norm_time})"
+            lead_memory["disposition"] = "SITE_VISIT_BOOKED"
+            lead_memory["lead_id"] = str(lead_obj.id)
+
+        confirm_msg = f"Site visit confirmed for {spoken_date} at {spoken_time}."
+        if wa_status == "sent":
+            confirm_msg += " You will receive the location on WhatsApp."
+        elif wa_status == "queued":
+            confirm_msg += " We have queued the location details to your WhatsApp."
+        elif not whatsapp_opt_in:
+            confirm_msg += " Shall I send the details on WhatsApp?"
+
+        wa_confirmed = wa_status in ("sent", "queued")
+        if spoken_text_guard and hasattr(spoken_text_guard, "mark_tool_succeeded"):
+            spoken_text_guard.mark_tool_succeeded("book_site_visit", whatsapp_confirmed=wa_confirmed, confirm_msg=confirm_msg)
+
+        if call_metrics and hasattr(call_metrics, "record_tool_call"):
+            call_metrics.record_tool_call(
+                "book_site_visit",
+                success=True,
+                latency_ms=(time.monotonic() - tool_call_started_at) * 1000,
+            )
+
+        await params.result_callback(
+            {
+                "status": "confirmed",
+                "date": iso_date,
+                "spoken_date": spoken_date,
+                "time": norm_time,
+                "spoken_time": spoken_time,
+                "whatsapp_status": wa_status,
+                "message": confirm_msg,
+            },
+            properties=FunctionCallResultProperties(run_llm=False),
+        )
+    except Exception as exc:
+        logger.error(f"[{stream_id}] book_site_visit DB commit error: {exc}")
+        if call_metrics and hasattr(call_metrics, "record_tool_call"):
+            call_metrics.record_tool_call(
+                "book_site_visit",
+                success=False,
+                latency_ms=(time.monotonic() - tool_call_started_at) * 1000,
+            )
+        await params.result_callback({"status": "error", "message": "Failed to book slot."})
 
 
 async def run_bot(
@@ -4883,6 +5977,7 @@ async def run_bot(
             language=config.get("language", {}).get("initial", "en"),
             cost_rates=config.get("cost_rates", {}),
         )
+        setattr(llm, "_call_metrics", call_metrics)
 
         # Attach error monitors to services to detect repeated unrecoverable failures
         provider_error_monitor = ProviderErrorMonitor(
@@ -4913,9 +6008,6 @@ async def run_bot(
             .get("params", {})
             .get("tools", [])
         )
-
-        # Keep conversational turns zero-latency by disabling in-turn tool calls
-        llm_tools_raw = []
 
         groq_rate_limited = {"active": False}
 
@@ -5100,18 +6192,10 @@ async def run_bot(
                 )
                 return fallback_text
 
-        call_metrics = CallMetricsCollector(
-            call_id=stream_id,
-            stt_provider=active["stt"],
-            llm_provider=llm_provider_used,
-            tts_provider=active["tts"],
-            cost_rates=config.get("cost_rates"),
-        )
-
         # Record initial call record in persistent store
         await lead_state.upsert_call_async(stream_id, campaign_id=campaign_id)
 
-        supported_langs = config.get("language", {}).get("supported", ["en", "de"])
+        supported_langs = config.get("language", {}).get("supported", ["en", "hi", "te"])
         language_state = LanguageState(
             sustained_switch_turns=config.get(
                 "language",
@@ -5121,6 +6205,12 @@ async def run_bot(
                 2,
             ),
             supported_languages=frozenset(supported_langs),
+        )
+        logger.info(
+            "[{}] Effective language config: supported={} sustained_switch_turns={}",
+            stream_id,
+            list(supported_langs),
+            language_state.sustained_switch_turns,
         )
 
         shutdown_state = {
@@ -5132,6 +6222,7 @@ async def run_bot(
         }
 
         lead_memory: dict[str, str] = {}
+        setattr(llm, "_lead_memory", lead_memory)
         if campaign_data and campaign_data.get("customer_name"):
             cust_name = str(campaign_data["customer_name"]).strip()
             lead_memory["client"] = cust_name
@@ -5153,16 +6244,28 @@ async def run_bot(
                 "call_end_coordinator"
             )
 
+            # Farewell drain order on web calls: allow browser audio buffer to drain (0.8s) before closing websocket
+            if call_type == "web" and websocket:
+                try:
+                    await asyncio.sleep(0.8)
+                    if hasattr(websocket, "client_state") and websocket.client_state.name == "CONNECTED":
+                        await websocket.close(code=1000, reason="Call completed normally")
+                except Exception as _ws_e:
+                    logger.debug("[{}] Web socket close notice: {}", stream_id, _ws_e)
+
             await task.cancel()
 
         rejection_attempts = {"count": 0}
+
+        grace_seconds = float(config.get("hangup_grace_seconds", 0.8))
+        logger.info("[{}] Resolved hangup grace_seconds={:.2f}s", stream_id, grace_seconds)
 
         termination_processor = _TerminationProcessor(
             stream_id=stream_id,
             on_hangup=_perform_end_of_call_hangup,
             # Mark hangup_state before provider hangup to prevent redundant triggers
             force_hangup_fn=_force_hangup_and_mark_done,
-            grace_seconds=0.8,
+            grace_seconds=grace_seconds,
             safety_seconds=15.0,
         )
 
@@ -5175,7 +6278,7 @@ async def run_bot(
         call_end_coordinator = _CallEndCoordinator(
             stream_id=stream_id,
             on_hangup=_perform_end_of_call_hangup,
-            grace_seconds=0.8,
+            grace_seconds=grace_seconds,
             safety_seconds=15.0,
             fallback_seconds=2.5,
             fallback_closing_text=config.get(
@@ -5202,6 +6305,7 @@ async def run_bot(
             llm=llm,
             tts=tts,
             websocket=websocket,
+            call_end_coordinator=call_end_coordinator,
         )
 
         def _latest_user_utterance() -> str:
@@ -5349,123 +6453,15 @@ async def run_bot(
 
         async def book_site_visit(params) -> None:
             """Tool handler for booking property site visit slots."""
-            tool_call_started_at = time.monotonic()
-            args = params.arguments or {}
-            date_raw = str(args.get("date", ""))
-            time_str = str(args.get("time", "11:00 AM"))
-            logger.info(f"[{stream_id}] Tool book_site_visit called: date={date_raw!r}, time={time_str}")
-
-            # Normalize date before any storage — fail closed on unparseable input
-            try:
-                import zoneinfo as _zi
-                from leads.worker import normalize_visit_date
-                _now_ist = __import__("datetime").datetime.now(_zi.ZoneInfo("Asia/Kolkata"))
-                date_result = normalize_visit_date(date_raw, _now_ist)
-            except Exception as _norm_exc:
-                logger.warning(f"[{stream_id}] normalize_visit_date error: {_norm_exc}; treating as unparseable")
-                date_result = None
-
-            if date_result is None:
-                logger.warning(
-                    f"[{stream_id}] book_site_visit: unparseable date {date_raw!r} — returning needs_confirmation"
-                )
-                call_metrics.record_tool_call(
-                    "book_site_visit",
-                    success=False,
-                    latency_ms=(time.monotonic() - tool_call_started_at) * 1000,
-                )
-                await params.result_callback({
-                    "status": "needs_confirmation",
-                    "message": "Date is unclear — please ask the caller to confirm a specific day (e.g. Saturday, tomorrow, Monday).",
-                })
-                return
-
-            _iso_date, date_label = date_result
-            logger.info(f"[{stream_id}] book_site_visit: normalized {date_raw!r} -> {date_label!r}")
-
-            try:
-                await lead_state.record_fields_async(
-                    stream_id,
-                    {
-                        "preferred_visit_date": date_label,
-                        "preferred_visit_time": time_str,
-                        "site_visit": "booked",
-                        "disposition": "SITE_VISIT_BOOKED",
-                    },
-                )
-                call_rec = (await lead_state.get_call_async(stream_id)) or {}
-                lead_id_val = call_rec.get("lead_id")
-
-                try:
-                    from leads.db import get_session
-                    from leads.models import Lead, SiteVisit, Touchpoint
-                    from leads.worker import _resolve_visit_datetime
-                    from sqlalchemy import select
-
-                    async with get_session() as session:
-                        lead_obj = None
-                        if lead_id_val:
-                            try:
-                                lead_obj = await session.get(Lead, uuid.UUID(lead_id_val))
-                            except Exception:
-                                lead_obj = None
-
-                        if not lead_obj:
-                            # Fallback for demo web test calls: find recent active lead
-                            stmt_f = select(Lead).where(Lead.status.in_(["pending", "contacting", "new"])).order_by(Lead.created_at.desc()).limit(1)
-                            res_f = await session.execute(stmt_f)
-                            lead_obj = res_f.scalar_one_or_none()
-                            if lead_obj:
-                                lead_id_val = str(lead_obj.id)
-                                try:
-                                    await lead_state.record_field_async(stream_id, "lead_id", lead_id_val)
-                                except Exception:
-                                    pass
-
-                        if lead_obj:
-                            lead_obj.status = "visit_booked"
-                            lead_obj.visit_genuine = True
-                            slot_dt = _resolve_visit_datetime(date_label, time_str)
-                            sv = SiteVisit(
-                                lead_id=lead_obj.id,
-                                slot_start=slot_dt,
-                                status="booked",
-                                occurred_at=datetime.now(timezone.utc),
-                            )
-                            session.add(sv)
-                            tp = Touchpoint(
-                                lead_id=lead_obj.id,
-                                kind="site_visit",
-                                call_id=stream_id,
-                                summary=f"Site visit booked for {date_label} at {time_str}",
-                                occurred_at=datetime.now(timezone.utc),
-                            )
-                            session.add(tp)
-                            logger.info(f"[{stream_id}] Persisted SiteVisit for lead_id={lead_obj.id} slot={slot_dt}")
-                except Exception as exc:
-                    logger.warning(f"[{stream_id}] SiteVisit DB sync warning: {exc}")
-
-                call_metrics.record_tool_call(
-                    "book_site_visit",
-                    success=True,
-                    latency_ms=(time.monotonic() - tool_call_started_at) * 1000,
-                )
-                await params.result_callback(
-                    {
-                        "status": "confirmed",
-                        "date": date_label,
-                        "time": time_str,
-                        "message": f"Site visit confirmed for {date_label} at {time_str}.",
-                    }
-                )
-            except Exception as exc:
-                logger.error(f"[{stream_id}] book_site_visit error: {exc}")
-                call_metrics.record_tool_call(
-                    "book_site_visit",
-                    success=False,
-                    latency_ms=(time.monotonic() - tool_call_started_at) * 1000,
-                )
-                await params.result_callback({"status": "error", "message": "Failed to book slot."})
+            await execute_book_site_visit(
+                params,
+                stream_id=stream_id,
+                call_metrics=call_metrics,
+                spoken_text_guard=spoken_text_guard,
+                lead_memory=lead_memory,
+                call_type=call_type,
+                config=config,
+            )
 
         async def send_brochure(params) -> None:
             """Tool handler for dispatching property brochure & payment plans via WhatsApp."""
@@ -5605,7 +6601,7 @@ async def run_bot(
                 cancel_on_interruption=True,
             )
 
-        # Item 6: Prompt ordering for Groq / Cerebras prefix caching.
+        # Item 6: Prompt ordering for Groq prefix caching.
         # Static system prompt and project facts are strictly FIRST in the message array.
         # Any per-call / dynamic context (customer name, IST date) is appended SECOND (last).
         # This guarantees exact-prefix caching (~50% token cost reduction & lower TTFT).
@@ -5641,14 +6637,6 @@ async def run_bot(
                     .get("parameters", {})
                     .get("required", [])
                 ),
-                **(
-                    {"handler": _tool_handlers[raw["function"]["name"]]}
-                    if (
-                        _FUNCTION_SCHEMA_SUPPORTS_HANDLER
-                        and raw["function"]["name"] in _tool_handlers
-                    )
-                    else {}
-                ),
             )
             for raw in llm_tools_raw
         ]
@@ -5657,6 +6645,8 @@ async def run_bot(
             messages,
             tools=llm_tools,
         )
+        context.call_metrics = call_metrics
+        context.lead_memory = lead_memory
 
         turn_config = config.get(
             "turn_management",
@@ -5674,14 +6664,11 @@ async def run_bot(
         # Item 3: Try Pipecat Smart Turn (local ONNX model) first for sub-250ms endpointing
         try:
             from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
-            from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
-                TurnAnalyzerUserTurnStopStrategy,
-            )
             smart_analyzer = LocalSmartTurnAnalyzerV3()
             user_turn_stop_strategies.append(
-                TurnAnalyzerUserTurnStopStrategy(turn_analyzer=smart_analyzer)
+                SarvamSmartTurnStopStrategy(turn_analyzer=smart_analyzer, stream_id=stream_id)
             )
-            logger.info("[{}] Smart Turn endpointing enabled (LocalSmartTurnAnalyzerV3)", stream_id)
+            logger.info("[{}] Smart Turn endpointing enabled (SarvamSmartTurnStopStrategy with LocalSmartTurnAnalyzerV3)", stream_id)
         except Exception as _st_err:
             logger.info(
                 "[{}] Smart Turn not available ({}); fallback to debounced stop strategy",
@@ -5716,7 +6703,7 @@ async def run_bot(
                 user_turn_stop_timeout=float(
                     turn_config.get(
                         "user_turn_stop_timeout",
-                        0.75,
+                        5.0,
                     )
                 ),
             ),
@@ -5784,15 +6771,16 @@ async def run_bot(
             task=None,
             context_aggregator_user=context_aggregator.user(),
             call_end_coordinator=call_end_coordinator,
-            # TUNED: 15.0s first interval (then 14s) provides human-like pause tolerance before nudge
+            # TUNED: 15s first interval, 15s second, 15s third -> ~45s total to goodbye
             silence_threshold_secs=float(config.get("silence_nudge_first_secs", 15.0)),
-            second_threshold_secs=14.0,
-            third_threshold_secs=14.0,
-            check_in_message="Hello? Are you there?",
-            second_check_in_message="umm, can you hear me.",
-            goodbye_message="Looks like you're busy right now. I'll call you later, have a great day!",
+            second_threshold_secs=15.0,
+            third_threshold_secs=15.0,
+            check_in_message="Hello? Are you still there?",
+            second_check_in_message="Sorry, I didn't catch that. Could you say that again?",
+            goodbye_message="Understood, thanks for your time. Have a wonderful day!",
             force_hangup_fn=_force_hangup_and_mark_done,
             call_metrics=call_metrics,
+            lead_memory=lead_memory,
         )
         silence_checker.bind_state(
             shutdown_state=shutdown_state,
@@ -5801,12 +6789,6 @@ async def run_bot(
 
 
 
-        fast_path_router = _FastPathRouter(
-            stream_id=stream_id,
-            lead_memory=lead_memory,
-            config=config,
-        )
-
         delayed_race_filler = _DelayedRaceFiller(
             stream_id=stream_id,
             sample_rate=sample_rate,
@@ -5814,6 +6796,17 @@ async def run_bot(
             language_state=language_state,
             hangup_state=hangup_state,
             timeout_seconds=float(config.get("filler_timeout_ms", 700)) / 1000.0,
+            llm_service=llm,
+            context=context,
+        )
+
+        fast_path_router = _FastPathRouter(
+            stream_id=stream_id,
+            lead_memory=lead_memory,
+            config=config,
+            history_pruner=history_pruner,
+            call_metrics=call_metrics,
+            delayed_race_filler=delayed_race_filler,
         )
 
         spam_qualify_gate = _SpamQualifyGate(
@@ -5827,6 +6820,8 @@ async def run_bot(
             pipeline_elements.append(fallback_vad_processor)
         pipeline_elements.extend([
             stt,
+            _TranscriptionTap(call_metrics),
+            spam_qualify_gate,
             language_observer,
             context_aggregator.user(),
             fast_path_router,
@@ -5838,7 +6833,6 @@ async def run_bot(
             call_end_coordinator,
             termination_processor,
             silence_checker,
-            spam_qualify_gate,
             stall_watchdog,
             transport.output(),
             context_aggregator.assistant(),
@@ -5995,17 +6989,25 @@ async def run_bot(
             user_content = getattr(user_msg, "content", "") or ""
             was_interrupted = getattr(interruption_audio_gate, "is_interrupted", False)
 
-            if not str(user_content).strip() or strategy is None:
+            source_name = "timeout" if strategy is None else "strategy"
+            logger.info("[{}] turn_stop source={}", stream_id, source_name)
+            if call_metrics and hasattr(call_metrics, "record_turn_stop"):
+                call_metrics.record_turn_stop(source_name)
+
+            if not str(user_content).strip():
                 silence_checker._turn_in_flight = False
                 silence_checker._user_is_speaking = False
                 now = time.monotonic()
                 silence_checker._last_user_speech_time = now
                 stall_watchdog.disarm()
+                if delayed_race_filler is not None:
+                    delayed_race_filler.cancel_all_timers("empty transcript")
                 logger.info(
                     "[{}] User turn ended with empty transcript; disarmed stall watchdog, silence monitor active (stage={})",
                     stream_id,
                     silence_checker._stage,
                 )
+                return
             else:
                 # FIX 4: Drop STT garbage produced by music/noise (e.g. 'Iyamya.', 'लाळवान.').
                 # A valid user utterance must have at least 3 alphabetic characters total.
@@ -6180,6 +7182,7 @@ async def run_bot(
             full_transcript if ("full_transcript" in locals() and full_transcript)
             else (list(messages) if ("messages" in locals() and messages is not None) else [])
         )
+        logger.debug("[{}] Transcript length for call report: {} messages", stream_id, len(transcript_to_use))
         current_lead_mem = lead_memory if "lead_memory" in locals() else None
 
         metrics_sum = None

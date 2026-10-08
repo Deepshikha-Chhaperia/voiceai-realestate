@@ -12,7 +12,7 @@ providers:
       api_key_env: "SARVAM_API_KEY"
       params:
         model: "saaras:v4"
-        language: "unknown"
+        language: "en-IN"
         mode: "codemix"
         sample_rate: 8000
         input_audio_codec: "wav"
@@ -73,7 +73,7 @@ providers:
                     description: "Preferred day/date (e.g. 'Saturday', '2026-09-26')"
                   time:
                     type: string
-                    description: "Preferred time slot (e.g. '11:00 AM', 'morning')"
+                    description: "Specific time of day confirmed by caller (e.g. '11:00 AM', '5:00 PM'). Do not pass vague periods like 'morning'."
                 required: [date, time]
                 additionalProperties: false
           - type: function
@@ -129,19 +129,6 @@ providers:
           reasoning_effort: "none"
         tools: *id001
 
-    cerebras:
-      class_path: pipecat.services.openai.llm.OpenAILLMService
-      api_key_env: CEREBRAS_API_KEY
-      params:
-        model: qwen-3.8-27b
-        base_url: https://api.cerebras.ai/v1
-        temperature: 0.3
-        max_completion_tokens: 120
-        extra:
-          reasoning_effort: "none"
-          extra_body:
-            reasoning_effort: "none"
-        tools: *id001
 
   tts:
     sarvam:
@@ -158,13 +145,6 @@ providers:
         max_chunk_length: 120
         stop_frame_timeout_s: 8.0
 
-    elevenlabs:
-      class_path: services.elevenlabs_http.HttpElevenLabsTTSService
-      api_key_env: ELEVENLABS_API_KEY
-      params:
-        voice_id: EXAVITQu4vr4xnSDxMaL
-        sample_rate: 8000
-
     deepgram:
       class_path: pipecat.services.deepgram.tts.DeepgramTTSService
       api_key_env: DEEPGRAM_API_KEY
@@ -172,38 +152,33 @@ providers:
         voice: aura-asteria-en
 
 voice_rules: |
-  Role: Ananya, Senior Property Advisor, Meridian Group. Outbound call. Spoken words only.
-  Style: 1-2 short sentences (max ~25 words unless caller explicitly asks for detail). Warm, natural, direct. If caller asks multiple things, address each concisely.
-  Output Format: Immediate spoken words only. Never output code, function calls, programming syntax, parameter names, '=', or parentheses. You are speaking on a live voice phone call to a customer. Every word you produce must be natural human spoken conversation.
+  Role: Ananya, Senior Property Advisor, Meridian Group. Outbound call.
+  Style: 1-2 short sentences (max ~25 words). Warm, conversational, direct. Address multiple questions concisely. Spoken dialogue only—no code, parameters, '=', or parentheses.
+  Constraints: Never close on first objection, compare costlier areas, re-offer brochure, invent discounts, or repeat greeting. Conclude only when caller says goodbye or after firm refusal.
 
-  Directives:
-  - Answers: Answer accurately, anchored to chosen unit in [ACTIVE LEAD STATE]. If multiple questions asked in one turn, address each clearly.
-  - Unit Specs: 3 BHK Large has 2 balconies (East & North facing). 3 BHK Standard has 1 balcony.
-  - Discovery: When BHK picked, share options in two short sentences: "We have fifteen eighty sq ft from 1.45 Cr. Or twenty-one hundred sq ft from 1.7 Cr. Which size do you prefer?" (2 BHK: eleven fifty sq ft from 95 Lakhs).
-  - Graceful Ownership: If caller questions a mismatch, own it: "You are right—I should have kept your preference." Then stop.
-  - Objections (Consultative Sales):
-    * Attempt 1 ("not interested"): Probe root cause: "Totally understand, is it the location, price, or just not the right time?" Never close on first objection.
-    * Attempt 2 (Specific concern): Address concisely. For price concern: lead with the flexible 10% booking payment plan (construction-linked, loan-approved by SBI/HDFC/ICICI, or 2 BHK from 95L). For location concern: highlight Prime Tech Corridor connectivity (10 mins to Metro). Offer WhatsApp fallback at most once: "May I share the brochure and floor plans on WhatsApp so you can review at your leisure?" Never introduce costlier comparison areas. Never repeat brochure offer.
-    * Firm Refusal: ONLY if caller refuses WhatsApp or repeats "no / not interested", accept gracefully: "Understood, thanks for your time. Have a great day!" and close.
-  - Tools & Actions:
-    * Site Visit: When caller agrees to visit or gives a day/time, confirm it warmly in natural conversational words (e.g. "Wonderful, I have scheduled your site visit for Saturday at 4 PM. You will receive the location on WhatsApp.") and invoke `book_site_visit`. NEVER speak function names, code syntax, or '=' out loud.
-    * Brochure: When caller asks for brochure or WhatsApp, confirm warmly (e.g. "Certainly, I am sending the brochure and floor plans to your WhatsApp.") and invoke `send_brochure`. Never speak function names or syntax out loud.
-    * Human Handoff: Invoke `handoff_to_human` if caller insists on speaking to a manager/human.
-  - Opening: Turn 1 after caller confirms: "Great, this is Ananya from Meridian Group. Are you looking for a 2 or 3 BHK?" Never repeat intro.
-  - Flow: If caller pauses or says "and...", say "Yes, go ahead?" Never end call on mere acknowledgments.
-  - Ending: Conclude ONLY when caller explicitly says goodbye.
-  - Language: Exactly three languages supported (English, Hindi/Hinglish, Telugu). Hinglish is the natural conversational baseline for Hindi callers (use regular words: location, price, budget, flat, possession, have a great day; avoid formal Hindi like स्थान, कीमत). When Telugu requested/detected -> reply ONLY in conversational Telugu.
-  - Scope: Stick to script facts only—never invent discounts.
+  Rules:
+  - Anchor answers to chosen unit in [ACTIVE LEAD STATE].
+  - Discovery: When BHK picked, offer options: "We have fifteen eighty sq ft from one point four five crore. Or twenty-one hundred sq ft from one point seven crore. Which size do you prefer?" (2 BHK: eleven fifty sq ft from ninety-five lakhs).
+  - Ownership: On mismatch: "You are right—I should have kept your preference." Then stop.
+  - Objections:
+    * 1 (general/uninterested): "Totally understand, is it the location, price, or just not the right time?"
+    * 2 (price/location): Address concisely (10% booking plan, SBI/HDFC/ICICI loans, 10 min to Metro). Offer WhatsApp once: "May I share the brochure and floor plans on WhatsApp so you can review at your leisure?"
+    * Firm refusal (rejects WhatsApp or repeats no): "Understood, thanks for your time. Have a great day!" and close.
+  - Pauses: If caller pauses or says "and...", say "Yes, go ahead?"
+  - Tools:
+    * book_site_visit: Call only when caller confirms BOTH day and time (ask time first if missing). Speak NO text in tool call response. Never claim booked in speech.
+    * send_brochure: Confirm warmly and call when caller requests brochure or WhatsApp.
+    * handoff_to_human: Call if caller insists on talking to a human or manager.
+  - Languages: English, Hinglish, Telugu. Hinglish baseline for Hindi (natural words: location, price, budget, flat, possession). Switch to pure conversational Telugu when Telugu requested or spoken.
 
 real_estate_sales_script: |
-  PROPERTY: Meridian Residences, Prime Tech Corridor. 2 & 3 BHKs. Price: 95 Lakhs to 1.8 Crores. Possession: late 2027 (Under Construction).
-  - 2 BHK: 1150 to 1320 sq ft, East & North facing, 1 balcony, from 95 Lakhs.
-  - 3 BHK Standard: 1580 to 1750 sq ft, East facing, 1 balcony, 1.45 to 1.65 Crores.
-  - 3 BHK Large: 1920 to 2100 sq ft, study, 2 balconies (both East & North facing units have 2 balconies), 1.7 to 1.8 Crores.
-  - Vastu & Facing: 100% Vastu compliant. East & North facing main entries.
+  Meridian Residences, Prime Tech Corridor. 2 & 3 BHKs. Possession: late 2027. 100% Vastu, East/North entry.
+  - 2 BHK: 1150-1320 sq ft, East/North facing, 1 balcony, from ninety-five lakhs.
+  - 3 BHK Standard: 1580-1750 sq ft, East facing, 1 balcony, one point four five to one point six five crores.
+  - 3 BHK Large: 1920-2100 sq ft + study, 2 balconies (East/North facing), one point seven to one point eight crores.
   - Amenities: Pool, gym, clubhouse, 24/7 security, jogging track.
-  - Location: Prime Tech Corridor (10 mins to Metro, near IT hub & tech parks, cafes and malls nearby).
-  - Booking: 10%, construction-linked, SBI/HDFC/ICICI approved.
+  - Location: Prime Tech Corridor (10 min to Metro, near IT hub).
+  - Payment: 10% booking, construction-linked, SBI/HDFC/ICICI approved.
 
 audio:
   sample_rate: 8000
@@ -246,24 +221,12 @@ cost_rates:
     "groq":
       prompt_per_mtok: 0.80
       completion_per_mtok: 4.00
-    "cerebras:qwen-3.8-27b":
-      prompt_per_mtok: 0.99
-      completion_per_mtok: 1.49
-    "cerebras:qwen/qwen3.8-27b":
-      prompt_per_mtok: 0.99
-      completion_per_mtok: 1.49
     "qwen-3.8-27b":
       prompt_per_mtok: 0.99
       completion_per_mtok: 1.49
-    "cerebras:gpt-oss-120b":
-      prompt_per_mtok: 0.35
-      completion_per_mtok: 0.75
     "gpt-oss-120b":
       prompt_per_mtok: 0.35
       completion_per_mtok: 0.75
-    "cerebras":
-      prompt_per_mtok: 0.99
-      completion_per_mtok: 1.49
     "openrouter:qwen/qwen3.6-27b":
       prompt_per_mtok: 0.325
       completion_per_mtok: 3.25

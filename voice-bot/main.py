@@ -144,6 +144,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Leads database initialization warning: {e}")
 
+    # Start outbox background worker
+    try:
+        import leads.outbox
+        await leads.outbox.start_outbox_worker()
+        logger.info("Leads outbox worker started.")
+    except Exception as e:
+        logger.warning(f"Failed to start outbox worker: {e}")
+
     # Pre-load all active provider classes once at boot so per-call start is instantaneous (<500ms).
     try:
         from bot import ServiceFactory
@@ -165,6 +173,11 @@ async def lifespan(app: FastAPI):
     logger.info("Voice bot config loaded.")
     yield
     
+    try:
+        import leads.outbox
+        await leads.outbox.stop_outbox_worker()
+    except Exception:
+        pass
     await CALL_MANAGER.close()
     try:
         from bot import _vobiz_http_client

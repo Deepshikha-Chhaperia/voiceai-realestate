@@ -155,11 +155,38 @@ class SiteVisit(Base):
     slot_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("slots.id"), nullable=True
     )
+    call_id: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, index=True
+    )
+    visit_date_iso: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    visit_date_original: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    time_slot: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    configuration: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
     slot_start: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
     status: Mapped[str] = mapped_column(
         String(64), nullable=False, default="booked", index=True
+    )
+    whatsapp_opt_in: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    whatsapp_opt_in_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    whatsapp_status: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    whatsapp_message_id: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)

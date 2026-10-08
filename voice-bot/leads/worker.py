@@ -39,31 +39,36 @@ def normalize_visit_date(raw: str, now_ist: datetime) -> tuple[str, str] | None:
         return None
 
     # today: today / aaj / आज
-    # \b works for ASCII tokens; for Devanagari, use direct substring match
     if re.search(r"\b(today|aaj)\b", v) or "आज" in v:
         d = now_ist.date()
-        return (d.isoformat(), f"Today — {d.strftime('%d %b %Y')}")
+        return (d.isoformat(), f"Today — {d.strftime('%A, %d %b %Y')}")
 
     # tomorrow: tomorrow / kal / कल
     if re.search(r"\b(tomorrow|kal)\b", v) or "कल" in v:
         d = (now_ist + timedelta(days=1)).date()
-        return (d.isoformat(), f"Tomorrow — {d.strftime('%d %b %Y')}")
+        logger.info("normalize_visit_date: 'कल' / 'kal' resolved as tomorrow for future site visit -> {}", d.isoformat())
+        return (d.isoformat(), f"Tomorrow — {d.strftime('%A, %d %b %Y')}")
 
-    # day after tomorrow: parso / परसों
-    if re.search(r"\b(parso|parson)\b", v) or "परसों" in v:
+    # day after tomorrow: parso / परसों / day after tomorrow
+    if re.search(r"\b(parso|parson|day after tomorrow)\b", v) or "परसों" in v:
         d = (now_ist + timedelta(days=2)).date()
         return (d.isoformat(), f"{d.strftime('%A, %d %b %Y')}")
 
-    # weekday names (English whole-word)
+    # weekday names (English and Hindi)
     weekday_map = {
-        "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
-        "friday": 4, "saturday": 5, "sunday": 6,
+        "monday": 0, "somwar": 0, "सोमवार": 0,
+        "tuesday": 1, "mangalwar": 1, "मंगलवार": 1,
+        "wednesday": 2, "budhwar": 2, "बुधवार": 2,
+        "thursday": 3, "guruwar": 3, "brihaspatiwar": 3, "गुरुवार": 3,
+        "friday": 4, "shukrawar": 4, "शुक्रवार": 4,
+        "saturday": 5, "shaniwar": 5, "शनिवार": 5,
+        "sunday": 6, "ravivar": 6, "रविवार": 6,
     }
     for day_name, day_idx in weekday_map.items():
-        if re.search(r"\b" + day_name + r"\b", v):
+        if (day_name in ("सोमवार", "मंगलवार", "बुधवार", "गुरुवार", "शुक्रवार", "शनिवार", "रविवार") and day_name in v) or re.search(r"\b" + re.escape(day_name) + r"\b", v):
             days_ahead = (day_idx - now_ist.weekday()) % 7
             if days_ahead == 0:
-                days_ahead = 7  # "Saturday" means the coming one, not today
+                days_ahead = 7  # Upcoming occurrence, not today
             d = (now_ist + timedelta(days=days_ahead)).date()
             return (d.isoformat(), f"{d.strftime('%A, %d %b %Y')}")
 
@@ -78,6 +83,159 @@ def normalize_visit_date(raw: str, now_ist: datetime) -> tuple[str, str] | None:
             return None
 
     return None
+
+
+def format_spoken_date(date_val: Any, now_ist: Any, language: str = "en") -> str:
+    """Format a date into natural conversational speech.
+    Never outputs year or ISO format with hyphens.
+    - today -> "today" / "aaj"
+    - tomorrow -> "tomorrow" / "kal"
+    - day after tomorrow -> "day after tomorrow" / "parso"
+    - within 6 days -> weekday name (e.g. "Sunday", "Sunday ko")
+    - otherwise -> ordinal day (e.g. "9th", "9 tareekh ko") if current month,
+      or day + month (e.g. "15th of November", "15 November ko") if different month.
+    """
+    if isinstance(date_val, str):
+        from datetime import date as _date
+        parts = [int(p) for p in date_val.split("-")]
+        d = _date(parts[0], parts[1], parts[2])
+    elif hasattr(date_val, "date"):
+        d = date_val.date()
+    else:
+        d = date_val
+
+    ref_date = now_ist.date() if hasattr(now_ist, "date") else now_ist
+    delta = (d - ref_date).days
+
+    is_hi = isinstance(language, str) and language.lower().startswith("hi")
+
+    if delta == 0:
+        return "aaj" if is_hi else "today"
+    elif delta == 1:
+        return "kal" if is_hi else "tomorrow"
+    elif delta == 2:
+        return "parso" if is_hi else "day after tomorrow"
+    elif 3 <= delta <= 6:
+        weekday = d.strftime("%A")
+        return f"{weekday} ko" if is_hi else weekday
+    else:
+        day = d.day
+        if 11 <= (day % 100) <= 13:
+            suffix = "th"
+        else:
+            suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+
+        month_name = d.strftime("%B")
+        if d.month == ref_date.month and d.year == ref_date.year:
+            return f"{day} tareekh ko" if is_hi else f"{day}{suffix}"
+        else:
+            return f"{day} {month_name} ko" if is_hi else f"{day}{suffix} of {month_name}"
+
+
+def format_spoken_time(time_str: str, language: str = "en") -> str:
+    """Format a normalized time string like '11:00 AM' into natural conversational speech."""
+    if not time_str or not isinstance(time_str, str):
+        return ""
+    t = time_str.strip()
+    is_hi = isinstance(language, str) and language.lower().startswith("hi")
+
+    m = re.match(r"^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)?$", t, re.IGNORECASE)
+    if not m:
+        return t
+
+    hour = int(m.group(1))
+    minute = int(m.group(2)) if m.group(2) else 0
+    ampm = (m.group(3) or "").upper()
+    if not ampm:
+        if hour >= 12:
+            ampm = "PM"
+            if hour > 12:
+                hour = hour - 12
+        else:
+            ampm = "AM"
+            if hour == 0:
+                hour = 12
+    elif hour > 12:
+        hour = hour - 12
+
+    time_part = f"{hour}" if minute == 0 else f"{hour}:{minute:02d}"
+
+    if is_hi:
+        if ampm == "AM":
+            period = "subah " if hour < 12 else ""
+        elif ampm == "PM":
+            period = "dopahar " if (hour == 12 or hour < 4) else "shaam "
+        else:
+            period = ""
+        return f"{period}{time_part} baje".strip()
+    else:
+        if ampm:
+            return f"{time_part} {ampm.lower()}"
+        return time_part
+
+
+def normalize_visit_time(raw: str) -> str | None:
+    """Normalize spoken time in English or Hindi into a standard format (e.g. '5:00 PM').
+    Supports 'शाम 5 बजे', '5 baje', 'evening 5', '5 pm', 'subah 10', 'dopahar 2 baje', etc.
+    """
+    if not raw:
+        return None
+    s = raw.strip().lower()
+
+    # Reject property specifications and non-time numerical entities:
+    # 3 BHK, 2 BHK, 4 BHK, 95 Lakh, 1.7 Cr, 1580 sq ft, 2 balconies
+    has_explicit_time_indicator = any(
+        w in s for w in ("baje", "बजे", "o'clock", "oclock", "shaam", "shyam", "sham", "dopahar", "subah", "morning", "evening", "शाम", "सुबह", "दोपहर", "कल", "kal", "tomorrow")
+    ) or bool(re.search(r"\b\d{1,2}\s*(?:am|a\.m\.|pm|p\.m\.)\b", s)) or bool(re.search(r"\b(?:at|around)\s+\d{1,2}\b", s))
+    if re.search(r"\b\d+\s*(?:bhk|bed|bedroom|bedrooms|lakh|lakhs|lac|lacs|cr|crore|crores|sq\s*ft|sqft|balcon|balconies|floor|tower)\b", s):
+        if not has_explicit_time_indicator:
+            return None
+
+    is_pm = bool(re.search(r"\b\d{1,2}\s*(?:pm|p\.m\.)\b", s)) or any(w in s for w in ("pm", "p.m.", "shaam", "shyam", "sham", "dopahar", "raat", "evening", "afternoon", "night", "शाम", "दोपहर", "रात"))
+    is_am = bool(re.search(r"\b\d{1,2}\s*(?:am|a\.m\.)\b", s)) or any(w in s for w in ("subah", "morning", "सुबह"))
+
+    m = re.search(r"(\b\d{1,2})(?:[:.](\d{2}))?\s*(?:baje|बजे|pm|am|o'?clock)?\b", s)
+    if not m:
+        # Check word numbers like 'two', 'three', etc.
+        word_match = re.search(r"\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|ek|do|teen|chaar|paanch|chhe|saat|aath|nau|das|gyarah|baarah)\b(?:\s*(?:baje|बजे|pm|am|o'?clock))?", s)
+        if word_match:
+            word_map = {
+                "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+                "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+                "ek": 1, "do": 2, "teen": 3, "chaar": 4, "paanch": 5, "chhe": 6,
+                "saat": 7, "aath": 8, "nau": 9, "das": 10, "gyarah": 11, "baarah": 12,
+            }
+            hour = word_map[word_match.group(1)]
+            minute = 0
+        else:
+            return None
+    else:
+        hour = int(m.group(1))
+        minute = int(m.group(2)) if m.group(2) else 0
+
+    if hour > 24 or minute > 59:
+        return None
+
+    # If the token is just a bare number without explicit time indicator, only accept valid hour slots (1-12)
+    # when the input is a concise time expression (e.g. "at 2", "two", "2", "around 4")
+    if not has_explicit_time_indicator and not re.search(r"^(?:at\s+|around\s+)?(?:\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|do|teen|chaar|paanch)(?:[:.]\d{2})?\.?$", s):
+        return None
+
+    if is_pm and hour < 12:
+        meridiem = "PM"
+    elif is_am and hour < 12:
+        meridiem = "AM"
+    elif 12 <= hour < 24:
+        meridiem = "PM"
+        if hour > 12:
+            hour -= 12
+    elif hour <= 7 and not is_am:
+        # Typical real-estate visit hours: 2 baje -> 2 PM, 5 baje -> 5 PM, not 5 AM
+        meridiem = "PM"
+    else:
+        meridiem = "AM" if (hour < 12 and not is_pm) else "PM"
+
+    return f"{hour}:{minute:02d} {meridiem}"
 
 
 def _resolve_visit_datetime(date_str: str | None, time_str: str | None) -> datetime:
@@ -364,28 +522,7 @@ async def on_call_finished(ctx: dict, call_id: str) -> None:
         res_v = await session.execute(stmt_v)
         visit_obj = res_v.scalar_one_or_none()
 
-        # If call confirmed a site visit but no DB row exists yet, create it now!
-        has_visit_booking = (
-            disposition in ("SITE_VISIT_BOOKED", "SITE_VISIT_REQUESTED")
-            or analysis.get("visit_intent") in ("booked", "requested")
-            or any(w in str(lead_fields.get("site_visit", "")).lower() for w in ("confirm", "booked", "saturday", "sunday"))
-            or "site visit successfully booked" in str(analysis.get("summary", "")).lower()
-            or "site visit requested" in str(score_reason).lower()
-        )
-
-        if not visit_obj and has_visit_booking:
-            v_date = lead_fields.get("preferred_visit_date") or analysis.get("preferred_visit_date") or "Saturday"
-            v_time = lead_fields.get("preferred_visit_time") or analysis.get("preferred_visit_time") or "2:00 PM"
-            slot_start = _resolve_visit_datetime(v_date, v_time)
-            visit_obj = SiteVisit(
-                lead_id=lead.id,
-                slot_start=slot_start,
-                status="booked",
-            )
-            session.add(visit_obj)
-            logger.info("Auto-created SiteVisit row for lead_id={} slot={}", lead.id, slot_start)
-
-        if visit_obj or has_visit_booking:
+        if visit_obj:
             lead.status = "visit_booked"
             lead.visit_genuine = True
 
@@ -444,10 +581,6 @@ async def on_call_finished(ctx: dict, call_id: str) -> None:
         if lead_tier == "hot":
             if visit_obj:
                 visit_info = f"{visit_obj.slot_start.strftime('%A, %b %d at %I:%M %p')}"
-            elif has_visit_booking:
-                v_date = lead_fields.get("preferred_visit_date") or analysis.get("preferred_visit_date") or "Saturday"
-                v_time = lead_fields.get("preferred_visit_time") or analysis.get("preferred_visit_time") or "2:00 PM"
-                visit_info = f"Booked ({v_date} at {v_time})"
             else:
                 visit_info = "not booked"
 

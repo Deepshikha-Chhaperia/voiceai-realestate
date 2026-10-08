@@ -94,6 +94,17 @@ async def _call_llm(prompt: str) -> str:
 async def analyze_call(call_id: str, messages: list[dict] | None = None) -> dict[str, Any]:
     """Analyzes a finished call transcript, parses through Pydantic schema, stores analysis and returns data."""
     call = await lead_state.get_call_async(call_id) or {}
+    if call.get("analysis_json") or call.get("analysis"):
+        existing_analysis = call.get("analysis")
+        if not existing_analysis and call.get("analysis_json"):
+            try:
+                existing_analysis = json.loads(call["analysis_json"])
+            except Exception:
+                existing_analysis = None
+        if existing_analysis:
+            logger.info("[{}] Post-call analysis already present; reusing existing analysis", call_id)
+            return {"analysis": existing_analysis, "call": call}
+
     if not messages:
         # Rebuild minimal transcript if not provided
         messages = []
@@ -127,14 +138,4 @@ async def analyze_call(call_id: str, messages: list[dict] | None = None) -> dict
     logger.info("[{}] Post-call validated analysis stored", call_id)
 
     # Re-fetch the updated call record from DB with finalized stats
-    call = await lead_state.get_call_async(call_id) or call
-
-    # Re-sync local test report markdown file if available
-    if messages:
-        try:
-            import local_test_report
-            local_test_report.write_report(call_id, messages)
-        except Exception as e:
-            logger.warning("[{}] Failed updating local test report after analysis: {}", call_id, e)
-
     return {"analysis": analysis_dict, "call": call}

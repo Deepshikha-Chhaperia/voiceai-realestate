@@ -51,7 +51,6 @@ _INBOUND_RUNTIME_RULE = (
     "Respond directly to what caller said and continue naturally."
 )
 
-
 def build_system_prompt(
     call_type: str,
     config: dict,

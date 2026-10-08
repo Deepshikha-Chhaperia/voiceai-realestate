@@ -55,6 +55,7 @@ PHRASES: dict[str, str] = {
     "ack_theek_hai": "Theek hai.",
 
     # Clarifications & Repeats
+    "checkin_generic": "Hello? Are you still there?",
     "clarify_repeat": "Sorry, I didn't catch that. Could you say that again?",
     "clarify_repeat_hi": "Sorry, main sun nahi paayi. Kya aap repeat kar sakte hain?",
     "clarify_property": "Hello? Are you looking for a property?",
@@ -134,6 +135,9 @@ async def main():
     async with aiohttp.ClientSession() as session:
         for key, text in PHRASES.items():
             out_path = INDIA_DIR / f"{key}.wav"
+            if out_path.exists() and out_path.stat().st_size > 0:
+                print(f"  [EXISTS] {out_path.name}")
+                continue
             print(f"Synthesizing '{key}'...")
             print(f"  Text: {text}")
             wav_bytes = await synthesize_sarvam(session, text, key)
