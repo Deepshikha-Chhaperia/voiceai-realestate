@@ -64,7 +64,7 @@ providers:
           - type: function
             function:
               name: book_site_visit
-              description: "Book a site visit slot for the caller. Returns confirmation details or alternate slots."
+              description: "Book a site visit slot. Call ONLY after the caller has said both a day and a time, or said yes to the exact day and time you asked. Otherwise ask for the missing part."
               parameters:
                 type: object
                 properties:
@@ -79,7 +79,7 @@ providers:
           - type: function
             function:
               name: send_brochure
-              description: "Send property brochure and floor plans via WhatsApp."
+              description: "Call ONLY when the caller explicitly asks for the brochure or floor plans on WhatsApp. Never for questions about amenities, price, balconies, size or Vastu."
               parameters:
                 type: object
                 properties:

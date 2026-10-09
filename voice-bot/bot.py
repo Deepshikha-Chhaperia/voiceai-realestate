@@ -120,9 +120,10 @@ from metrics_collector import CallMetricsCollector
 
 import lead_state
 import local_test_report
-from call_repairs import (SHORT_GOODBYE, FAQ_TEXTS, valid_transcript, terminal_answer, faq_key,
+from call_repairs import (combo_parts, faq_keys, combo_key, combo_text, FAQ_COMBO_CLIPS, relative_visit_date, _strip_day_offsets, held_slot_message, assented_slot, slot_assented, log_postcall_whatsapp, caller_asked_something, SHORT_GOODBYE, FAQ_TEXTS, valid_transcript, terminal_answer, faq_key,
                           brochure_payload, finish_brochure, queue_goodbye, TTSStallState, explicit_caller_name, clarification_for, unambiguous_visit_time, pure_farewell, CALL5_TEXTS, campaign_faq, genuine_late_question, brochure_decision, safe_tts_text, fragment_transcript, whatsapp_answer, CALL7_TEXTS, visit_time, visit_intent, whatsapp_ready, postcall_whatsapp_plan, manual_whatsapp_message, record_manual_whatsapp, closing_after_work, queue_goal_close, goal_complete, manual_location_offer)
 from spoken_numbers import spoken_numbers
+from faq_recovery import FAQReplyRecovery
 from stall_watchdog import StallWatchdog, ProviderErrorMonitor
 
 
@@ -595,6 +596,13 @@ def _attach_resilient_failover(service: Any, provider_name: str, config: dict) -
         full_str = f"{cls_name}: {detail}{header_info}"
         return cls_name, full_str
 
+    async def _same_turn_retry(context: Any):
+        """One immediate retry of the primary on a stall/transient error (same turn, nothing spoken yet)."""
+        rs = await asyncio.wait_for(orig_get_chat(context), timeout=1.5)
+        it = rs.__aiter__()
+        first = await asyncio.wait_for(it.__anext__(), timeout=1.5)
+        return it, first
+
     async def _resilient_get_chat_completions(context: Any):
         async def _stream_wrapper():
             primary_failed = False
@@ -653,6 +661,7 @@ def _attach_resilient_failover(service: Any, provider_name: str, config: dict) -
 
                         # Check 429 rate limit with retry-after header
                         is_429 = "429" in err_str or "ratelimit" in err_str.lower()
+                        retry_ok = True
                         retry_val = None
                         if "retry-after=" in err_str:
                             try:
@@ -706,7 +715,17 @@ def _attach_resilient_failover(service: Any, provider_name: str, config: dict) -
                                 service._skip_primary_until = time.monotonic() + 60.0
                                 primary_failed = True
                         else:
-                            skip_dur = min(60.0, max(0.25, retry_val)) if (is_429 and retry_val is not None) else 60.0
+                            try:
+                                iter_stream, first_chunk = await _same_turn_retry(context)
+                                logger.warning("[LLM Retry] Primary '{}' stalled ({}ms); same-turn retry succeeded", provider_name, elapsed_ms)
+                                primary_failed = False
+                                service._skip_primary_until = 0.0
+                                retry_ok = True
+                            except Exception as _re:
+                                retry_ok = False
+                                logger.warning("[LLM Retry] same-turn retry failed: {}", _extract_err_details(_re)[1])
+                        if not retry_ok:
+                            skip_dur = min(60.0, max(0.25, retry_val)) if (is_429 and retry_val is not None) else (60.0 if has_backup else 0.0)  # no backup model: locking out the only LLM just kills the call
                             service._skip_primary_until = time.monotonic() + skip_dur
                             logger.warning(
                                 "[LLM Failover] Primary LLM provider '{}' first token failed/timed out after {}ms ({}); skipping primary for {:.1f}s...",
@@ -723,6 +742,7 @@ def _attach_resilient_failover(service: Any, provider_name: str, config: dict) -
                         call_metrics.record_provider_failure(provider_name, err_str, elapsed_ms)
 
                     is_429 = "429" in err_str or "ratelimit" in err_str.lower()
+                    retry_ok = True
                     retry_val = None
                     prose_retry = re.search(r"try again in ([0-9.]+)s", err_str)
                     if prose_retry:
@@ -779,7 +799,17 @@ def _attach_resilient_failover(service: Any, provider_name: str, config: dict) -
                             service._skip_primary_until = time.monotonic() + 60.0
                             primary_failed = True
                     else:
-                        skip_dur = min(60.0, max(0.25, retry_val)) if (is_429 and retry_val is not None) else 60.0
+                        try:
+                            iter_stream, first_chunk = await _same_turn_retry(context)
+                            logger.warning("[LLM Retry] Primary '{}' stream init failed ({}ms); same-turn retry succeeded", provider_name, elapsed_ms)
+                            primary_failed = False
+                            service._skip_primary_until = 0.0
+                            retry_ok = True
+                        except Exception as _re:
+                            retry_ok = False
+                            logger.warning("[LLM Retry] same-turn retry failed: {}", _extract_err_details(_re)[1])
+                    if not retry_ok:
+                        skip_dur = min(60.0, max(0.25, retry_val)) if (is_429 and retry_val is not None) else (60.0 if has_backup else 0.0)  # no backup model: locking out the only LLM just kills the call
                         service._skip_primary_until = time.monotonic() + skip_dur
                         logger.warning(
                             "[LLM Failover] Primary LLM provider '{}' stream creation failed after {}ms ({}); skipping primary for {:.1f}s...",
@@ -1225,8 +1255,12 @@ def _extract_lead_preferences(text: str, agent_text: str = "") -> dict[str, str]
         extracted["language"] = "Telugu"
 
     # 1. Configuration (e.g. 2/3 BHK, bedrooms, villa, penthouse, study/large variants - strictly caller's speech)
-    m_cfg = re.search(r"\b([1-5]|one|two|three|four|five|teen|do|ek|char|paanch)?\s*(?:bhk|bed(?:room)?s?|kamre)\b", user_lower)
+    ambiguous_bhk = bool(re.search(r"\b(?:two|2) (?:three|3) bhk\b", user_lower))
+    m_cfg = None if ambiguous_bhk else re.search(r"\b([1-5]|one|two|three|four|five|teen|do|ek|char|paanch)?\s*(?:bhk|bed(?:room)?s?|kamre)\b", user_lower)
     has_large = bool(re.search(r"\b(large|larger|big|bigger|study|bada|2100|twenty[- ]one hundred|(?:2|two|do)\s*balcon(?:y|ies)?)\b", user_lower))
+    # Complete Hindi unit choices, not comparison/questions or negated preferences.
+    if re.fullmatch(r"(?:हाँ ठीक है मतलब मेरेको वो |मुझे |मेरेको |मेरे को )?ब(?:ड़|ड़)ा वाला (?:चाहिए|चाहिये)(?: ऐसे तो)?[।.! ]*", user_lower):
+        has_large = True
     has_std = bool(re.search(r"\b(standard|regular|small|smaller|chota|1580|fifteen eighty|(?:1|one|ek)\s*balcon(?:y|ies)?)\b", user_lower))
 
     # If both large and standard words appear (e.g. comparing "bigger or standard?"), don't guess
@@ -1303,7 +1337,8 @@ def _extract_lead_preferences(text: str, agent_text: str = "") -> dict[str, str]
     if candidate_name:
         extracted["spoken_name"] = candidate_name
 
-    is_farewell = any(f in user_lower for f in ("bye", "goodbye", "cya", "never mind", "later", "thank you", "thanks"))
+    _farewell_text = _strip_day_offsets(user_lower)  # "two days later" is a date offset, not "see you later"
+    is_farewell = any(f in _farewell_text for f in ("bye", "goodbye", "cya", "never mind", "later", "thank you", "thanks"))
     user_has_refusal = any(neg in user_lower for neg in ("not interested", "dont want", "don't want", "nahi chahiye", "kuch nahi"))
 
     # 5. Site Visit Day & Time (must be stated or confirmed by user, not hallucinated by agent)
@@ -1313,6 +1348,10 @@ def _extract_lead_preferences(text: str, agent_text: str = "") -> dict[str, str]
         _now_ist = datetime.now(_zi.ZoneInfo("Asia/Kolkata"))
 
         norm_d = normalize_visit_date(user_lower, _now_ist)
+        if not norm_d:
+            _rel_iso = relative_visit_date(user_lower, _now_ist)  # "after two days", "two days later", "do din baad"
+            if _rel_iso:
+                norm_d = (_rel_iso, _rel_iso)
         if norm_d:
             extracted["visit_date_iso"] = norm_d[0]
             extracted["preferred_visit_date"] = norm_d[0]
@@ -1859,6 +1898,26 @@ def _load_audio_cache() -> dict[int, dict[str, bytes]]:
 _AUDIO_CACHE: dict[int, dict[str, bytes]] = _load_audio_cache()
 
 
+_FAQ_COMBO_TEXTS: dict[str, str] = {}
+
+
+def _ensure_faq_combo(key: str, keys: list[str]) -> bool:
+    """Join the cached clips of every asked topic into one clip. False if any clip is missing, so the live path answers instead."""
+    if key in _FAQ_COMBO_TEXTS:
+        return True
+    built = {}
+    for sr in (16000, 8000):
+        clips = [_AUDIO_CACHE.get(sr, {}).get(FAQ_COMBO_CLIPS[k]) for k in keys]
+        if not all(clips):
+            return False
+        gap = b"\x00\x00" * int(sr * 0.25)
+        built[sr] = gap.join(clips)
+    for sr, pcm in built.items():
+        _AUDIO_CACHE[sr][key] = pcm
+    _FAQ_COMBO_TEXTS[key] = _CACHED_PHRASE_TEXTS[key] = combo_text(keys)
+    return True
+
+
 def _match_cached_phrase(text: str, turn_count: int = 1) -> str | None:
     """Matches candidate text against known pre-rendered audio cache keys.
     Matches Turn 1 opening intro, objection pivots, acknowledgments, and farewells.
@@ -1866,7 +1925,7 @@ def _match_cached_phrase(text: str, turn_count: int = 1) -> str | None:
     if not text:
         return None
     t = text.lower().strip()
-    for key, phrase in {"short_goodbye": SHORT_GOODBYE, **FAQ_TEXTS, **CALL5_TEXTS, **CALL7_TEXTS}.items():
+    for key, phrase in {"short_goodbye": SHORT_GOODBYE, **FAQ_TEXTS, **CALL5_TEXTS, **CALL7_TEXTS, **_FAQ_COMBO_TEXTS}.items():
         if t == phrase.lower():
             return key
 
@@ -2703,6 +2762,10 @@ class _SpokenTextGuard(FrameProcessor):
                     if not self._leading_flushed:
                         self._leading_buffer += original
                         cached_key = _match_cached_phrase(self._leading_buffer, turn_count=self._turn_count)
+                        # An acknowledgment can be a prefix, not the whole answer.
+                        # Playing its WAV here would swallow every later response token.
+                        if cached_key and cached_key.startswith('ack_'):
+                            cached_key = None
                         if cached_key and self._interruption_audio_gate:
                             # Never repeat objection_pivot if it has already been spoken in this call
                             if cached_key == "objection_pivot" and (self._lead_memory or {}).get("_objection_pivot_spoken"):
@@ -3284,10 +3347,12 @@ class _FastPathRouter(FrameProcessor):
         call_end_coordinator: Any = None,
         on_whatsapp_consent=None,
         on_visit_ready=None,
+        faq_recovery=None,
     ):
         super().__init__()
         self._on_whatsapp_consent = on_whatsapp_consent
         self._on_visit_ready = on_visit_ready
+        self._faq_recovery = faq_recovery
         self._stream_id = stream_id
         self._lead_memory = lead_memory if lead_memory is not None else {}
         self._config = config or {}
@@ -3302,6 +3367,8 @@ class _FastPathRouter(FrameProcessor):
 
         if isinstance(frame, UserStoppedSpeakingFrame):
             self._turn_count += 1
+        if isinstance(frame, InterruptionFrame) and self._faq_recovery:
+            self._faq_recovery.interrupt()
 
         if direction == FrameDirection.DOWNSTREAM and isinstance(frame, LLMContextFrame):
             context = frame.context
@@ -3333,6 +3400,8 @@ class _FastPathRouter(FrameProcessor):
             if self._call_end_coordinator and getattr(self._call_end_coordinator, "_ended", False):
                 return
             if latest_user_text:
+                if self._faq_recovery:
+                    self._faq_recovery.new_transcript()
                 if self._call_end_coordinator and getattr(self._call_end_coordinator, "is_ending", False):
                     if not genuine_late_question(latest_user_text):
                         return
@@ -3341,6 +3410,12 @@ class _FastPathRouter(FrameProcessor):
                     self._call_end_coordinator._late_reply_routed = True
 
                 memory = self._lead_memory or {}
+                _yes_slot = assented_slot(messages) if (self._on_visit_ready and memory.get("disposition") != "SITE_VISIT_BOOKED") else None
+                if _yes_slot and re.search(r"\b(?:book|confirm|slot|schedule|visit|mean)\b", str(next((m.get("content", "") for m in reversed(messages[:-1]) if m.get("role") == "assistant"), "")), re.I):
+                    # Plain yes to our own "Shall I book <day> at <time>?": book exactly that slot now, no model round trip.
+                    logger.info("[{}] Caller agreed to the exact slot we named ({} {}); booking without another model turn", self._stream_id, _yes_slot[0], _yes_slot[1])
+                    await self._on_visit_ready(_yes_slot[0], _yes_slot[1])
+                    return
                 if visit_intent(latest_user_text, memory):
                     date = memory.get("visit_date_iso")
                     slot = memory.get("time_slot")
@@ -3417,6 +3492,10 @@ class _FastPathRouter(FrameProcessor):
                     await self.push_frame(LLMFullResponseEndFrame(), direction)
                     return
 
+                if re.fullmatch(r"(?:yeah |yes )?i (?:am|'m) looking for (?:a )?(?:two|2) (?:three|3) bhk[.!? ]*", latest_user_text.lower()):
+                    await self.push_frame(TTSSpeakFrame(text="Are you looking for two or three B H K?", append_to_context=True), direction)
+                    return
+
                 matched = campaign_faq(latest_user_text, self._lead_memory, self._config)
                 # Preserve old opt-in router for explicitly supplied minimal configs/test harnesses.
                 key = faq_key(latest_user_text)
@@ -3426,7 +3505,29 @@ class _FastPathRouter(FrameProcessor):
                     reply = FAQ_TEXTS[key]
                 else:
                     key = None
+                if not key and self._config.get("faq_cache_enabled", False):
+                    # STT can split one question into fragments: judge every user message since the last assistant turn together.
+                    _tail = []
+                    for _m in reversed(messages):
+                        if _m.get("role") != "user" or not isinstance(_m.get("content"), str):
+                            break
+                        _tail.append(_m["content"].strip())
+                    _joined = " , ".join(reversed(_tail))
+                    if self._config.get("real_estate_sales_script"):
+                        _m2 = campaign_faq(_joined, self._lead_memory, self._config) if _tail else None
+                        _ks = combo_parts(_m2[0]) if _m2 and _m2[0].startswith("faq_combo_") else None
+                    else:
+                        _ks = faq_keys(_joined) if _tail else None
+                    if _ks:
+                        key, reply = combo_key(_ks), combo_text(_ks)
+                if key and key.startswith("faq_combo_"):
+                    _ks = combo_parts(key)
+                    if not _ensure_faq_combo(key, _ks):
+                        logger.info("FAQ combo {} lacks a cached clip; live answer for the whole question", key)
+                        key = None
                 if key:
+                    if self._faq_recovery:
+                        self._faq_recovery.commit(reply)
                     if self._call_metrics:
                         self._call_metrics.record_cached_answer(key)
                     await self.push_frame(LLMFullResponseStartFrame(), direction)
@@ -3703,13 +3804,7 @@ class _DelayedRaceFiller(FrameProcessor):
 # "thanks for your time" + "have a great day"/"bye"), and keep the GOODBYE lines free of
 # farewell words ("bye", "take care", "have a ... day") - the call is ended by the
 # call-end coordinator, not by farewell-pattern detection.
-_SILENCE_SOFT_LINES = (
-    "Hello? Can you hear me okay?",
-    "Take your time, I'm right here whenever you're ready.",
-    "Hello? Just checking you're still on the line.",
-    "Hi, the line went quiet for a moment. Are you with me?",
-    "Hi, I can't hear you at the moment. Is everything alright?",
-)
+_SILENCE_SOFT_LINES = ("Hi, are you there?",)
 _SILENCE_SECOND_LINES = (
     "Hello? I'm not hearing anything on my side. Could you say something if you can hear me?",
     "Just checking once more, are you able to hear me? If it's a bad time, I'm happy to call back.",
@@ -4194,6 +4289,18 @@ class _SpamQualifyGate(FrameProcessor):
         await super().cleanup()
 
 
+class _FAQAudibleObserver(FrameProcessor):
+    def __init__(self, recovery):
+        super().__init__()
+        self._recovery = recovery
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, BotStoppedSpeakingFrame):
+            self._recovery.audio_completed()
+        await self.push_frame(frame, direction)
+
+
 class _TranscriptionTap(FrameProcessor):
     """Passively taps TranscriptionFrame and ProposedUserStoppedSpeakingFrame for call_metrics.
 
@@ -4202,15 +4309,21 @@ class _TranscriptionTap(FrameProcessor):
     new frames or forwarding MetricsFrame, ensuring zero chance of a replay loop.
     """
 
-    def __init__(self, collector: Any = None) -> None:
+    def __init__(self, collector: Any = None, faq_recovery=None) -> None:
         super().__init__()
         self._collector = collector
+        self._faq_recovery = faq_recovery
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         if direction == FrameDirection.DOWNSTREAM and isinstance(frame, TranscriptionFrame) and frame.text.strip() and (not valid_transcript(frame.text) or fragment_transcript(frame.text)):
             logger.info("Dropping nonlinguistic STT noise before aggregation: {!r}", frame.text[:60])
             frame.text = ""  # preserve the empty-turn lifecycle, never add noise to LLM context
+        if self._faq_recovery and direction == FrameDirection.DOWNSTREAM:
+            if isinstance(frame, InterruptionFrame):
+                self._faq_recovery.interrupt()
+            elif isinstance(frame, TranscriptionFrame) and frame.text.strip():
+                self._faq_recovery.new_transcript()
         if self._collector and direction == FrameDirection.DOWNSTREAM:
             if isinstance(frame, ProposedUserStoppedSpeakingFrame):
                 self._collector._speech_stop_at = time.monotonic()
@@ -5218,7 +5331,7 @@ class _CallEndCoordinator(FrameProcessor):
 
     async def _wait_late_transcript(self) -> None:
         try:
-            await asyncio.sleep(min(8.0, self._safety_seconds))
+            await asyncio.sleep(min(5.0, self._safety_seconds))
             await self._finish()
         except asyncio.CancelledError:
             return
@@ -5231,6 +5344,21 @@ class _CallEndCoordinator(FrameProcessor):
             return
 
         await self._finish()
+
+    def finish_after_farewell_ack(self, delay: float = 0.6) -> None:
+        """Caller said a bare ok/bye after our closing line finished: end shortly, do not wait out the late-speech window."""
+        if self._ended or not self._in_grace:
+            return
+
+        async def _go() -> None:
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+            await self._finish()
+
+        self._cancel_task("_grace_task")
+        self._grace_task = asyncio.create_task(_go())
 
     async def _finish(self) -> None:
         if self._ended:
@@ -5719,7 +5847,7 @@ async def execute_book_site_visit(
                 idemp_spoken_date = format_spoken_date(stored_date, _now_ist, active_lang)
                 idemp_spoken_time = format_spoken_time(stored_time, active_lang)
                 confirm_msg = f"Site visit confirmed for {idemp_spoken_date} at {idemp_spoken_time}."
-                if (config or {}).get("whatsapp_after_call_only", False):
+                if True:
                     if lead_memory and 'location' not in (lead_memory.get('_postcall_whatsapp_actions') or []):
                         confirm_msg += manual_location_offer(lead_memory, config)
                 elif existing_sv.whatsapp_status == "sent":
@@ -5797,7 +5925,7 @@ async def execute_book_site_visit(
                     return
 
             # 5. WhatsApp opt-in and dispatch
-            whatsapp_opt_in = not (config or {}).get("whatsapp_after_call_only", False) and bool(
+            whatsapp_opt_in = not True and bool(
                 (lead_memory and lead_memory.get("whatsapp_opt_in"))
                 or call_rec.get("whatsapp_opt_in")
             )
@@ -5897,7 +6025,7 @@ async def execute_book_site_visit(
             lead_memory["lead_id"] = str(lead_obj.id)
 
         confirm_msg = f"Perfect, you're booked for {spoken_date} at {spoken_time}."
-        if (config or {}).get('whatsapp_after_call_only', False):
+        if True:
             confirm_msg += manual_location_offer(lead_memory, config)
         elif wa_status == "sent":
             confirm_msg += " The location is on its way."
@@ -6102,7 +6230,7 @@ async def run_bot(
                         attempt + 1,
                         trigger,
                     )
-                    return
+                    return True
 
                 logger.warning(
                     "[{}] Vobiz hangup failed status={} on attempt {} ({})",
@@ -6140,12 +6268,16 @@ async def run_bot(
             trigger,
         )
 
+        return False
+
     # NEW: hoisted above the try block (was previously defined deep inside
     # it) so it's guaranteed to exist for the finally-block safety net
     # below, even if setup fails before reaching that point.
     hangup_state = {
         "done": False,
     }
+    provider_end_confirmed = {"value": False}
+    hard_timeout_task = None
 
     async def _force_hangup_and_mark_done(trigger: str) -> None:
         """
@@ -6207,7 +6339,7 @@ async def run_bot(
 
         hangup_state["done"] = True
         if call_type != "web":
-            await force_provider_hangup(trigger)
+            provider_end_confirmed["value"] = bool(await force_provider_hangup(trigger))
         elif websocket:
             try:
                 await websocket.close(code=1000, reason="Call completed")
@@ -6222,6 +6354,10 @@ async def run_bot(
     )
 
     call_metrics = None
+    enterprise_on = bool((config.get("enterprise") or {}).get("enabled"))
+    enterprise_session_id = (campaign_data or {}).get("enterprise_session_id") if enterprise_on else None
+    transferred = {"active":False}
+    enterprise_started = time.monotonic()
 
     try:
         # Optional input-side noise suppression filter
@@ -6329,10 +6465,9 @@ async def run_bot(
             try:
                 # Pre-warm TLS connection and prime provider's prefix cache with system prompt
                 warm_ctx = LLMContext(
-                    [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": "Hello"},
-                    ]
+                    [m for m in (context.messages or []) if m.get("role") == "system"]
+                    + [{"role": "user", "content": "Hello"}],
+                    tools=llm_tools,
                 )
                 prewarm_timeout = float(config.get("llm_prewarm_timeout", 4.0))
                 await asyncio.wait_for(
@@ -6360,8 +6495,7 @@ async def run_bot(
 
         # Fire and forget -- runs concurrently with greeting playback,
         # so the socket and prefix cache are hot before caller finishes their first turn.
-        if config.get("llm_cache_prewarm_enabled", False):
-            asyncio.create_task(_warm_llm_context_cache())
+        # (started below, once the real context and tools exist, so the warm request matches the live prefix)
 
         async def _fast_side_channel_reply(
             *,
@@ -6497,7 +6631,11 @@ async def run_bot(
                 return fallback_text
 
         # Record initial call record in persistent store
-        await lead_state.upsert_call_async(stream_id, campaign_id=campaign_id)
+        if enterprise_on:
+            await lead_state.upsert_call_async(stream_id, campaign_id=campaign_id,
+                phone=(campaign_data or {}).get("phone"),lead_id=(campaign_data or {}).get("lead_id"))
+        else:
+            await lead_state.upsert_call_async(stream_id, campaign_id=campaign_id)
 
         supported_langs = config.get("language", {}).get("supported", ["en", "hi", "te"])
         language_state = LanguageState(
@@ -6527,6 +6665,9 @@ async def run_bot(
 
         lead_memory: dict[str, str] = {}
         setattr(llm, "_lead_memory", lead_memory)
+        if enterprise_session_id:
+            lead_memory['_repeat_caller'] = bool((campaign_data or {}).get('repeat_caller'))
+            lead_memory['_project_name'] = str(config.get('enterprise',{}).get('project_name') or '')
         if campaign_data and campaign_data.get("customer_name"):
             cust_name = str(campaign_data["customer_name"]).strip()
             lead_memory["client"] = cust_name
@@ -6546,7 +6687,7 @@ async def run_bot(
 
             silence_checker.stop()
             if call_type != "web":
-                await force_provider_hangup("call_end_coordinator")
+                provider_end_confirmed["value"] = bool(await force_provider_hangup("call_end_coordinator"))
 
             # Farewell drain order on web calls: allow browser audio buffer to drain (0.8s) before closing websocket
             if call_type == "web" and websocket:
@@ -6755,8 +6896,10 @@ async def run_bot(
 
         async def book_site_visit(params) -> None:
             """Model arguments alone do not establish a caller-selected slot."""
-            if not caller_slot_matches(context.messages, params.arguments or {}):
-                await params.result_callback({"status": "needs_confirmation", "message": "Ask only for the missing day or time. Do not invent a slot."}, properties=FunctionCallResultProperties(run_llm=False))
+            if not (caller_slot_matches(context.messages, params.arguments or {}) or slot_assented(context.messages, params.arguments or {})):
+                # Never leave the caller in silence: the model must ask for the missing day or time right now.
+                logger.info("[{}] book_site_visit held: caller has not stated this exact slot; asking instead of booking", stream_id)
+                await params.result_callback({"status": "needs_confirmation", "message": held_slot_message(params.arguments or {}, datetime.now(__import__("zoneinfo").ZoneInfo("Asia/Kolkata")))}, properties=FunctionCallResultProperties(run_llm=True))
                 return
             await execute_book_site_visit(
                 params,
@@ -6769,13 +6912,16 @@ async def run_bot(
             )
 
         async def send_brochure(params) -> None:
-            if config.get('whatsapp_after_call_only', False) and 'brochure' in (lead_memory.get('_postcall_whatsapp_actions') or []):
+            if True and 'brochure' in (lead_memory.get('_postcall_whatsapp_actions') or []):
                 await params.result_callback({'status':'prepared_not_sent'}, properties=FunctionCallResultProperties(run_llm=False))
                 return
             decision = whatsapp_answer(context.messages, "brochure" if lead_memory.get("_brochure_consent_pending") else None) or brochure_decision(context.messages, bool(lead_memory.get("_brochure_consent_pending")))
             if decision == "not_requested":
-                # An unsolicited tool call must not turn goodbye/unrelated text into another pitch.
-                await params.result_callback({'status':'not_requested'}, properties=FunctionCallResultProperties(run_llm=False))
+                # An unsolicited tool call must not turn goodbye into another pitch, but a real question must still get an answer.
+                if caller_asked_something(context.messages):
+                    await params.result_callback({'status':'not_requested','message':'No brochure requested. Answer the caller\'s last question now in one or two short sentences. Do not call send_brochure.'}, properties=FunctionCallResultProperties(run_llm=True))
+                else:
+                    await params.result_callback({'status':'not_requested'}, properties=FunctionCallResultProperties(run_llm=False))
                 return
             if decision == "declined":
                 lead_memory.pop("_brochure_consent_pending", None)
@@ -6789,7 +6935,7 @@ async def run_bot(
             lead_memory.pop("_brochure_consent_pending", None)
             lead_memory.pop("_whatsapp_consent_action", None)
             lead_memory["whatsapp_opt_in"] = True
-            if config.get("whatsapp_after_call_only", False):
+            if True:
                 line = record_manual_whatsapp(lead_memory, config, 'brochure')
                 await params.result_callback({'status':'prepared_not_sent'}, properties=FunctionCallResultProperties(run_llm=False))
                 if line:
@@ -6843,6 +6989,19 @@ async def run_bot(
             await finish_brochure(params, result, task, spoken_text_guard)
 
         async def handoff_to_human(params) -> None:
+            if enterprise_session_id:
+                from enterprise import routing
+                result = await routing.transfer(provider_call_id, enterprise_session_id, config,
+                    str((params.arguments or {}).get("reason") or "caller_requested"))
+                if result["status"] in {"initiated","connected","uncertain","processing"}:
+                    transferred["active"] = True
+                    hangup_state["done"] = True
+                    await params.result_callback(result)
+                    await task.cancel()
+                    return
+                await params.result_callback(result)
+                return
+
             """Tool handler for human advisor escalation."""
             tool_call_started_at = time.monotonic()
             args = params.arguments or {}
@@ -6921,7 +7080,7 @@ async def run_bot(
             llm.register_function(
                 tool_name,
                 handler_fn,
-                cancel_on_interruption=True,
+                cancel_on_interruption=(not enterprise_on or tool_name != "handoff_to_human"),
             )
 
         # Item 6: Prompt ordering for Groq prefix caching.
@@ -6970,6 +7129,10 @@ async def run_bot(
         )
         context.call_metrics = call_metrics
         context.lead_memory = lead_memory
+
+        # Pre-warm the Groq connection and prefix cache (same system messages + tools as live turns) during the greeting.
+        if config.get("llm_cache_prewarm_enabled", False):
+            asyncio.create_task(_warm_llm_context_cache())
 
         turn_config = config.get(
             "turn_management",
@@ -7125,6 +7288,7 @@ async def run_bot(
             context=context,
         )
 
+        faq_recovery = FAQReplyRecovery()
         fast_path_config = dict(config)
         # An API-supplied campaign may override the bundled script. Never speak bundled facts
         # unless they actually occur in the effective model prompt selected by prompt_builder.
@@ -7135,7 +7299,7 @@ async def run_bot(
             lead_memory["_whatsapp_dispatching"] = True
             consent_started = time.monotonic()
             try:
-                if config.get('whatsapp_after_call_only', False):
+                if True:
                     line = record_manual_whatsapp(lead_memory, config, action)
                     if line:
                         async def emit_goal(frame):
@@ -7164,7 +7328,10 @@ async def run_bot(
                 lead_memory["_whatsapp_dispatching"] = False
 
         async def finish_provider_failure():
-            await queue_goodbye(call_end_coordinator, task)
+            # The recovery line already says goodbye ("try this call again later"). A second queued goodbye
+            # would play on top of it (two voices), so only mark the ending.
+            call_end_coordinator._dedicated_goodbye_queued = True
+            call_end_coordinator.request_ending()
         llm._on_provider_exhausted = finish_provider_failure
 
         async def run_visit_ready(date, slot):
@@ -7186,17 +7353,34 @@ async def run_bot(
             config=fast_path_config,
             on_whatsapp_consent=run_consented_whatsapp,
             on_visit_ready=run_visit_ready,
+            faq_recovery=faq_recovery,
             history_pruner=history_pruner,
             call_metrics=call_metrics,
             delayed_race_filler=delayed_race_filler,
             call_end_coordinator=call_end_coordinator,
         )
 
-        spam_qualify_gate = _SpamQualifyGate(
-            stream_id=stream_id,
-            force_hangup_fn=_force_hangup_and_mark_done,
-            is_call_ending=lambda: call_end_coordinator.is_ending,
-        )
+        async def enterprise_handoff(reason):
+            if not enterprise_session_id:
+                return {"status":"not_ready"}
+            from enterprise import routing
+            result = await routing.transfer(provider_call_id,enterprise_session_id,config,reason)
+            if result["status"] in {"initiated","connected","uncertain","processing"}:
+                transferred["active"] = True
+                hangup_state["done"] = True
+                await task.cancel()
+            return result
+        if enterprise_on:
+            from enterprise.processor import IntentGate
+            spam_qualify_gate = IntentGate(stream_id,lead_memory,config,
+                _force_hangup_and_mark_done,enterprise_handoff,
+                lambda: call_end_coordinator.is_ending or hangup_state["done"])
+        else:  # enterprise disabled: original spam/qualify gate, unchanged
+            spam_qualify_gate = _SpamQualifyGate(
+                stream_id=stream_id,
+                force_hangup_fn=_force_hangup_and_mark_done,
+                is_call_ending=lambda: call_end_coordinator.is_ending,
+            )
 
         async def hedge_tts_stall():
             if call_end_coordinator.is_ending or hangup_state["done"]:
@@ -7224,7 +7408,7 @@ async def run_bot(
             pipeline_elements.append(fallback_vad_processor)
         pipeline_elements.extend([
             stt,
-            _TranscriptionTap(call_metrics),
+            _TranscriptionTap(call_metrics, faq_recovery),
             spam_qualify_gate,
             language_observer,
             context_aggregator.user(),
@@ -7234,6 +7418,7 @@ async def run_bot(
             spoken_text_guard,
             tts,
             interruption_audio_gate,
+            _FAQAudibleObserver(faq_recovery),
             tts_stall_observer,
             call_end_coordinator,
             termination_processor,
@@ -7247,11 +7432,20 @@ async def run_bot(
 
         pipeline = Pipeline(pipeline_elements)
 
-        max_duration = config.get(
-            "max_call_duration_seconds",
-            900,
-        )
+        if enterprise_on:
+            max_duration = min(240, int(config.get("max_call_duration_seconds", 240)),
+                int((campaign_data or {}).get("enterprise_seconds", 240)))
+        else:
+            max_duration = config.get("max_call_duration_seconds", 900)
 
+        if enterprise_session_id:
+            from enterprise import store
+            admitted = store.session(enterprise_session_id)
+            if admitted:
+                # Budget starts at telephony admission, not greeting after provider construction.
+                max_duration = max(0, max_duration - int(time.time() - admitted['started']))
+
+        call_deadline = time.monotonic() + max_duration
         task = PipelineTask(
             pipeline,
             params=PipelineParams(
@@ -7284,6 +7478,7 @@ async def run_bot(
 
         @transport.event_handler("on_client_connected")
         async def on_client_connected(transport,client):
+            nonlocal hard_timeout_task
             if _greeting_sent["done"]:
                 logger.debug(
                     "[{}] Greeting already sent, skipping",
@@ -7358,9 +7553,16 @@ async def run_bot(
             )
 
             async def hard_timeout():
-                await asyncio.sleep(
-                    max_duration
-                )
+                await asyncio.sleep(max(0, call_deadline - time.monotonic() - (10 if enterprise_session_id else 0)))
+                if enterprise_session_id:
+                    from enterprise import routing
+                    result = await routing.transfer(provider_call_id, enterprise_session_id, config, "ai_ceiling")
+                    if result["status"] in {"initiated","connected","uncertain","processing"}:
+                        transferred["active"] = True
+                        hangup_state["done"] = True
+                        await task.cancel()
+                        return
+                    await asyncio.sleep(max(0, call_deadline - time.monotonic()))
 
                 # Guard against firing hard timeout if call already ended
                 if hangup_state["done"]:
@@ -7377,9 +7579,7 @@ async def run_bot(
 
                 await task.cancel()
 
-            asyncio.create_task(
-                hard_timeout()
-            )
+            hard_timeout_task = asyncio.create_task(hard_timeout())
 
         @context_aggregator.user().event_handler(
             "on_user_turn_stopped"
@@ -7407,6 +7607,14 @@ async def run_bot(
                 stall_watchdog.disarm()
                 if delayed_race_filler is not None:
                     delayed_race_filler.cancel_all_timers("empty transcript")
+                reply = faq_recovery.take_after_empty_turn()
+                if not call_end_coordinator.is_ending and not hangup_state['done']:
+                    if reply:
+                        logger.info("[{}] Recovering interrupted FAQ after transcriptless turn", stream_id)
+                        await task.queue_frames([TTSSpeakFrame(text=reply, append_to_context=False)])
+                    elif faq_recovery.take_clarification():
+                        line = _CACHED_PHRASE_TEXTS['clarify_repeat_hi' if lead_memory.get('language') == 'Hindi' else 'clarify_repeat']
+                        await task.queue_frames([TTSSpeakFrame(text=line, append_to_context=False)])
                 logger.info(
                     "[{}] User turn ended with empty transcript; disarmed stall watchdog, silence monitor active (stage={})",
                     stream_id,
@@ -7421,6 +7629,8 @@ async def run_bot(
                     silence_checker._turn_in_flight = False
                     silence_checker._user_is_speaking = False
                     stall_watchdog.disarm()
+                    if not call_end_coordinator.is_ending and not hangup_state['done'] and faq_recovery.take_clarification():
+                        await task.queue_frames([TTSSpeakFrame(text=_CACHED_PHRASE_TEXTS['clarify_repeat_hi' if lead_memory.get('language') == 'Hindi' else 'clarify_repeat'], append_to_context=False)])
                     logger.warning(
                         "[{}] Dropped garbage STT transcript {!r} ({} alpha chars) — not sending to LLM",
                         stream_id,
@@ -7496,7 +7706,11 @@ async def run_bot(
                             stream_id,
                             user_content,
                         )
-                        # Coordinator owns the eight-second quiet window; do not end early or re-speak.
+                        # Farewell already played and caller just acknowledged: end shortly, no re-speak.
+                        try:
+                            call_end_coordinator.finish_after_farewell_ack()
+                        except Exception:
+                            pass
                         return
 
             _coalesce_consecutive_messages(context.messages)
@@ -7562,6 +7776,8 @@ async def run_bot(
         )
 
     finally:
+        if hard_timeout_task:
+            hard_timeout_task.cancel()
         STREAM_PROVIDER_CALL_IDS.pop(
             stream_id,
             None,
@@ -7606,6 +7822,29 @@ async def run_bot(
         except Exception as e:
             logger.warning("[{}] Failed inferring deterministic disposition: {}", stream_id, e)
 
+        if enterprise_session_id:
+            from enterprise import store, meta
+            row = store.session(enterprise_session_id)
+            if row and current_lead_mem:
+                result = meta.enqueue_postcall(row["tenant"],stream_id,row["phone"],current_lead_mem,enterprise_session_id)
+                current_lead_mem["_postcall_delivery_result"] = result
+
+        if enterprise_on and not enterprise_session_id and current_lead_mem:
+            from enterprise import meta
+            rec = (await lead_state.get_call_async(stream_id)) or {}
+            real_phone = rec.get('phone') or (campaign_data or {}).get('phone') or ''
+            result = meta.enqueue_postcall(str(campaign_id or 'single_project'),stream_id,real_phone,current_lead_mem)
+            current_lead_mem['_postcall_delivery_result'] = result
+
+        try:
+            _wa_rec = (await lead_state.get_call_async(stream_id)) or {}
+            _wa_phone = _wa_rec.get('phone') or _wa_rec.get('customer_phone') or (campaign_data or {}).get('phone') or ''
+            _wa_result = log_postcall_whatsapp(stream_id, current_lead_mem or {}, config, _wa_phone, (current_lead_mem or {}).get('_postcall_delivery_result'))
+            if current_lead_mem is not None and _wa_result.get('status') == 'dry_run':
+                current_lead_mem['_postcall_delivery_result'] = _wa_result
+        except Exception as _wa_exc:
+            logger.warning("[{}] WhatsApp post-call trace failed: {}", stream_id, _wa_exc)
+
         # 2. Finalize call in SQLite so ended_at and disposition are persisted BEFORE report generation
         await lead_state.finalize_call_async(stream_id)
         # Manual delivery only: export one copyable message in the report below.
@@ -7638,7 +7877,13 @@ async def run_bot(
             # Background arq lead worker scoring, touchpoint logging, and CRM dispatch
             try:
                 from leads.worker import enqueue_on_call_finished
-                asyncio.create_task(enqueue_on_call_finished(stream_id, transcript_to_use))
+                if enterprise_session_id:
+                    from enterprise import analytics,store
+                    row=store.session(enterprise_session_id)
+                    if row and row.get('lead_id'):
+                        analytics.enqueue(row['tenant'],stream_id,row['lead_id'],transcript_to_use,config['enterprise']['transcript_retention_days'])
+                else:
+                    asyncio.create_task(enqueue_on_call_finished(stream_id, transcript_to_use))
             except Exception as exc:
                 logger.debug(f"[{stream_id}] Enqueue on_call_finished warning: {exc}")
 
@@ -7652,7 +7897,7 @@ async def run_bot(
             )
 
             try:
-                await asyncio.shield(force_provider_hangup("finally_safety_net"))
+                provider_end_confirmed["value"] = bool(await asyncio.shield(force_provider_hangup("finally_safety_net")))
 
             except BaseException:
                 logger.exception(
@@ -7661,6 +7906,14 @@ async def run_bot(
                 )
 
             hangup_state["done"] = True
+
+        if enterprise_session_id and not transferred["active"]:
+            from enterprise import store
+            row=store.session(enterprise_session_id)
+            if row and row['state']=='active':
+                store.event(row['tenant'],enterprise_session_id,'provider_end_unverified',
+                  {'hangup_request_accepted':provider_end_confirmed["value"],
+                   'reason':'quota reservation retained until provider end read or signed callback'},enterprise_session_id+':end_unverified')
 
         if not aiohttp_session.closed:
             try:
@@ -7683,6 +7936,12 @@ def caller_slot_matches(messages, arguments):
             for key in ("visit_date_iso", "time_slot"):
                 if fields.get(key):
                     selected[key] = fields[key]
+    if not selected.get("visit_date_iso"):
+        for message in messages:
+            if message.get("role") == "user" and isinstance(message.get("content"), str):
+                rel = relative_visit_date(message["content"], now)
+                if rel:
+                    selected["visit_date_iso"] = rel
     requested_date = normalize_visit_date(str(arguments.get("date", "")), now)
     raw_time = str(arguments.get("time", ""))
     requested_time = visit_time(raw_time)

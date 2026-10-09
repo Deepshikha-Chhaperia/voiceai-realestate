@@ -29,6 +29,10 @@ def terminal_answer(text, filler=False, connector=False):
 def faq_key(text):
     """Only narrow, single-intent English FAQ questions, never corrections or mixed requests."""
     t = text.lower().strip().rstrip(".?!")
+    # Filler/refusal refers to the previous visit offer, not this explicit FAQ.
+    vastu = re.fullmatch(r"(?:(?:uh|um)[, ]+)?(?:no[, ]+)*can you tell me (?:about )?(?:the )?vastu(?: (?:first|once))*", t)
+    if vastu:
+        return 'faq_vastu'
     for key, pattern in {
         "faq_vastu": r"(?:can you tell me (?:about )?|is (?:it|the project) |what about )?vastu(?: compliant)?",
         "faq_possession": r"(?:when is (?:the )?possession|what is (?:the )?possession date|tell me (?:the )?possession date)",
@@ -37,6 +41,63 @@ def faq_key(text):
         if re.fullmatch(pattern, t):
             return key
     return None
+
+
+_TOPIC = {
+    "faq_vastu": r"(?:vastu|vaastu|वास्तु)(?: compliant| compliance)?",
+    "faq_possession": r"(?:(?:possession|पजेशन|पज़ेशन|handover|hand over)(?: date| time| timeline)?|(?:कब तक|kab tak)(?: का| ka)?(?: है| hai)?|kab milega|when (?:will it be|is it) ready)",
+    "faq_amenities": r"(?:amenities|amenity|सुविधाएं|सुविधाएँ)",
+}
+FAQ_COMBO_CLIPS = {"faq_vastu": "faq_vastu", "faq_possession": "faq_possession", "faq_amenities": "faq_amenities_v2"}
+_LEAD = (r"(?:(?:uh|um|okay|ok|so|and|also|please|actually|haan|acha|accha)[, ]+)*"
+         r"(?:(?:can|could) you (?:please )?(?:tell|share|give) me (?:about |the )?(?:details )?(?:about |on |of )?"
+         r"|tell me (?:about )?|i (?:want|would like) to (?:know|ask) about |i want to know about |do you have |batao |bataiye )?")
+_SEG = (r"(?:(?:the|about|on|what about|what are|what is|what's|when is|when's|is it|is the project|is there|are there|any|tell me about)\s+)*"
+        r"({topics})(?:\s+(?:details|information|info|status|are there|there|hai|hain|kya hai|kab hai|kya hain))*")
+_SPLIT = r"\s*(?:,|&|\band\b|\baur\b|\bplus\b|\bas well as\b|\balso\b|और)\s*"
+
+
+_FILLER = r"(?:(?:uh|um|umm|hmm|actually|okay|ok|so|well|then|and|also|please|haan|acha|accha|hello|sir|ma'am)\b[ ,]*)+"
+
+
+def faq_keys(text):
+    """Two or more cached FAQ topics in one question, in asked order. None unless EVERY clause is a cached topic.
+
+    Sentence breaks, fillers (uh, actually, okay) and STT fragment joins are ignored; any other clause means None."""
+    t = re.sub(r"\s+", " ", text.lower().strip())
+    t = re.sub(r"[.?!।;]+", ",", t)
+    parts = []
+    for raw in re.split(_SPLIT, t):
+        part = re.sub(r"^" + _FILLER, "", raw.strip(" ,"))
+        part = re.sub(r"^" + _LEAD, "", part)
+        part = re.sub(r"(?:[, ]+(?:please|batao|bataiye|bata do|details))+$", "", part).strip(" ,")
+        if part:
+            parts.append(part)
+    keys = []
+    for part in parts:
+        hit = None
+        for key, topic in _TOPIC.items():
+            if re.fullmatch(_SEG.replace("{topics}", topic), part):
+                hit = key
+                break
+        if not hit:
+            return None
+        if hit not in keys:
+            keys.append(hit)
+    return keys if len(keys) >= 2 else None
+
+
+def combo_key(keys):
+    return "faq_combo_" + "_".join(k[4:] for k in keys)
+
+
+def combo_parts(key):
+    return ["faq_" + p for p in key[len("faq_combo_"):].split("_")]
+
+
+def combo_text(keys):
+    texts = {**FAQ_TEXTS, "faq_amenities": CALL5_TEXTS["faq_amenities_v2"]}
+    return " ".join(texts[k] for k in keys)
 
 
 def brochure_payload(call_id, phone, name, date, time, config, consent):
@@ -123,41 +184,8 @@ class TTSStallState:
             self.used = False
 
 async def dispatch_brochure(payload, client_factory=None):
-    """One approved template containing both URLs. No free-form send outside a verified 24h window."""
-    import os
-    import httpx
-    from services.whatsapp_sender import normalize_phone_e164
-    token = os.getenv("WHATSAPP_ACCESS_TOKEN", "").strip()
-    number = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
-    template = payload.get("template_name")
-    if not token or not number or not template:
-        return {"status": "not_configured", "ok": False, "error": "Brochure template or credentials not configured"}
-    if not payload.get("consent"):
-        return {"status": "needs_consent", "ok": False, "error": "WhatsApp consent missing"}
-    fields = [payload.get(k, "") for k in ("name", "visit_date_iso", "time_slot", "brochure_url", "floorplan_url")]
-    if not payload.get("phone") or not all(fields):
-        return {"status": "failed", "ok": False, "error": "Brochure payload missing phone or content"}
-    version = os.getenv("WHATSAPP_API_VERSION", "v21.0").strip()
-    request = {"messaging_product": "whatsapp", "to": normalize_phone_e164(payload["phone"]).lstrip("+"),
-        "type": "template", "template": {"name": template,
-            "language": {"code": payload.get("template_language", "en_US")},
-            "components": [{"type": "body", "parameters": [{"type": "text", "text": str(v)} for v in fields]}]}}
-    try:
-        async with (client_factory or httpx.AsyncClient)(timeout=8.0) as client:
-            response = await client.post(f"https://graph.facebook.com/{version}/{number}/messages",
-                headers={"Authorization": f"Bearer {token}"}, json=request)
-            data = response.json()
-            message_id = ((data.get("messages") or [{}])[0]).get("id")
-            if response.is_success and message_id:
-                return {"status": "sent", "ok": True, "message_id": message_id}
-            error = data.get("error") or {}
-            code = error.get("code")
-            return {"status": "failed", "ok": False, "error_code": code,
-                    "error": f"Meta error {code}: {error.get('message', 'send not accepted')}",
-                    "http_status": response.status_code}
-    except Exception as exc:
-        # A timeout can be accepted by Meta; do not auto-retry an uncertain send.
-        return {"status": "uncertain", "ok": False, "error": f"Send outcome unknown ({type(exc).__name__})"}
+    from enterprise.meta import send
+    return await send({**payload,"action":"brochure","consent_scope":"brochure"},client_factory)
 
 
 def explicit_caller_name(text):
@@ -223,6 +251,9 @@ def campaign_faq(text, memory, config):
     comparison_facts = ('1750', '1920', 'east facing', 'east/north facing', '1 balcony', '2 balconies', 'one point four five to one point six five', 'one point seven to one point eight')
     if comparison and '3' in str(memory.get('configuration') or memory.get('bhk') or '') and all(v in script for v in comparison_facts) and re.search(r'one point seven to one point eight crores?[.,\n]', script):
         return 'compare_3bhk_v1', 'Standard: 1580-1750 square feet, 1.45-1.65 crore. Large: 1920-2100 sq ft, 1.7-1.8 crore, study, extra balcony.'
+    keys = faq_keys(text)
+    if keys:
+        return combo_key(keys), combo_text(keys)
     key = faq_key(text)
     if key:
         return ('faq_amenities_v2', CALL5_TEXTS['faq_amenities_v2']) if key == 'faq_amenities' else (key, FAQ_TEXTS[key])
@@ -231,6 +262,12 @@ def campaign_faq(text, memory, config):
     if re.fullmatch(r'(?:yeah |yes |haan )?(?:i(?: am|\'m) looking for (?:a )?)?(?:3|three)\s*bhk', t):
         return 'faq_3bhk_options', CALL5_TEXTS['faq_3bhk_options']
     configuration = str(memory.get('configuration') or memory.get('bhk') or '').lower()
+    price_facts = ('one point four five to one point six five crores.', 'one point seven to one point eight crores.')
+    if re.fullmatch(r"(?:अच्छा नहीं मेरे को मतलब |अच्छा |मुझे |मेरे को )?(?:3|three) bhk का कितना पड़ेगा", t) and all(v in script for v in price_facts):
+        return 'faq_3bhk_price_v11', 'Standard one point four five to one point six five crore, aur Large one point seven to one point eight crore hai.'
+    large_choice = re.fullmatch(r"(?:हाँ ठीक है मतलब मेरेको वो |मुझे |मेरेको |मेरे को )?ब(?:ड़|ड़)ा वाला (?:चाहिए|चाहिये)(?: ऐसे तो)?[।.! ]*", t)
+    if '3' in configuration and large_choice:
+        return 'faq_3bhk_large', CALL5_TEXTS['faq_3bhk_large']
     if '3' in configuration and re.fullmatch(r'(?:the )?(?:larger|large|bigger) (?:one|flat|unit)', t):
         return 'faq_3bhk_large', CALL5_TEXTS['faq_3bhk_large']
     return None
@@ -308,13 +345,27 @@ CALL7_TEXTS = {
 }
 
 
+_MONTHS = r"(?:january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept|sep|oct|nov|dec)"
+_DATE_NUM_RE = re.compile(r"\b\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?" + _MONTHS + r"\b|\b" + _MONTHS + r"\s+\d{1,2}(?:st|nd|rd|th)?\b")
+
+
+def _strip_calendar_dates(text):
+    return _DATE_NUM_RE.sub(' ', text)
+
+
 def visit_time(text):
     """Concrete caller time. Bare hours use the owner's daytime convention, not availability."""
     t = text.lower().strip().rstrip('.?!।')
+    t = _strip_day_offsets(t)  # "after two days" is a date offset, never 2 o'clock
+    t = _strip_calendar_dates(t)  # "11 October" is a date, never 11 o'clock
+    t = re.sub(r"(?<!\w)(?:kar|karo|kardo|de|dijiye|kijiye|कर|दे)\s+(?:do|दो)(?!\w)", ' ', t)  # "book kar do" = "please book", never 2 o'clock
     for word, number in {'one':1,'two':2,'three':3,'four':4,'five':5,'six':6,'seven':7,'eight':8,'nine':9,'ten':10,'eleven':11,'twelve':12,'एक':1,'दो':2,'तीन':3,'चार':4,'पांच':5,'पाँच':5,'छह':6,'सात':7,'आठ':8,'नौ':9,'दस':10,'ग्यारह':11,'बारह':12}.items():
         t = re.sub(r'(?<!\w)' + word + r'(?!\w)', str(number), t)
     if re.search(r'\d+\s*(?:bhk|balcon|bed|crore|lakh|sq)', t):
         return None
+    marked = re.search(r"(?<!\d)\d{1,2}(?::\d{2})?\s*(?:बजे|baje|bajey|o'?clock|a\.?m\b|p\.?m\b)", t)
+    if marked:  # a number that carries a time marker wins over any other number in the sentence
+        t = re.sub(r"\d+(?::\d{2})?", ' ', t[:marked.start()]) + t[marked.start():marked.end()] + re.sub(r"\d+(?::\d{2})?", ' ', t[marked.end():])
     numeric = re.search(r'(?<!\d)(\d{1,2})(?::(\d{2}))?', t)
     if numeric and (int(numeric.group(1)) > 23 or int(numeric.group(2) or 0) > 59):
         return None
@@ -338,9 +389,8 @@ def visit_intent(text, memory):
 
 
 def whatsapp_ready():
-    """Only check presence of existing config, never expose values or send a probe."""
-    import os
-    return bool(os.getenv('WHATSAPP_ACCESS_TOKEN', '').strip() and os.getenv('WHATSAPP_PHONE_NUMBER_ID', '').strip())
+    from enterprise.meta import state
+    return state()['ready']
 
 
 def postcall_whatsapp_plan(memory, config, action):
@@ -350,7 +400,7 @@ def postcall_whatsapp_plan(memory, config, action):
     actions = set(memory.get('_postcall_whatsapp_actions') or []) | {action}
     plan = {'actions': sorted(actions), 'delivery': 'manual', 'status': 'prepared_not_sent'}
     check = manual_whatsapp_message({**memory, '_postcall_whatsapp_actions': sorted(actions)}, config)
-    error = ('The location link needs team confirmation.' if action == 'location' else 'The brochure links need team confirmation.') if check['blockers'] else None
+    error = ("I can't share the location right now." if action == 'location' else "I can't share the brochure right now.") if check['blockers'] else None
     return plan, error
 
 
@@ -388,6 +438,8 @@ def manual_whatsapp_message(memory, config):
 
 def record_manual_whatsapp(memory, config, action):
     """Remember scoped consent once, even when delivery links are missing."""
+    from loguru import logger
+    logger.info('[WA-TOOL] {} requested/consented mid-call; NOTHING is sent now, delivery is deferred until the call has ended', action)
     already = action in (memory.get('_postcall_whatsapp_actions') or [])
     plan, error = postcall_whatsapp_plan(memory, config, action)
     if plan:
@@ -451,4 +503,127 @@ def manual_location_offer(memory, config):
     if memory.get('_whatsapp_consent_action') == 'location':
         memory.pop('_whatsapp_consent_action', None)
     memory['_manual_close_after_booking'] = True
-    return ' The location link needs team confirmation.'
+    return ''
+
+
+def caller_asked_something(messages):
+    """True when the last caller turn is a real request/question (3+ words, not a bare farewell/ack)."""
+    last = next((str(m.get('content','')) for m in reversed(messages) if m.get('role') == 'user' and isinstance(m.get('content'), str)), '')
+    words = re.findall(r"[^\W\d_]+", last.lower())
+    if len(words) < 3 and '?' not in last:
+        return False
+    return not re.fullmatch(r"(?:okay|ok|thanks?|thank you|bye|goodbye|theek hai|thik hai|haan|ji|accha|achha|hmm|yes|no|\s)+", ' '.join(words))
+
+
+def _mask_phone(phone):
+    d = re.sub(r'\D', '', str(phone or ''))
+    return ('*' * max(0, len(d) - 4) + d[-4:]) if d else 'none'
+
+
+def log_postcall_whatsapp(call_id, memory, config, phone, delivery=None):
+    """Visible post-call WhatsApp trace. Runs only after the call ended. Never sends and never claims success.
+
+    delivery is the enterprise.meta.enqueue_postcall() result when enterprise is on; None otherwise (dry run)."""
+    from loguru import logger
+    actions = list(memory.get('_postcall_whatsapp_actions') or [])
+    if not actions:
+        logger.info('[WA-POSTCALL] [{}] call ended; no WhatsApp action was requested', call_id)
+        return {'status': 'not_requested'}
+    logger.info('[WA-POSTCALL] [{}] call ended; actions={} recipient={}', call_id, actions, _mask_phone(phone))
+    status = (delivery or {}).get('status')
+    if status == 'queued':
+        logger.info('[WA-POSTCALL] [{}] QUEUED for Meta send (work_ids={}); the sender confirms only after the provider accepts', call_id, delivery.get('work_ids'))
+        return delivery
+    gaps = (delivery or {}).get('gaps') or ['Meta automation not enabled/configured (enterprise off or keys missing)']
+    preview = manual_whatsapp_message(memory, config)
+    logger.warning('[WA-POSTCALL] [{}] DRY RUN, NOT SENT. Reason: {}', call_id, '; '.join(map(str, gaps))[:300])
+    logger.info('[WA-POSTCALL] [{}] would send: {}', call_id, str(preview.get('text', ''))[:400].replace('\n', ' | '))
+    return {'status': 'dry_run', 'gaps': gaps, 'sent': False}
+
+
+_ASSENT = {'yes','yeah','yep','yup','sure','ok','okay','correct','right','fine','please','haan','han','haa','ji','bilkul','theek','thik','hai','ha','sahi','done','confirm','confirmed'}
+
+
+def assented_slot(messages):
+    """(iso_date, time) when the caller's latest turn is a plain yes to OUR immediately preceding question that named BOTH a day and a time."""
+    users = [i for i, m in enumerate(messages) if m.get('role') == 'user' and isinstance(m.get('content'), str)]
+    if not users:
+        return None
+    i = users[-1]
+    raw = messages[i]['content'].lower().replace('हाँ', 'haan').replace('हां', 'haan').replace('जी', 'ji').replace('ठीक है', 'theek hai')
+    words = re.sub(r"[^a-z ]", ' ', raw).split()
+    if not words or len(words) > 4 or not all(w in _ASSENT for w in words):
+        return None
+    prev = next((str(m.get('content', '')) for m in reversed(messages[:i]) if m.get('role') == 'assistant'), '')
+    if '?' not in prev:
+        return None
+    from bot import _extract_lead_preferences
+    fixed = re.sub(r'\b([ap])\s*\.?m\b\.?', r'\1m', prev, flags=re.I)
+    fields = _extract_lead_preferences(fixed)
+    asked_time = fields.get('time_slot') or visit_time(fixed)
+    asked_date = fields.get('visit_date_iso')
+    if not (asked_date and asked_time):
+        return None
+    return asked_date, asked_time
+
+
+def slot_assented(messages, arguments):
+    """Caller said a plain yes to OUR immediately preceding question that named BOTH the exact day and time.
+
+    The booking still has to match what we asked. A bare yes to anything else never books."""
+    from leads.worker import normalize_visit_date
+    from zoneinfo import ZoneInfo
+    from datetime import datetime
+    asked = assented_slot(messages)
+    if not asked:
+        return False
+    now = datetime.now(ZoneInfo('Asia/Kolkata'))
+    requested_date = normalize_visit_date(str(arguments.get('date', '')), now)
+    requested_time = visit_time(str(arguments.get('time', '')))
+    return bool(requested_date and requested_time and requested_date[0] == asked[0] and requested_time == asked[1])
+
+
+_NUM_WORDS = {'one':1,'two':2,'three':3,'four':4,'five':5,'six':6,'seven':7,'eight':8,'nine':9,'ten':10,'ek':1,'do':2,'teen':3,'char':4,'paanch':5,'एक':1,'दो':2,'तीन':3,'चार':4,'पांच':5}
+_NUMTOK = r"(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)"
+_OFFSET_RE = re.compile(
+    r"(?:\b(?:after|in)\s+" + _NUMTOK + r"\s+days?\b"
+    r"|\b" + _NUMTOK + r"\s+days?\s+(?:later|from\s+now|ahead)\b"
+    r"|(?<!\w)(\d{1,2}|ek|do|teen|char|paanch|एक|दो|तीन|चार|पांच)\s+(?:din|दिन)\s+(?:baad|bad|me|mein|बाद|में)(?!\w))"
+)
+
+
+def _strip_day_offsets(text):
+    return _OFFSET_RE.sub(' ', text)
+
+
+def relative_visit_date(text, now):
+    """ISO date for 'after two days' / 'do din baad' / 'day after tomorrow' / 'parso'. None when not stated."""
+    from datetime import timedelta
+    t = str(text).lower()
+    m = _OFFSET_RE.search(t)
+    if m:
+        raw = next(g for g in m.groups() if g)
+        n = int(raw) if raw.isdigit() else _NUM_WORDS.get(raw)
+        if n and 0 < n <= 14:
+            return (now + timedelta(days=n)).date().isoformat()
+    if re.search(r"day after tomorrow|\bparso\b|परसों|परसो", t):
+        return (now + timedelta(days=2)).date().isoformat()
+    return None
+
+
+def held_slot_message(arguments, now):
+    """Tool-result text for a held book_site_visit. It must never read like a refusal: a later plain yes has to be bookable."""
+    from leads.worker import normalize_visit_date
+    args = arguments or {}
+    d = normalize_visit_date(str(args.get('date', '')), now)
+    t = visit_time(str(args.get('time', '')))
+    if d and t:
+        from datetime import date as _date
+        y, m, dd = [int(x) for x in d[0].split('-')]
+        day = _date(y, m, dd)
+        label = f"{day.strftime('%A')}, {day.day} {day.strftime('%B')} at {t}"
+        return (f"The caller has not clearly stated this slot yet, so nothing is booked. Ask exactly one short question: "
+                f"\"Shall I book {label}?\" and say nothing else about booking. When the caller answers yes, call book_site_visit "
+                f"with date {d[0]} and time {t} straight away. Never tell the caller you cannot confirm or that they did not say something.")
+    return ("The caller has not given both a day and a time yet, so nothing is booked. In one short sentence ask for the missing day or time. "
+            "Never tell the caller you cannot confirm or that they did not say something.")

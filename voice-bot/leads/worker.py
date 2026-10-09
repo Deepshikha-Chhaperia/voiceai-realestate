@@ -43,6 +43,11 @@ def normalize_visit_date(raw: str, now_ist: datetime) -> tuple[str, str] | None:
         d = now_ist.date()
         return (d.isoformat(), f"Today — {d.strftime('%A, %d %b %Y')}")
 
+    # day after tomorrow must be tested BEFORE tomorrow (it contains the word "tomorrow")
+    if re.search(r"\b(parso|parson|day after tomorrow)\b", v) or "परसों" in v:
+        d = (now_ist + timedelta(days=2)).date()
+        return (d.isoformat(), f"{d.strftime('%A, %d %b %Y')}")
+
     # tomorrow: tomorrow / kal / कल
     if re.search(r"\b(tomorrow|kal)\b", v) or "कल" in v:
         d = (now_ist + timedelta(days=1)).date()

@@ -144,6 +144,8 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Leads database initialization warning: {e}")
 
+    await enterprise_api.start_worker(CONFIG)
+
     # Start outbox background worker
     try:
         from leads import outbox as leads_outbox
@@ -178,6 +180,7 @@ async def lifespan(app: FastAPI):
         await leads_outbox.stop_outbox_worker()
     except Exception:
         pass
+    await enterprise_api.stop_worker()
     await CALL_MANAGER.close()
     try:
         from bot import _vobiz_http_client
@@ -206,6 +209,8 @@ app.add_middleware(
 )
 
 app.include_router(leads.dashboard.router)
+from enterprise import api as enterprise_api
+app.include_router(enterprise_api.router)
 
 
 def _tls() -> bool:
@@ -256,12 +261,48 @@ async def handle_inbound_call(request: Request):
     VobizFrameSerializer handles the conversion to PCM that Pipecat expects.
     """
     _verify_vobiz_signature(request)
-    stream_url = _build_ws_url("/ws")
+    from enterprise.config import policy, readiness
+    from enterprise import store, routing
+    p = policy(CONFIG)
+    from enterprise.forms import provider_form
+    call_data = await provider_form(request) if p.get("enabled") else {}
+    provider_id = call_data.get("CallUUID", "")
+    caller_phone = call_data.get("From", "")
+    extra = ""
+    if p.get("enabled"):
+        gates = readiness(CONFIG)
+        if not gates["quota"]["ready"] or not provider_id:
+            return Response('<Response><Hangup/></Response>', media_type="application/xml")
+        try:
+            lead_id, repeat = await routing.persist_caller(caller_phone, CONFIG, provider_id)
+        except Exception:
+            store.event(p['tenant_id'],provider_id,'missed_call',{'reason':'caller_identity_or_project_unavailable','has_phone':bool(caller_phone)},provider_id+':missed')
+            logger.exception("Enterprise inbound caller persistence failed; AI admission blocked")
+            return Response('<Response><Hangup/></Response>', media_type="application/xml")
+        human = p.get("mode") == "human"
+        if human and not gates["human_mode"]["ready"]:
+            store.event(p["tenant_id"], provider_id, "missed_call", {"lead_id":lead_id,"reason":"human_mode_not_ready"}, provider_id+":missed")
+            return Response('<Response><Hangup/></Response>', media_type="application/xml")
+        cap = p.get("recording",{}).get("max_call_seconds",240) if human else 240
+        admission = store.reserve(provider_id,p["tenant_id"],caller_phone,p["quota"],seconds=cap,mode="human" if human else "ai",lead_id=lead_id)
+        if not admission["allowed"]:
+            store.event(p["tenant_id"],provider_id,"missed_call",{"lead_id":lead_id,"reason":"monthly_cap_reached"},provider_id+":missed")
+            return Response('<Response><Hangup/></Response>', media_type="application/xml")
+        if human:
+            if not routing.available(CONFIG):
+                routing.callback(provider_id,CONFIG,"outside_rep_hours")
+                store.finish(provider_id,"outside_rep_hours")
+            return Response(routing.bridge_xml(provider_id,CONFIG,record=True),media_type="application/xml")
+        await CALL_MANAGER.save(provider_id,{"provider_call_id":provider_id,"enterprise_session_id":provider_id,
+           "phone":caller_phone,"lead_id":lead_id,"campaign_id":p["tenant_id"],"repeat_caller":repeat,
+           "enterprise_seconds":admission["seconds"]},ttl=900)
+        extra = "&call_id=" + quote(provider_id,safe="")
+    stream_url = _build_ws_url("/ws") + extra
 
     # Instruct Vobiz to open a bidirectional 8kHz µ-law audio stream
     vxml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Stream bidirectional="true" audioTrack="inbound" contentType="audio/x-mulaw;rate=8000" keepCallAlive="true">{stream_url}</Stream>
+    <Stream bidirectional="true" audioTrack="inbound" contentType="audio/x-mulaw;rate=8000" keepCallAlive="true">{stream_url.replace("&", "&amp;")}</Stream>
 </Response>"""
 
     logger.info(f"Inbound call directed to stream host {os.getenv('PUBLIC_HOST')}")
@@ -281,6 +322,12 @@ async def initiate_outbound_call(
 
     Enforces calling hours (09:00-21:00 IST) and checks Do-Not-Call registry before placing call.
     """
+    from enterprise.config import policy
+    ep = policy(CONFIG)
+    if ep.get("enabled"):
+        from enterprise.config import readiness
+        if not ep.get('outbound_enabled') or not readiness(CONFIG)['quota']['ready'] or not readiness(CONFIG)['routing']['ready']:
+            return {"status":"blocked","reason":"enterprise_outbound_admission_not_ready"}
     # 1. Calling hours check (IST: 09:00 - 21:00)
     from leads.worker import is_within_calling_hours
     if not is_within_calling_hours("Asia/Kolkata", "09:00", "21:00"):
@@ -298,8 +345,22 @@ async def initiate_outbound_call(
             logger.warning(f"Outbound call to {to_phone} blocked: number is on Do-Not-Call list")
             return {"status": "blocked", "reason": "do_not_call", "phone": to_phone}
 
+    if ep.get("enabled"):
+        from enterprise import routing,store
+        from enterprise.config import e164
+        if not e164(to_phone):return {"status":"blocked","reason":"invalid_phone"}
+        lead_id, repeat = await routing.persist_caller(to_phone,CONFIG,'outbound-request-'+str(uuid.uuid4()),source='outbound_call')
+        # Outbound consent does not follow from inbound/API possession. Explicit client policy required.
+        if ep.get('outbound_consent_policy') != 'verified_lead_optin':return {"status":"blocked","reason":"outbound_consent_policy_not_ready"}
+        from leads.models import Lead
+        async with get_session() as session:
+            lead=await session.get(Lead,uuid.UUID(lead_id))
+            if not lead or not lead.consent_at:return {"status":"blocked","reason":"outbound_lead_optin_missing"}
     call_id = str(uuid.uuid4())
     camp_id = campaign_id or f"uncategorized-{datetime.now().strftime('%Y-%m-%d')}"
+    if ep.get('enabled'):
+        admitted=store.reserve(call_id,ep['tenant_id'],to_phone,ep['quota'],seconds=240,mode='outbound_ai',lead_id=lead_id)
+        if not admitted['allowed']:return {"status":"blocked","reason":"monthly_cap_reached"}
     initial_data = {
         "customer_name": customer_name,
         "campaign_prompt": campaign_prompt,
@@ -307,6 +368,9 @@ async def initiate_outbound_call(
         "campaign_id": camp_id,
         "lead_id": lead_id,
     }
+    if ep.get('enabled'):
+        initial_data.update(phone=to_phone,enterprise_seconds=admitted['seconds'],repeat_caller=repeat,
+           enterprise_local_admission=call_id)
     await CALL_MANAGER.save(call_id, initial_data)
     logger.info(f"[{call_id}] Campaign data stored (lead_id={lead_id})")
 
@@ -337,6 +401,8 @@ async def initiate_outbound_call(
         "answer_url": answer_url,
         "answer_method": "POST",
     }
+    if ep.get('enabled'):
+        payload.update(time_limit=admitted['seconds'],hangup_url=f'{scheme}://{host_val}/enterprise/call-ended',hangup_method='POST')
     headers = {
         "X-Auth-ID": auth_id,
         "X-Auth-Token": auth_token,
@@ -349,15 +415,25 @@ async def initiate_outbound_call(
             response.raise_for_status()
             result = response.json()
             provider_call_id = result.get("callId") or result.get("call_uuid") or result.get("uuid")
+            if ep.get("enabled") and not provider_call_id:
+                provider_call_id = result.get("request_uuid")
+            if ep.get('enabled') and not provider_call_id:
+                store.event(ep['tenant_id'],call_id,'outbound_outcome_unknown',{'reason':'Provider accepted response missing UUID'},call_id+':outbound_unknown')
+                return {"status":"uncertain","call_id":call_id}
             if provider_call_id:
+                if ep.get('enabled'):store.bind_provider(call_id,provider_call_id)
                 campaign_data = await CALL_MANAGER.get(call_id)
                 if campaign_data:
                     campaign_data["provider_call_id"] = provider_call_id
+                    if ep.get('enabled'):campaign_data['enterprise_session_id']=provider_call_id
                     await CALL_MANAGER.save(call_id, campaign_data)
                 lead_state.upsert_call(call_id, provider_call_id=provider_call_id)
             logger.info(f"Outbound call initiated to {to_phone}, answer_url={answer_url}")
             return {"status": "success", "call_id": call_id, "vobiz_response": result}
         except httpx.HTTPStatusError as e:
+            if ep.get('enabled'):
+                if 400 <= e.response.status_code < 500:store.finish(call_id,'provider_dial_rejected',0)
+                else:store.event(ep['tenant_id'],call_id,'outbound_outcome_unknown',{'reason':'HTTP '+str(e.response.status_code)},call_id+':outbound_unknown')
             error_body = e.response.text
             logger.error(f"Vobiz API error: {e} | Response: {error_body}")
             raise HTTPException(500, f"Failed to initiate outbound call. Vobiz error: {error_body}")
@@ -407,7 +483,7 @@ async def handle_outbound_answer(request: Request):
 
     vxml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Stream bidirectional="true" audioTrack="inbound" contentType="audio/x-mulaw;rate=8000" keepCallAlive="true">{stream_url}</Stream>
+    <Stream bidirectional="true" audioTrack="inbound" contentType="audio/x-mulaw;rate=8000" keepCallAlive="true">{stream_url.replace("&", "&amp;")}</Stream>
 </Response>"""
 
     logger.info(f"Outbound call answered (call_id={call_id}), directed to stream host {os.getenv('PUBLIC_HOST')}")
@@ -476,8 +552,17 @@ async def websocket_endpoint(websocket: WebSocket):
                 await CALL_MANAGER.delete(call_id)
                 logger.info(f"Campaign data loaded for call {call_id}")
 
+        from enterprise.config import policy
+        if policy(CONFIG).get('enabled'):
+            from enterprise import store
+            session_id=(campaign_data or {}).get('enterprise_session_id')
+            row=store.session(session_id) if session_id else None
+            if not row or row['state']!='active':
+                await websocket.close(code=4403,reason='Enterprise admission missing')
+                return
+
         # 3. Run the bot pipeline with a maximum call duration so calls automatically stop if they run too long (default 15 minutes).
-        max_duration = CONFIG.get("max_call_duration_seconds", 900)
+        max_duration = max(260, int(CONFIG.get("max_call_duration_seconds", 900))) if policy(CONFIG).get("enabled") else CONFIG.get("max_call_duration_seconds", 900)
 
         await asyncio.wait_for(
             run_bot(
@@ -531,7 +616,8 @@ if is_local_demo():
             return
 
         try:
-            max_duration = CONFIG.get("max_call_duration_seconds", 900)
+            from enterprise.config import policy
+            max_duration = max(260, int(CONFIG.get("max_call_duration_seconds", 900))) if policy(CONFIG).get("enabled") else CONFIG.get("max_call_duration_seconds", 900)
 
             # We start the bot directly with our internal stream_id
             await asyncio.wait_for(

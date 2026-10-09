@@ -56,6 +56,10 @@ def score(
             elif hasattr(lead, "project_config"):
                 project_config = lead.project_config or {}
 
+    if project_config.get("enterprise_scoring"):
+        from enterprise.scoring import qualification
+        return qualification(analysis, project_config, booking_verified=(disp == "SITE_VISIT_BOOKED"))
+
     min_project_price = float(project_config.get("min_price_lakhs", 95.0))
     max_project_price = float(project_config.get("max_price_lakhs", 180.0))
 

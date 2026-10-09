@@ -139,6 +139,9 @@ async def drain_outbox() -> int:
 
             try:
                 if item.target == "whatsapp":
+                    item.status = "failed"
+                    item.last_error = "Legacy WhatsApp queue disabled; use scoped postcall enterprise work ledger and review old rows manually"
+                    continue
                     from services.whatsapp_sender import send_whatsapp_location
                     payload = item.payload or {}
                     to_phone = payload.get("phone", "")

@@ -187,7 +187,7 @@ fallback_closing_text: "Thanks so much for your time today. Have a great day!"
 continuation_fallback: "Is there anything else I can help with?"
 
 # In-service connection and prompt pre-warming during initial greeting playback.
-llm_cache_prewarm_enabled: false
+llm_cache_prewarm_enabled: true
 llm_prewarm_timeout: 4.0
 
 max_conversation_messages: 6  # was 8; Oct 4 value. [ACTIVE LEAD STATE] carries long-term slots
@@ -363,3 +363,46 @@ brochure_delivery:
 whatsapp_after_call_only: true
 hangup_grace_seconds: 3.0
 postcall_whatsapp_enabled: false  # Meta account inactive; manual preparation only, no API queue
+
+# Enterprise is dormant until deployment/account policies are filled and readiness is green.
+# Single-host only: enterprise.db requires a persistent local volume shared by app processes.
+enterprise:
+  enabled: false
+  mode: ai  # ai | human
+  outbound_enabled: false
+  outbound_consent_policy: null # verified_lead_optin; no inferred permission
+  tenant_id: null
+  transcript_retention_days: null # New enterprise analytics/transcript retention, approved policy
+  project_id: null  # Existing projects.id UUID, never arbitrary default project
+  project_name: null
+  deployment_scope: null  # single_host; distributed ledger unsupported
+  legacy_retention_policy_confirmed: false # logs/lead_state/vendor copies lifecycle
+  persistent_volume_confirmed: false
+  provider_hangup_webhook_confirmed: false # Vobiz app hangup URL /enterprise/call-ended
+  quota:
+    monthly_calls: null
+    monthly_minutes: null
+    timezone: null
+    accounting: null  # all_routed_call_seconds, not invoice/B-leg billing
+  routing:
+    rep_numbers: []  # E.164, simultaneous dialing, not sequential holds
+    timezone: null
+    weekdays: []  # 0 Monday .. 6 Sunday
+    open: null  # HH:MM local
+    close: null
+    max_call_seconds: null  # Human bridge extension, quota-reserved before transfer
+    callback_message: null  # Approved fallback wording; never invent a promised callback
+    broker_job_policy: null  # close | route
+  recording:
+    notice: null
+    consent_policy: null  # notice_continue only when approved; explicit opt-in IVR unsupported
+    retention_days: null
+    access_policy: null  # Existing shared dashboard-key holders; no multi-user role system
+    allowed_hosts: []  # Exact provider media hosts, no redirects; typically media.vobiz.ai after verification
+    sarvam_model: null  # Explicit batch model supported by installed SDK/API; live STT unchanged
+    language_code: null
+    max_call_seconds: null
+  reports:
+    brand: null
+    anchor_date: null  # ISO local date/time; every14days from this anchor
+    timezone: null
