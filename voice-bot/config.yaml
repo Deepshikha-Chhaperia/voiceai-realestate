@@ -10,7 +10,7 @@ providers:
       api_key_env: "SARVAM_API_KEY"
       params:
         model: "saaras:v4"
-        language: "en-IN"
+        language: "unknown"
         mode: "codemix"
         sample_rate: 8000
         input_audio_codec: "wav"
@@ -87,7 +87,7 @@ providers:
                     description: "Specific day or date requested by caller, e.g. 'Saturday', 'tomorrow', 'October 12'."
                   time:
                     type: string
-                    description: "Specific time or slot requested by caller, e.g. '11:00 AM', '3:00 PM', 'morning 11am'."
+                    description: "Concrete caller time; bare two or do baje means daytime 2 PM. Do not pass vague periods."
                 required: [date, time]
                 additionalProperties: false
 
@@ -99,7 +99,7 @@ providers:
         model: "qwen/qwen3.8-27b"
         temperature: 0.3
         top_p: 0.85
-        max_completion_tokens: 60 # capped at 60 tokens for sub-500ms voice-to-voice & reduced TTS burn
+        max_completion_tokens: 90 # headroom for complete sentences, not a target length
         extra:
           reasoning_effort: "none"
         tools: *id001
@@ -160,26 +160,11 @@ providers:
 
 
 voice_rules: |
-  Role: Ananya, Senior Property Advisor, Meridian Group. Outbound call.
-  Style: 1-2 short sentences (max ~25 words). Warm, conversational, direct. Address multiple questions concisely. Spoken dialogue only—no code, parameters, '=', or parentheses.
-  Constraints: Never close on first objection, compare costlier areas, re-offer brochure, invent discounts, or repeat greeting. Conclude only when caller says goodbye or after firm refusal.
-
-  Rules:
-  - Anchor answers to chosen unit in [ACTIVE LEAD STATE].
-  - Discovery: When BHK picked, offer options: "We have fifteen eighty sq ft from one point four five crore. Or twenty-one hundred sq ft from one point seven crore. Which size do you prefer?" (2 BHK: eleven fifty sq ft from ninety-five lakhs).
-  - Ownership: On mismatch: "You are right—I should have kept your preference." Then stop.
-  - Objections:
-    * 1 (general/uninterested): "Totally understand, is it the location, price, or just not the right time?"
-    * 2 (price/location): Address concisely (10% booking plan, SBI/HDFC/ICICI loans, 10 min to Metro). Offer WhatsApp once: "May I share the brochure and floor plans on WhatsApp so you can review at your leisure?"
-    * Firm refusal (rejects WhatsApp or repeats no): "Understood, thanks for your time. Have a great day!" and close.
-  - Pauses: If caller pauses or says "and...", say "Yes, go ahead?"
-  - Tools:
-    * book_site_visit: Call only when caller confirms BOTH day and time (ask time first if missing). Speak NO text in tool call response. Never claim booked in speech.
-    * send_brochure: Confirm warmly and call when caller requests brochure or WhatsApp.
-    * handoff_to_human: Call if caller insists on talking to a human or manager.
-  - Languages: English, Hinglish, Telugu. Hinglish baseline for Hindi (natural words: location, price, budget, flat, possession). Switch to pure conversational Telugu when Telugu requested or spoken.
-
-termination_rules: ""
+  You are Ananya, Meridian Group property advisor. Help the caller choose a home and arrange a site visit.
+  Speak naturally in their language, using conversational Hinglish for Hindi. Give one or two short complete sentences. Answer only what was asked; avoid extra offers and follow-up questions. State property facts, not invented best-facing or Vastu-superiority advice. Keep natural punctuation for speech. Do not reintroduce yourself or repeat answered questions.
+  Use the property facts below and [ACTIVE LEAD STATE] caller preferences. Never invent facts, discounts or availability. Listen to corrections; unclear speech gets a brief repeat request.
+  For visits ask only the missing day or time. Interpret bare hours as normal daytime visit hours and repeat the resolved time in confirmation. Claim booked only after book_site_visit success. Caller can correct it.
+  Send WhatsApp only on specific consent; queued or accepted is not delivered. End politely on goodbye or firm refusal; never re-pitch during closing.
 
 real_estate_sales_script: |
   Meridian Residences, Prime Tech Corridor. 2 & 3 BHKs. Possession: late 2027. 100% Vastu, East/North entry.
@@ -202,10 +187,10 @@ fallback_closing_text: "Thanks so much for your time today. Have a great day!"
 continuation_fallback: "Is there anything else I can help with?"
 
 # In-service connection and prompt pre-warming during initial greeting playback.
-llm_cache_prewarm_enabled: true
+llm_cache_prewarm_enabled: false
 llm_prewarm_timeout: 4.0
 
-max_conversation_messages: 8
+max_conversation_messages: 6  # was 8; Oct 4 value. [ACTIVE LEAD STATE] carries long-term slots
 
 audio:
   sample_rate: 8000
@@ -221,14 +206,17 @@ vad:
   silence_timeout: 0.50
 
 silence_nudge_first_secs: 15
+# Second Groq model used when the primary Groq model fails / hits 429 (same GROQ_API_KEY). "" disables.
+llm_backup_groq_model: ""  # set only after local authenticated model-list validation
 filler_timeout_ms: 700
 preemptive_llm_enabled: false
 
 turn_management:
   user_speech_timeout: 0.20
   user_speech_min_duration: 0.20
-  filler_debounce_seconds: 0.25
+  filler_debounce_seconds: 0.15
   user_turn_stop_timeout: 0.75
+  smart_turn_enabled: false
 
 metrics:
   enable_metrics: true
@@ -356,3 +344,22 @@ cost_rates:
     murf:
       per_character_inr: 0.001917
       per_character: 0.000020
+# Optional: only enable for a campaign whose facts exactly match call_repairs.FAQ_TEXTS.
+faq_cache_enabled: true
+# Optional: approved Meta body template parameters IN THIS ORDER:
+# customer name, visit date, visit time, brochure HTTPS URL, floorplan HTTPS URL.
+# Empty sources/template fail truthfully; never pretend a send completed.
+brochure_delivery:
+  # Existing Meta-approved post-call template, with exact reviewed field order.
+  # Empty until local account/template validation. No guessed template/free-form send.
+  postcall_template_name: ""
+  postcall_template_fields: []
+  postcall_location_url: ""
+  brochure_url: ""
+  floorplan_url: ""
+  template_name: ""
+  template_language: en_US
+
+whatsapp_after_call_only: true
+hangup_grace_seconds: 3.0
+postcall_whatsapp_enabled: false  # Meta account inactive; manual preparation only, no API queue

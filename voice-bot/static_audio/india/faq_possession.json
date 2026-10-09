@@ -1,0 +1,15 @@
+{
+  "identity": {
+    "schema": 1,
+    "provider": "sarvam",
+    "model": "bulbul:v3",
+    "speaker": "pooja",
+    "language": "en-IN",
+    "sample_rate": 16000,
+    "pace": 1.02,
+    "temperature": 0.6,
+    "text": "Possession is expected in late twenty twenty seven.",
+    "api": "sarvam-rest"
+  },
+  "sha256": "188ca6a11954c162e069d1a3ff3cd07056fd54bcab18655f84de4dc0fb0c254e"
+}

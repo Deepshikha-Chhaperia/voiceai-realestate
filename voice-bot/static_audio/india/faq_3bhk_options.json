@@ -1,0 +1,15 @@
+{
+  "identity": {
+    "schema": 1,
+    "provider": "sarvam",
+    "model": "bulbul:v3",
+    "speaker": "pooja",
+    "language": "en-IN",
+    "sample_rate": 16000,
+    "pace": 1.02,
+    "temperature": 0.6,
+    "text": "We have fifteen eighty square feet from one point four five crore, or twenty one hundred from one point seven crore. Which size would you prefer?",
+    "api": "sarvam-rest"
+  },
+  "sha256": "c0e770cb8811f1399c9b47fd1f9b2672d4d97d33282fd54e1f235e1b93ddeaa3"
+}

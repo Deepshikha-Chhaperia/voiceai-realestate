@@ -1,0 +1,15 @@
+{
+  "identity": {
+    "schema": 1,
+    "provider": "sarvam",
+    "model": "bulbul:v3",
+    "speaker": "pooja",
+    "language": "en-IN",
+    "sample_rate": 16000,
+    "pace": 1.02,
+    "temperature": 0.6,
+    "text": "Please hold while I connect you to a senior property advisor.",
+    "api": "sarvam-rest"
+  },
+  "sha256": "7326866c6c028a0b484ad211f626f142aa873069c61ad76cfa35feb85716fb32"
+}

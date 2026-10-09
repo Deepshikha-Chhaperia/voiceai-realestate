@@ -1,50 +1,13 @@
-"""
-Google Sheets export -- additive module, called from call_analytics.py's
-existing _push_to_crm() hook, not a replacement for it.
-
-WHY A DEDICATED MODULE INSTEAD OF JUST THE GENERIC CRM_WEBHOOK_URL: you
-asked specifically for "a google sheet", not "a webhook that could point
-somewhere". A generic webhook still needs something on the other end
-(Zapier, Make, your own receiver) to actually land rows in a Sheet -- this
-module talks to the Sheets API directly, so a spreadsheet ID and a service
-account are the entire dependency, nothing else to stand up.
-
-HOW AUTH WORKS, and why this is fine on any cloud:
-  A Google service account is just a JSON key file / JSON blob -- not tied
-  to AWS, Azure, or GCP in any way. Two ways to supply it, pick whichever
-  fits your deployment:
-    - GOOGLE_SHEETS_CREDENTIALS_JSON: the full JSON key content, as an
-      environment variable. Cleanest for containers (ECS/Cloud Run/Azure
-      Container Apps task definitions, k8s secrets, etc.) -- no file to
-      mount.
-    - GOOGLE_APPLICATION_CREDENTIALS: a file path, standard Google-auth
-      convention, for when you'd rather mount a secret as a file.
-  Share the target Google Sheet with that service account's email address
-  (found inside the JSON key as `client_email`) with Editor access -- the
-  API call fails otherwise, and that failure is caught and logged, not
-  swallowed silently.
-
-LOCAL / DEMO BEHAVIOR: if GOOGLE_SHEETS_SPREADSHEET_ID isn't set, every
-call below is a fast no-op that logs once and returns -- the rest of the
-pipeline (including the generic CRM_WEBHOOK_URL push) is completely
-unaffected. This is the same "optional, degrades to a no-op" pattern
-CRM_WEBHOOK_URL already uses.
-
-DISPOSITION: included as its own column, and this is the ONE place a
-freshly-computed disposition from post-call analysis becomes visible to a
-human outside the system -- see call_analytics.py, which only ever
-*upgrades* a null disposition from analysis, never overwrites one the live
-call already set via the enum-enforced set_disposition().
-
-IDEMPOTENCY: guarded by lead_state's existing crm_pushed flag (set by the
-caller in call_analytics.py) -- this module itself does not check it, to
-keep it a plain "append this row" primitive; the check belongs where the
-decision to call it is made.
+"""Finished-call Sheets export, driven by leads.outbox's durable call_sheet_exports queue.
+Existing credentials only. Call-ID lookup reconciles retry-after-timeout before append.
+RAW values prevent formula injection from caller text. Verified row readback is the receipt.
+Single-process SQLite or PostgreSQL row locks required; Sheets has no atomic unique key.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import os
 from typing import Any
 
@@ -144,31 +107,51 @@ def _row_from(call: dict[str, Any], analysis: dict[str, Any]) -> list[Any]:
     return [values[c] for c in COLUMNS]
 
 
-def append_call_row(call: dict[str, Any], analysis: dict[str, Any] | None = None) -> bool:
-    """Appends one row for a finished call. Returns True on success, False
-    on any failure (including 'not configured') -- never raises, since a
-    Sheets outage must not be able to affect call teardown or crash the
-    fire-and-forget analytics task that calls this."""
+def append_call_row_verified(call: dict[str, Any], analysis: dict[str, Any] | None = None) -> dict:
+    call_id = str(call.get("call_id") or "")
+    if not call_id:
+        raise ValueError("Missing call_id")
     client = _get_client()
     if client is None:
-        return False
-
+        raise RuntimeError("Sheets not configured or credentials unavailable; inspect authentication log")
+    import gspread
+    sheet = client.open_by_key(SPREADSHEET_ID)
     try:
-        sheet = client.open_by_key(SPREADSHEET_ID)
-        try:
-            worksheet = sheet.worksheet(SHEET_NAME)
-        except Exception:
-            # First run: sheet tab doesn't exist yet -- create it with a
-            # header row rather than fail. Safe to run every time; gspread
-            # raises (caught above) if it already exists.
-            worksheet = sheet.add_worksheet(title=SHEET_NAME, rows=1000, cols=len(COLUMNS))
-            worksheet.append_row(COLUMNS)
+        worksheet = sheet.worksheet(SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        worksheet = sheet.add_worksheet(title=SHEET_NAME, rows=1000, cols=len(COLUMNS))
+        worksheet.append_row(COLUMNS, value_input_option="RAW")
+    if worksheet.row_values(1) != COLUMNS:
+        raise RuntimeError("Calls sheet header/order mismatch; expected " + repr(COLUMNS))
+    ids = worksheet.col_values(1)
+    if call_id in ids:
+        row = ids.index(call_id) + 1
+        values = worksheet.row_values(row)
+        if not values or values[0] != call_id:
+            raise RuntimeError("Existing row readback failed")
+        return {"call_id": call_id, "row": row, "status": "already_present", "verified": True}
+    # If append times out, the next attempt looks up call_id before appending again.
+    response = worksheet.append_row(_row_from(call, analysis or {}), value_input_option="RAW")
+    updated_range = (response or {}).get("updates", {}).get("updatedRange")
+    if not updated_range:
+        raise RuntimeError("Append response missing updatedRange; reconcile call_id on retry")
+    # Worksheet.get qualifies its own title. API updatedRange already has one.
+    relative_range = updated_range.rsplit("!", 1)[-1]
+    if not re.fullmatch(r"[A-Z]+[1-9]\d*(?::[A-Z]+[1-9]\d*)?", relative_range):
+        raise RuntimeError("Invalid append updatedRange; reconcile call_id on retry")
+    values = worksheet.get(relative_range)
+    if not values or not values[0] or str(values[0][0]) != call_id:
+        raise RuntimeError("Appended row readback failed; reconcile call_id on retry")
+    return {"call_id": call_id, "range": updated_range, "status": "appended", "verified": True}
 
-        worksheet.append_row(_row_from(call, analysis or {}), value_input_option="USER_ENTERED")
-        logger.info("[{}] Appended row to Google Sheet", call.get("call_id"))
+
+def append_call_row(call: dict[str, Any], analysis: dict[str, Any] | None = None) -> bool:
+    try:
+        receipt = append_call_row_verified(call, analysis)
+        logger.info("[{}] SHEETS_VERIFIED {}", call.get("call_id"), receipt)
         return True
-    except Exception as e:
-        logger.warning("[{}] Google Sheets append failed: {}", call.get("call_id"), e)
+    except Exception as exc:
+        logger.error("[{}] Sheets export failed: {}", call.get("call_id"), exc)
         return False
 
 

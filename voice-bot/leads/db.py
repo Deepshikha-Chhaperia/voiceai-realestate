@@ -107,3 +107,14 @@ async def init_models() -> None:
                         except Exception:
                             pass
         await conn.run_sync(_migrate)
+
+
+async def ensure_call_sheet_schema() -> None:
+    """Non-destructive, safe to rerun; bind matches the queue/session engine."""
+    from leads.models import CallSheetExport
+    from sqlalchemy import inspect
+    async with get_engine().begin() as conn:
+        await conn.run_sync(lambda c: CallSheetExport.__table__.create(c, checkfirst=True))
+        exists = await conn.run_sync(lambda c: inspect(c).has_table("call_sheet_exports"))
+        if not exists:
+            raise RuntimeError("call_sheet_exports was not created on the active Leads engine")

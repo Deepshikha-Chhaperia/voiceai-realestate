@@ -1,0 +1,15 @@
+{
+  "identity": {
+    "schema": 1,
+    "provider": "sarvam",
+    "model": "bulbul:v3",
+    "speaker": "pooja",
+    "language": "hi-IN",
+    "sample_rate": 16000,
+    "pace": 1.02,
+    "temperature": 0.6,
+    "text": "Haan, ek second, main check karti hoon.",
+    "api": "sarvam-rest"
+  },
+  "sha256": "c6271d5d07ce06226c7e370d7a9c174ed3d406b91bca9526019eed528fe4f488"
+}

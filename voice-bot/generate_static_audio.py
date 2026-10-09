@@ -1,6 +1,6 @@
 """
 Pre-generates static TTS audio files for high-frequency bot phrases
-using configured TTS provider (Sarvam bulbul:v3, voice: pooja, 8kHz mono PCM).
+using configured TTS provider (Sarvam bulbul:v3, voice: pooja, 16kHz mono PCM).
 
 Usage:
     cd voice-bot
@@ -10,7 +10,12 @@ Output: voice-bot/static_audio/india/*.wav
 """
 
 import asyncio
+import argparse
+import hashlib
+import json
+from call_repairs import SHORT_GOODBYE, FAQ_TEXTS
 import base64
+from call_repairs import CALL5_TEXTS, CALL7_TEXTS
 import os
 import sys
 import wave
@@ -20,11 +25,11 @@ import aiohttp
 import yaml
 from dotenv import load_dotenv
 
+from audio_provenance import PHRASES, effective_config, fresh_audio, write_provenance
+
 load_dotenv(Path(__file__).parent / ".env")
 
-CONFIG_PATH = Path(__file__).parent / "config.yaml"
-with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-    CONFIG = yaml.safe_load(f)
+CONFIG = effective_config(Path(__file__).parent)
 
 ACTIVE_TTS = CONFIG.get("active_providers", {}).get("tts", "sarvam")
 TTS_CONFIG = CONFIG.get("providers", {}).get("tts", {}).get(ACTIVE_TTS, {})
@@ -33,54 +38,17 @@ PARAMS = TTS_CONFIG.get("params", {})
 MODEL_ID = PARAMS.get("model", "bulbul:v3")
 VOICE_ID = PARAMS.get("voice_id", "pooja")
 LANGUAGE_CODE = PARAMS.get("language", "en-IN")
-SAMPLE_RATE = int(PARAMS.get("sample_rate", 8000))
+SAMPLE_RATE = 16000  # native browser rate; downsample only for 8k telephony
 SARVAM_API_KEY = os.getenv(TTS_CONFIG.get("api_key_env", "SARVAM_API_KEY"), "")
 
 OUTPUT_DIR = Path(__file__).parent / "static_audio"
 INDIA_DIR = OUTPUT_DIR / "india"
 
-PHRASES: dict[str, str] = {
-    # Outbound & Inbound Greetings
-    "greeting_alex": "Hi, am I speaking with Alex?",
-    "greeting_generic": "Hi, this is Ananya from Meridian Group. Is this a good time to talk?",
-    "inbound_greeting": "Hello, thank you for calling Meridian Group. How may I assist you today?",
-    "opening_intro": "Great, this is Ananya from Meridian Group. Are you looking for a 2 or 3 BHK?",
-
-    # Acknowledgments & Affirmations (English & Hindi)
-    "ack_sure": "Sure, absolutely.",
-    "ack_understood": "Understood.",
-    "ack_got_it": "Okay, got it.",
-    "ack_ji_bilkul": "Ji bilkul.",
-    "ack_haanji": "Haanji, bilkul.",
-    "ack_theek_hai": "Theek hai.",
-
-    # Clarifications & Repeats
-    "checkin_generic": "Hello? Are you still there?",
-    "clarify_repeat": "Sorry, I didn't catch that. Could you say that again?",
-    "clarify_repeat_hi": "Sorry, main sun nahi paayi. Kya aap repeat kar sakte hain?",
-    "clarify_property": "Hello? Are you looking for a property?",
-
-    # Common Objections & Closures
-    "objection_pivot": "Totally understand, is it the location, price, or just not the right time?",
-    "brochure_close": "Sure, our team will share the brochure and floor plans on WhatsApp shortly. Have a wonderful day!",
-    "visit_confirm": "Wonderful, I have noted your preference for the site visit.",
-    "transfer_announcement": "Please hold while I connect you to a senior property advisor.",
-
-    # Farewells
-    "final_farewell": "Understood, thanks for your time. Have a wonderful day!",
-    "farewell_polite": "Thank you for your time. Have a great day!",
-    "farewell_hi": "Dhanyavaad, aapka din shubh rahe!",
-
-    # Fillers (Slow-turn fallback)
-    "filler_en": "Sure, one moment, let me check that for you.",
-    "filler_hi": "Haan, ek second, main check karti hoon.",
-}
-
 
 async def synthesize_sarvam(
     session: aiohttp.ClientSession, text: str, phrase_key: str
 ) -> bytes | None:
-    """Call Sarvam REST TTS -> return raw 8kHz PCM bytes from WAV."""
+    """Call Sarvam REST TTS -> return native 16kHz PCM bytes from WAV."""
     url = "https://api.sarvam.ai/text-to-speech"
     headers = {
         "api-subscription-key": SARVAM_API_KEY,
@@ -94,9 +62,8 @@ async def synthesize_sarvam(
         "inputs": [text],
         "target_language_code": lang,
         "speaker": VOICE_ID,
-        "pitch": 0,
         "pace": float(PARAMS.get("pace", 1.02)),
-        "loudness": 1.5,
+        "temperature": float(PARAMS.get("temperature", 0.6)),
         "speech_sample_rate": SAMPLE_RATE,
         "enable_preprocessing": False,
         "model": MODEL_ID,
@@ -122,8 +89,29 @@ async def synthesize_sarvam(
         return None
 
 
+def validate_wav(path):
+    try:
+        with wave.open(str(path), "rb") as wav:
+            return wav.getnchannels() == 1 and wav.getsampwidth() == 2 and wav.getnframes() > 0 and wav.getframerate() in (8000, 16000, 22050, 24000, 44100, 48000)
+    except (OSError, wave.Error, EOFError):
+        return False
+
+
 async def main():
-    if not SARVAM_API_KEY:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--check-only", action="store_true", help="Validate WAVs without calling Sarvam")
+    parser.add_argument("--call3-only", action="store_true", help="Render only the four new call3 phrases")
+    parser.add_argument("--call5-only", action="store_true", help="Render only versioned call5 FAQ phrases")
+    parser.add_argument("--call7-only", action="store_true", help="Render only four new call7 operational phrases")
+    args = parser.parse_args()
+    phrases = {k: PHRASES[k] for k in ("short_goodbye", *FAQ_TEXTS)} if args.call3_only else PHRASES
+    if args.call5_only:
+        phrases = CALL5_TEXTS
+    if args.call7_only:
+        phrases = CALL7_TEXTS
+    if ACTIVE_TTS != "sarvam":
+        raise SystemExit("STOP: this generator supports Sarvam only; provider config was not changed")
+    if not args.check_only and not SARVAM_API_KEY:
         print("ERROR: SARVAM_API_KEY not found in environment/.env. Aborting.")
         sys.exit(1)
 
@@ -132,11 +120,15 @@ async def main():
     print(f"Output dir:  {INDIA_DIR}")
     print(f"Provider:    {ACTIVE_TTS} | Model: {MODEL_ID} | Voice: {VOICE_ID} | Sample Rate: {SAMPLE_RATE}Hz\n")
 
-    async with aiohttp.ClientSession() as session:
-        for key, text in PHRASES.items():
+    from contextlib import AsyncExitStack
+    async with AsyncExitStack() as stack:
+        session = None if args.check_only else await stack.enter_async_context(aiohttp.ClientSession())
+        for key, text in phrases.items():
             out_path = INDIA_DIR / f"{key}.wav"
-            if out_path.exists() and out_path.stat().st_size > 0:
+            if fresh_audio(out_path, key, text, CONFIG):
                 print(f"  [EXISTS] {out_path.name}")
+                continue
+            if args.check_only:
                 continue
             print(f"Synthesizing '{key}'...")
             print(f"  Text: {text}")
@@ -144,18 +136,25 @@ async def main():
             if wav_bytes:
                 with open(out_path, "wb") as f:
                     f.write(wav_bytes)
+                if validate_wav(out_path):
+                    write_provenance(out_path, key, text, CONFIG)
                 print(f"  [OK] Saved {out_path.name} ({len(wav_bytes) / 1024:.1f} KB)")
             else:
                 print(f"  [SKIP] '{key}' -- failed")
             print()
 
     print("--- Verification ---")
-    for key in PHRASES:
+    missing = []
+    for key in phrases:
         path = INDIA_DIR / f"{key}.wav"
-        status = "[OK]" if path.exists() else "[MISSING]"
+        if not fresh_audio(path, key, phrases[key], CONFIG):
+            missing.append(key)
+        status = "[OK]" if key not in missing else "[MISSING]"
         size = f"({path.stat().st_size / 1024:.1f} KB)" if path.exists() else ""
         print(f"  {status} {path.name} {size}")
 
+    if missing:
+        raise SystemExit("Audio preflight failed: " + ", ".join(missing))
 
 if __name__ == "__main__":
     asyncio.run(main())

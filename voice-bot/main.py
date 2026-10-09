@@ -146,8 +146,8 @@ async def lifespan(app: FastAPI):
 
     # Start outbox background worker
     try:
-        import leads.outbox
-        await leads.outbox.start_outbox_worker()
+        from leads import outbox as leads_outbox
+        await leads_outbox.start_outbox_worker()
         logger.info("Leads outbox worker started.")
     except Exception as e:
         logger.warning(f"Failed to start outbox worker: {e}")
@@ -174,8 +174,8 @@ async def lifespan(app: FastAPI):
     yield
     
     try:
-        import leads.outbox
-        await leads.outbox.stop_outbox_worker()
+        from leads import outbox as leads_outbox
+        await leads_outbox.stop_outbox_worker()
     except Exception:
         pass
     await CALL_MANAGER.close()

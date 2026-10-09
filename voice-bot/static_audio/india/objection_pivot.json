@@ -1,0 +1,15 @@
+{
+  "identity": {
+    "schema": 1,
+    "provider": "sarvam",
+    "model": "bulbul:v3",
+    "speaker": "pooja",
+    "language": "en-IN",
+    "sample_rate": 16000,
+    "pace": 1.02,
+    "temperature": 0.6,
+    "text": "Totally understand, is it the location, price, or just not the right time?",
+    "api": "sarvam-rest"
+  },
+  "sha256": "91d0b9d44016243284f0c168a6c6328d96df42e4f6e855a8c05269a8c4e62a78"
+}

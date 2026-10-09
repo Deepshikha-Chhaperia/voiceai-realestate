@@ -89,41 +89,7 @@ def write_report(
             else (metrics_summary.get("cost_usd") if metrics_summary else None)
         )
 
-        if cost_usd is None and messages:
-            # Fallback estimation using configured rates
-            try:
-                import yaml
-                base_cfg = {}
-                cfg_p = Path(__file__).parent / "config.yaml"
-                if cfg_p.exists():
-                    with open(cfg_p, "r", encoding="utf-8") as fp:
-                        base_cfg = yaml.safe_load(fp) or {}
-                rates = base_cfg.get("cost_rates", {})
-                stt_p = (call.get("stt_provider") or "sarvam").lower()
-                tts_p = (call.get("tts_provider") or "sarvam").lower()
-                llm_p = (call.get("llm_provider") or "groq").lower()
-
-                calc_dur = duration_s or 60.0
-                stt_rate = rates.get("stt", {}).get(stt_p, {}).get("per_second", 0.00008696)
-                tts_rate = rates.get("tts", {}).get(tts_p, {}).get("per_character", 0.00003131)
-                llm_rates = rates.get("llm", {}).get(llm_p, {}) or rates.get("llm", {}).get(f"{llm_p}:qwen/qwen3.8-27b", {})
-                p_rate = llm_rates.get("prompt_per_mtok", 0.80)
-                c_rate = llm_rates.get("completion_per_mtok", 4.00)
-
-                asst_chars = sum(len(str(m.get("content", ""))) for m in messages if m.get("role") == "assistant")
-                total_chars = sum(len(str(m.get("content", ""))) for m in messages)
-                c_toks = max(1, asst_chars // 4)
-                p_toks = max(1, 800 + (total_chars // 4))
-
-                stt_c = round(calc_dur * stt_rate, 6)
-                tts_c = round(asst_chars * tts_rate, 6)
-                llm_c = round((p_toks / 1_000_000 * p_rate) + (c_toks / 1_000_000 * c_rate), 6)
-                cost_usd = round(stt_c + tts_c + llm_c, 6)
-                if not cost_breakdown:
-                    cost_breakdown = {"stt": stt_c, "tts": tts_c, "llm": llm_c}
-            except Exception as exc:
-                logger.debug("Fallback cost calculation note: {}", exc)
-
+        # Do not synthesize heuristic token totals when native usage is missing.
         cost_inr = (cost_usd * USD_TO_INR) if cost_usd is not None else None
 
         cpm_str = "—"
@@ -197,7 +163,11 @@ def write_report(
             f"- **Duration:** {duration_s}s" if duration_s is not None else "- **Duration:** —",
             f"- **Campaign:** {call.get('campaign_id') or '—'}",
             f"- **Disposition:** `{disposition_val or 'INCOMPLETE'}`",
-            f"- **Avg voice-to-voice latency:** {avg_voice_latency or '—'} ms" + (f" (Announced-stop: {metrics_summary.get('avg_speech_stop_to_audio_ms', '—')} ms | Final-transcript: {metrics_summary.get('avg_transcript_to_audio_ms', '—')} ms)" if metrics_summary and (metrics_summary.get('avg_speech_stop_to_audio_ms') or metrics_summary.get('avg_transcript_to_audio_ms')) else ""),
+            f"- **Avg voice-to-voice latency:** {avg_voice_latency or '—'} ms" + (f" (Live commit anchor: {metrics_summary.get('avg_speech_stop_to_audio_ms', '—')} ms | Final-transcript: {metrics_summary.get('avg_transcript_to_audio_ms', '—')} ms)" if metrics_summary and (metrics_summary.get('avg_speech_stop_to_audio_ms') or metrics_summary.get('avg_transcript_to_audio_ms')) else ""),
+            f"- **Received END_SPEECH to server first output (live only):** {(metrics_summary or {}).get('avg_end_speech_to_audio_ms', 'unavailable')} ms. Not physical ear-to-ear; excludes client/network playback.",
+            f"- **Latency samples:** live={(metrics_summary or {}).get('latency_live_count', 'unavailable')}, transcript={(metrics_summary or {}).get('latency_transcript_count', 'unavailable')}, cached separate={(metrics_summary or {}).get('cached_answer_count', 'unavailable')}",
+            "- **Cost scope:** live pipeline only. Excludes LLM prewarm, post-call analysis, offline cache generation, telephony and taxes. Not an invoice.",
+            f"- **LLM usage:** {(metrics_summary or {}).get('llm_usage_source', 'unavailable')}; total partial={(metrics_summary or {}).get('cost_is_partial', True)}",
             f"- **Median voice-to-voice latency:** {median_voice_latency or '—'} ms",
             f"- **P90 voice-to-voice latency:** {p90_voice_latency or '—'} ms",
             f"- **Latency split:** STT Final: {avg_stt_final or '—'} ms | LLM TTFT: {avg_llm_ttft or '—'} ms | TTS TTFA: {ttfa_display}",
@@ -208,9 +178,24 @@ def write_report(
             f"- **Blended CPM (Cost per Minute):** {cpm_str}",
         ]
 
+        prepared = (lead_memory or {}).get('_manual_whatsapp_output') or {}
+        if prepared.get('text'):
+            lines += ['', '## WhatsApp message for manual forwarding',
+                      'Prepared only. Not sent. Review the lead/recipient before forwarding.', '',
+                      '```text', prepared['text'], '```']
+            if prepared.get('blockers'):
+                lines += ['', 'DO NOT FORWARD YET: missing verified details']
+                lines += ['- ' + b for b in prepared['blockers']]
+            REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+            draft_path = REPORTS_DIR / (re.sub(r'[^a-zA-Z0-9_-]', '_', call_id) + '_whatsapp.txt')
+            if prepared.get('blockers'):
+                draft_path.unlink(missing_ok=True)  # never leave an older send-ready draft
+            if not prepared.get('blockers'):
+                (REPORTS_DIR / (re.sub(r'[^a-zA-Z0-9_-]', '_', call_id) + '_whatsapp.txt')).write_text(prepared['text'], encoding='utf-8')
+
         if cost_breakdown:
             lines.append("")
-            lines.append("## Cost breakdown (Entire call total)")
+            lines.append("## Cost breakdown (Live pipeline only)")
             llm_c = float(cost_breakdown.get("llm", 0.0))
             stt_c = float(cost_breakdown.get("stt", 0.0))
             tts_c = float(cost_breakdown.get("tts", 0.0))
@@ -270,7 +255,7 @@ def write_report(
                 if k not in ("llm", "stt", "tts", "stt_provider", "tts_provider", "llm_provider"):
                     v_val = float(v) if isinstance(v, (int, float, str)) and str(v).replace(".", "").isdigit() else 0.0
                     lines.append(f"- **{k}:** ₹{(v_val * USD_TO_INR):.4f} (${v_val:.6f})")
-            lines.append(f"- **Total Estimated Cost (Entire call):** ₹{total_inr:.4f} (${total_c:.6f})")
+            lines.append(f"- **Total Estimated Cost (Live pipeline only):** ₹{total_inr:.4f} (${total_c:.6f})")
 
         analysis = json.loads(call.get("analysis_json") or "{}")
         if analysis and any(analysis.values()):

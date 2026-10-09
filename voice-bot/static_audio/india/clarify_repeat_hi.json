@@ -1,0 +1,15 @@
+{
+  "identity": {
+    "schema": 1,
+    "provider": "sarvam",
+    "model": "bulbul:v3",
+    "speaker": "pooja",
+    "language": "hi-IN",
+    "sample_rate": 16000,
+    "pace": 1.02,
+    "temperature": 0.6,
+    "text": "Sorry, main sun nahi paayi. Kya aap repeat kar sakte hain?",
+    "api": "sarvam-rest"
+  },
+  "sha256": "6a12e4b13dea377cfc147aba46981307ba2fc40693581b53a55a9710a272a514"
+}

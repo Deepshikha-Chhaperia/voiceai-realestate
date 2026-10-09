@@ -1,3 +1,4 @@
+from pathlib import Path
 """
 Comprehensive tests for 4 production fixes and 4-call suite scenarios:
 1. Fix 1: Endpointing with DebouncedExternalUserTurnStopStrategy (~200ms).
@@ -98,7 +99,7 @@ async def test_fix1_debounced_stop_strategy_params():
 # ==============================================================================
 
 @pytest.mark.asyncio
-async def test_fix2_silence_messages_and_cache_match():
+async def test_fix2_silence_messages_and_cache_match(tmp_path, monkeypatch):
     # Verify the 3 phrases used in SilenceChecker exist in audio cache
     nudge1 = "Hello? Are you still there?"
     nudge2 = "Sorry, I didn't catch that. Could you say that again?"
@@ -108,9 +109,22 @@ async def test_fix2_silence_messages_and_cache_match():
     assert _match_cached_phrase(nudge2) == "clarify_repeat"
     assert _match_cached_phrase(goodbye) == "final_farewell"
 
-    assert "checkin_generic" in _AUDIO_CACHE[16000]
-    assert "clarify_repeat" in _AUDIO_CACHE[16000]
-    assert "final_farewell" in _AUDIO_CACHE[16000]
+    import bot
+    import wave
+    from audio_provenance import PHRASES, effective_config, write_provenance
+    root = tmp_path
+    (root / 'config.yaml').write_text((Path(bot.__file__).parent / 'config.yaml').read_text())
+    cfg = effective_config(root)
+    directory = root / 'static_audio' / 'india'
+    directory.mkdir(parents=True)
+    for key in ('checkin_generic', 'clarify_repeat', 'final_farewell'):
+        path = directory / (key + '.wav')
+        with wave.open(str(path), 'wb') as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000); w.writeframes(b'\0\0' * 200)
+        write_provenance(path, key, PHRASES[key], cfg)
+    monkeypatch.setattr(bot, '__file__', str(root / 'bot.py'))
+    verified = bot._load_audio_cache()
+    assert all(key in verified[16000] for key in ('checkin_generic', 'clarify_repeat', 'final_farewell'))
 
 
 @pytest.mark.asyncio

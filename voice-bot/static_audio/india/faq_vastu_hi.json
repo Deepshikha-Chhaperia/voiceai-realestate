@@ -1,0 +1,15 @@
+{
+  "identity": {
+    "schema": 1,
+    "provider": "sarvam",
+    "model": "bulbul:v3",
+    "speaker": "pooja",
+    "language": "hi-IN",
+    "sample_rate": 16000,
+    "pace": 1.02,
+    "temperature": 0.6,
+    "text": "Haan, project hundred percent Vastu compliant hai, East ya North entry ke saath.",
+    "api": "sarvam-rest"
+  },
+  "sha256": "05baf86540f9454e533933db3b110b777ea1e8e22f0849ba436a5e2a8772ea40"
+}

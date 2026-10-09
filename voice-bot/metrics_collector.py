@@ -69,9 +69,12 @@ class CallMetricsCollector(FrameProcessor):
         self._voice_latencies_ms: list[float] = []
         self._live_voice_latencies_ms: list[float] = []   # FIX D: excludes cached-audio turns
         self._transcript_voice_latencies_ms: list[float] = []   # Anchor A: final transcript -> audio
-        self._speech_stop_voice_latencies_ms: list[float] = []  # Anchor B: announced stop -> audio
+        self._speech_stop_voice_latencies_ms: list[float] = []  # Anchor B: turn committed -> audio (HEADLINE, = Oct 4 definition)
+        self._end_speech_voice_latencies_ms: list[float] = []   # Anchor C: STT END_SPEECH -> audio (caller-felt)
+        self._cached_response_pending = False
         self._cached_audio_turns: int = 0                  # FIX D: turns served by cached audio
         self._llm_ttft_ms: list[float] = []
+        self._tts_raw_ttfa_ms: list[float] = []
         self._tts_ttfa_ms: list[float] = []
         self._cached_ttfa_ms: list[float] = []
         self._tts_silence_trimmed_ms: list[float] = []
@@ -120,6 +123,9 @@ class CallMetricsCollector(FrameProcessor):
         self._cached_answer_sent_at: float | None = None
         self._cached_answer_key: str = ""
         self._generation_silence_trimmed: dict[int, float] = {}
+        self._missing_native_usage_requests = 0
+        self._billed_usage_ids = set()
+        self._billed_usage_objects = []
         self._provider_llm_tokens: dict[str, dict[str, int]] = {}
         self._turn_stop_sources: list[str] = []
 
@@ -129,17 +135,23 @@ class CallMetricsCollector(FrameProcessor):
         model: str,
         prompt_tokens: int,
         completion_tokens: int,
+        usage_object: Any = None,
     ) -> None:
-        """Record token usage attributed to the provider that actually answered."""
+        """Record native usage once; identical metrics objects can traverse the pipeline again."""
+        if usage_object is not None:
+            if id(usage_object) in self._billed_usage_ids:
+                return
+            self._billed_usage_ids.add(id(usage_object))
+            self._billed_usage_objects.append(usage_object)
         self._totals["llm_prompt_tokens"] += prompt_tokens
         self._totals["llm_completion_tokens"] += completion_tokens
         if model:
             self._llm_models_used.add(model)
         if provider:
-            if provider not in self._provider_llm_tokens:
-                self._provider_llm_tokens[provider] = {"prompt": 0, "completion": 0}
-            self._provider_llm_tokens[provider]["prompt"] += prompt_tokens
-            self._provider_llm_tokens[provider]["completion"] += completion_tokens
+            if provider + ":" + model not in self._provider_llm_tokens:
+                self._provider_llm_tokens[provider + ":" + model] = {"prompt": 0, "completion": 0}
+            self._provider_llm_tokens[provider + ":" + model]["prompt"] += prompt_tokens
+            self._provider_llm_tokens[provider + ":" + model]["completion"] += completion_tokens
         self._log(
             "llm_token_usage",
             turn=self._turn_index,
@@ -164,7 +176,7 @@ class CallMetricsCollector(FrameProcessor):
         self._cached_answer_pending = True
         self._cached_answer_key = phrase_key
         self._cached_answer_sent_at = time.monotonic()
-        self._cache_hits += 1
+        # Fast-path text dispatch is not an audio hit. PCM playback records it once.
 
     def record_provider_failure(
         self,
@@ -216,6 +228,7 @@ class CallMetricsCollector(FrameProcessor):
         self._cached_ttfa_ms.append(0.0)
         # FIX D: cached audio turns are tracked separately; do NOT add to _live_voice_latencies_ms
         self._cached_audio_turns += 1
+        self._cached_response_pending = True
         self._log(
             "tts_cached_audio_ttfa",
             turn=self._turn_index,
@@ -313,22 +326,40 @@ class CallMetricsCollector(FrameProcessor):
                     key=self._cached_answer_key,
                     latency_ms=round(cached_latency_ms, 1),
                 )
+                self._cached_response_pending = False
+                self._voice_to_voice_logged_this_turn = True
+                self._last_transcript_at = None
+                self._speech_stop_at = None
+            elif self._cached_response_pending:
+                self._cached_response_pending = False
+                self._voice_to_voice_logged_this_turn = True
+                self._last_transcript_at = None
+                self._speech_stop_at = None
             elif (
                 (self._last_transcript_at is not None or self._user_stopped_speaking_at is not None)
                 and not self._voice_to_voice_logged_this_turn
             ):
                 now = time.monotonic()
-                ref_time = self._last_transcript_at if self._last_transcript_at is not None else self._user_stopped_speaking_at
+                # HEADLINE ANCHOR (same definition as the Oct 4 / 543ms measurement):
+                # turn committed (UserStoppedSpeakingFrame) -> first bot audio.
+                # Falls back to the final-transcript time only if no turn-stop was seen.
+                ref_time = self._user_stopped_speaking_at if self._user_stopped_speaking_at is not None else self._last_transcript_at
                 latency_ms = (now - ref_time) * 1000
                 self._voice_to_voice_logged_this_turn = True
 
+                # Extra anchors, logged for comparison but NOT used in the headline average:
+                #   transcript : final STT transcript   -> first bot audio  (includes the endpoint debounce wait)
+                #   end_speech : STT END_SPEECH signal  -> first bot audio  (closest to what the caller feels)
                 transcript_lat_ms = (now - self._last_transcript_at) * 1000 if self._last_transcript_at is not None else None
                 speech_stop_lat_ms = (now - self._user_stopped_speaking_at) * 1000 if self._user_stopped_speaking_at is not None else None
+                end_speech_lat_ms = (now - self._speech_stop_at) * 1000 if self._speech_stop_at is not None else None
 
                 if transcript_lat_ms is not None and transcript_lat_ms > 0:
                     self._transcript_voice_latencies_ms.append(transcript_lat_ms)
                 if speech_stop_lat_ms is not None and speech_stop_lat_ms > 0:
                     self._speech_stop_voice_latencies_ms.append(speech_stop_lat_ms)
+                if end_speech_lat_ms is not None and end_speech_lat_ms > 0:
+                    self._end_speech_voice_latencies_ms.append(end_speech_lat_ms)
 
                 if latency_ms > 0:
                     self._voice_latencies_ms.append(latency_ms)
@@ -338,9 +369,14 @@ class CallMetricsCollector(FrameProcessor):
                         "voice_to_voice_latency",
                         turn=self._turn_index,
                         latency_ms=round(latency_ms, 1),
+                        anchor="turn_commit",
                         transcript_anchor_ms=round(transcript_lat_ms, 1) if transcript_lat_ms else None,
                         speech_stop_anchor_ms=round(speech_stop_lat_ms, 1) if speech_stop_lat_ms else None,
+                        end_speech_anchor_ms=round(end_speech_lat_ms, 1) if end_speech_lat_ms else None,
                     )
+                # Clear per-turn anchors so a stale value can never leak into the next turn.
+                self._last_transcript_at = None
+                self._speech_stop_at = None
 
         elif isinstance(frame, InterruptionFrame):
             self._totals["interruptions"] += 1
@@ -441,6 +477,8 @@ class CallMetricsCollector(FrameProcessor):
             trim_reduction = max(0.0, leading_silence - 0.020)
             ttfa_post_trim = max(0.0, ttfa_raw - trim_reduction) if ttfa_raw is not None else None
 
+            if ttfa_raw is not None:
+                self._tts_raw_ttfa_ms.append(round(ttfa_raw * 1000, 1))
             if ttfa_post_trim is not None:
                 self._tts_ttfa_ms.append(round(ttfa_post_trim * 1000, 1))
             self._log(
@@ -482,20 +520,10 @@ class CallMetricsCollector(FrameProcessor):
             prompt_tokens = getattr(usage, "prompt_tokens", None)
             completion_tokens = getattr(usage, "completion_tokens", None)
             cache_read = getattr(usage, "cache_read_input_tokens", None)
-            self._totals["llm_prompt_tokens"] += prompt_tokens or 0
-            self._totals["llm_completion_tokens"] += completion_tokens or 0
+            self.record_llm_token_usage(self._llm_provider, model_name or "unknown",
+                prompt_tokens or 0, completion_tokens or 0, usage_object=usage)
             if model_name:
                 self._llm_models_used.add(model_name)
-            self._log(
-                "llm_token_usage",
-                turn=self._turn_index,
-                processor=processor_name,
-                model=model_name,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                # Prompt cache read tokens if supported by provider
-                cache_read_input_tokens=cache_read,
-            )
 
         elif isinstance(metrics_data, STTUsageMetricsData):
             audio_seconds = getattr(metrics_data.value, "audio_seconds", None)
@@ -624,14 +652,6 @@ class CallMetricsCollector(FrameProcessor):
         if self._totals.get("tts_characters", 0) <= 0 and asst_chars > 0:
             self._totals["tts_characters"] = asst_chars
 
-        if self._totals.get("llm_completion_tokens", 0) <= 0 and asst_chars > 0:
-            # Heuristic: ~4 chars per token for completions
-            self._totals["llm_completion_tokens"] = max(1, asst_chars // 4)
-
-        if self._totals.get("llm_prompt_tokens", 0) <= 0 and all_chars > 0:
-            # Heuristic: base prompt (~800 tokens) + turn context
-            self._totals["llm_prompt_tokens"] = max(1, 800 + (all_chars // 4))
-
         if self._totals.get("stt_audio_seconds", 0.0) <= 0.0:
             self._totals["stt_audio_seconds"] = max(0.0, time.monotonic() - self._call_start)
 
@@ -648,7 +668,8 @@ class CallMetricsCollector(FrameProcessor):
         if self._provider_llm_tokens:
             total_llm_cost = 0.0
             for p_name, p_toks in self._provider_llm_tokens.items():
-                p_rates = self._rate_for(rates.get("llm", {}), {p_name}, p_name)
+                provider, model = p_name.split(":", 1)
+                p_rates = self._rate_for(rates.get("llm", {}), {model}, provider)
                 if p_rates:
                     p_cost = (
                         (p_toks.get("prompt", 0) / 1_000_000) * p_rates.get("prompt_per_mtok", 0)
@@ -657,17 +678,6 @@ class CallMetricsCollector(FrameProcessor):
                     total_llm_cost += p_cost
             if total_llm_cost > 0:
                 breakdown["llm"] = round(total_llm_cost, 6)
-        else:
-            llm_rates = self._rate_for(rates.get("llm", {}), self._llm_models_used, self._llm_provider)
-            if llm_rates:
-                prompt_cost = (
-                    self._totals["llm_prompt_tokens"] / 1_000_000
-                ) * llm_rates.get("prompt_per_mtok", 0)
-                completion_cost = (
-                    self._totals["llm_completion_tokens"] / 1_000_000
-                ) * llm_rates.get("completion_per_mtok", 0)
-                breakdown["llm"] = round(prompt_cost + completion_cost, 6)
-
         stt_seconds = self._totals.get("stt_audio_seconds", 0.0)
         if stt_seconds <= 0.0:
             stt_seconds = max(0.0, time.monotonic() - self._call_start)
@@ -722,8 +732,8 @@ class CallMetricsCollector(FrameProcessor):
             else None
         )
         avg_tts_ttfa_raw = (
-            round(sum(self._tts_ttfa_ms) / len(self._tts_ttfa_ms), 1)
-            if self._tts_ttfa_ms
+            round(sum(self._tts_raw_ttfa_ms) / len(self._tts_raw_ttfa_ms), 1)
+            if self._tts_raw_ttfa_ms
             else None
         )
         avg_saved_silence = (
@@ -732,8 +742,8 @@ class CallMetricsCollector(FrameProcessor):
             else 0.0
         )
         avg_tts_ttfa_effective = (
-            round(max(0.0, avg_tts_ttfa_raw - avg_saved_silence), 1)
-            if avg_tts_ttfa_raw is not None
+            round(sum(self._tts_ttfa_ms) / len(self._tts_ttfa_ms), 1)
+            if self._tts_ttfa_ms
             else None
         )
 
@@ -773,12 +783,29 @@ class CallMetricsCollector(FrameProcessor):
             else None
         )
 
+        avg_end_speech_to_audio = (
+            round(sum(self._end_speech_voice_latencies_ms) / len(self._end_speech_voice_latencies_ms), 1)
+            if self._end_speech_voice_latencies_ms
+            else None
+        )
+
         return {
             # FIX D: headline = live turns only; overall = all turns
+            "latency_cohort": "live_responses_only",
+            "latency_live_count": len(self._live_voice_latencies_ms),
+            "latency_transcript_count": len(self._transcript_voice_latencies_ms),
+            "latency_end_speech_count": len(self._end_speech_voice_latencies_ms),
+            "cost_scope": "live_pipeline_only",
+            "cost_excludes": ["llm_prewarm", "post_call_analysis", "offline_cache_generation", "telephony", "taxes"],
+            "whole_call_cost_is_partial": True,
+            "llm_usage_source": "native" if self._provider_llm_tokens else "unavailable",
+            "cost_is_partial": not bool(self._provider_llm_tokens) or self._missing_native_usage_requests > 0,
+            "missing_native_usage_requests": self._missing_native_usage_requests,
             "avg_voice_latency_ms": headline_avg_latency if headline_avg_latency is not None else avg_latency,
             "avg_voice_latency_all_ms": avg_latency,
             "avg_transcript_to_audio_ms": avg_transcript_to_audio,
             "avg_speech_stop_to_audio_ms": avg_speech_stop_to_audio,
+            "avg_end_speech_to_audio_ms": avg_end_speech_to_audio,
             "median_voice_latency_ms": median_latency,
             "p90_voice_latency_ms": p90_latency,
             "avg_llm_ttft_ms": avg_llm_ttft,

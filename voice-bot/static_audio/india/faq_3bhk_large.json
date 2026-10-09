@@ -1,0 +1,15 @@
+{
+  "identity": {
+    "schema": 1,
+    "provider": "sarvam",
+    "model": "bulbul:v3",
+    "speaker": "pooja",
+    "language": "en-IN",
+    "sample_rate": 16000,
+    "pace": 1.02,
+    "temperature": 0.6,
+    "text": "The larger three BHK has a study and two balconies, with nineteen twenty to twenty one hundred square feet, from one point seven crore.",
+    "api": "sarvam-rest"
+  },
+  "sha256": "18f74e6a4ca48257cf066bb6c04b799ee5467f15acc1859a439200ff9cf32327"
+}

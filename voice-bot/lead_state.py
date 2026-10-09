@@ -318,10 +318,9 @@ def infer_deterministic_disposition(
         has_date_time and any(aff in user_text for aff in ("yes", "sure", "okay", "ok", "theek hai", "chalega", "done"))
     )
 
-    if ("confirmed" in sv_mem or "scheduled" in sv_mem or user_affirmed_visit) and "decline" not in sv_mem:
-        # If user had a refusal, only accept booking if they explicitly affirmed/booked afterwards
-        if not has_user_refusal or user_affirmed_visit:
-            return Disposition.SITE_VISIT_BOOKED.value
+    # Only the DB-verified booking tool sets this marker. Date/time intent is not a reservation.
+    if mem.get("disposition") == Disposition.SITE_VISIT_BOOKED.value and "confirmed" in sv_mem:
+        return Disposition.SITE_VISIT_BOOKED.value
 
     # 5. Callback Requested or Busy Right Now
     has_explicit_callback = any(
@@ -369,7 +368,8 @@ def infer_deterministic_disposition(
 
     # 7. Site Visit Requested (interest expressed without finalized slot)
     if (
-        "tentative" in sv_mem
+        user_affirmed_visit or has_date_time
+        or "tentative" in sv_mem
         or "interested" in sv_mem
         or any(k in user_text for k in ("site visit", "visit the property", "make a site visit", "come and see"))
     ):
@@ -470,7 +470,7 @@ def finalize_call(call_id: str, analysis: dict[str, Any] | None = None) -> None:
                 (Disposition.INCOMPLETE.value, call_id),
             )
         cur.execute(
-            f"UPDATE calls SET ended_at = {_ph(1)}, analysis_json = {_ph(1)} WHERE call_id = {_ph(1)}",
+            f"UPDATE calls SET ended_at = COALESCE(ended_at, {_ph(1)}), analysis_json = COALESCE({_ph(1)}, analysis_json) WHERE call_id = {_ph(1)}",
             (time.time(), json.dumps(analysis) if analysis else None, call_id),
         )
 

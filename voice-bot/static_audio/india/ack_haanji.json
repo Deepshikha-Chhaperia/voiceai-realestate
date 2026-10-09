@@ -1,0 +1,15 @@
+{
+  "identity": {
+    "schema": 1,
+    "provider": "sarvam",
+    "model": "bulbul:v3",
+    "speaker": "pooja",
+    "language": "hi-IN",
+    "sample_rate": 16000,
+    "pace": 1.02,
+    "temperature": 0.6,
+    "text": "Haanji, bilkul.",
+    "api": "sarvam-rest"
+  },
+  "sha256": "4396afd60ccf30e71f07eff899999681674e7d2f0fdb098174dfdd8f37a010e5"
+}

@@ -334,13 +334,13 @@ async def enqueue_process_new_lead(lead_id: str):
         asyncio.create_task(process_new_lead({}, lead_id))
 
 
-async def enqueue_on_call_finished(call_id: str):
+async def enqueue_on_call_finished(call_id: str, messages: list[dict] | None = None):
     pool = await get_arq_pool()
     if pool:
-        await pool.enqueue_job("on_call_finished", call_id)
+        await pool.enqueue_job("on_call_finished", call_id, messages)
     else:
         import asyncio
-        asyncio.create_task(on_call_finished({}, call_id))
+        asyncio.create_task(on_call_finished({}, call_id, messages))
 
 
 def is_within_calling_hours(tz_name: str = "Asia/Kolkata", start_str: str = "09:00", end_str: str = "21:00") -> bool:
@@ -423,11 +423,11 @@ async def process_new_lead(ctx: dict, lead_id: str) -> None:
             raise
 
 
-async def on_call_finished(ctx: dict, call_id: str) -> None:
+async def on_call_finished(ctx: dict, call_id: str, messages: list[dict] | None = None) -> None:
     """Post-call analytics, scoring, retry scheduling, and notification job."""
     logger.info("Executing on_call_finished for call_id={}", call_id)
     from call_analytics import analyze_call
-    analysis_data = await analyze_call(call_id)
+    analysis_data = await analyze_call(call_id, messages)
     if not analysis_data:
         logger.warning("No analysis generated for call_id={}", call_id)
         return
@@ -435,6 +435,8 @@ async def on_call_finished(ctx: dict, call_id: str) -> None:
     analysis = analysis_data.get("analysis", {})
     call_record = analysis_data.get("call", {})
     disposition = call_record.get("disposition") or analysis.get("disposition")
+    if analysis.get("visit_intent") == "booked" and disposition != "SITE_VISIT_BOOKED":
+        analysis["visit_intent"] = "requested"
 
     # Enrich analysis with captured lead fields from call working memory
     lead_fields = json.loads(call_record.get("lead_fields") or "{}") if isinstance(call_record.get("lead_fields"), str) else (call_record.get("lead_fields") or {})
@@ -443,7 +445,7 @@ async def on_call_finished(ctx: dict, call_id: str) -> None:
             if k not in analysis or not analysis[k]:
                 analysis[k] = v
         if "site_visit" in lead_fields and not analysis.get("visit_intent"):
-            analysis["visit_intent"] = "booked" if any(w in str(lead_fields["site_visit"]).lower() for w in ("confirm", "saturday", "sunday", "morning", "evening", ":")) else "requested"
+            analysis["visit_intent"] = "booked" if disposition == "SITE_VISIT_BOOKED" else "requested"
 
     dur = float(call_record.get("duration", 0.0))
     if dur <= 0.0 and call_record.get("ended_at") and call_record.get("started_at"):
@@ -475,12 +477,7 @@ async def on_call_finished(ctx: dict, call_id: str) -> None:
             res = await session.execute(stmt)
             lead = res.scalar_one_or_none()
 
-        # Fallback for demo web test calls: find the most recent active/pending lead
-        if not lead:
-            stmt = select(Lead).where(Lead.status.in_(["pending", "contacting", "new"])).options(selectinload(Lead.project)).order_by(Lead.created_at.desc()).limit(1)
-            res = await session.execute(stmt)
-            lead = res.scalar_one_or_none()
-
+        # Never attach this call to an arbitrary recent lead.
         if not lead:
             logger.info("No corresponding lead row found for call_id={}", call_id)
             return
@@ -595,7 +592,7 @@ async def on_call_finished(ctx: dict, call_id: str) -> None:
             )
 
         # Queue Outbox Items (Sheets & Webhook)
-        await queue_outbox_item(lead.id, "sheets", call_record, session=session)
+        # Finished-call Sheets queue is independent of this scoring/lead transaction.
         await queue_outbox_item(lead.id, "webhook", {"lead_id": str(lead.id), "analysis": analysis, "score": lead_score}, session=session)
 
     # Drain pending outbox tasks

@@ -118,9 +118,10 @@ from services.vobiz_serializer import VobizFrameSerializer
 from services.web_serializer import WebPCMFrameSerializer
 from metrics_collector import CallMetricsCollector
 
-import call_analytics
 import lead_state
 import local_test_report
+from call_repairs import (SHORT_GOODBYE, FAQ_TEXTS, valid_transcript, terminal_answer, faq_key,
+                          brochure_payload, finish_brochure, queue_goodbye, TTSStallState, explicit_caller_name, clarification_for, unambiguous_visit_time, pure_farewell, CALL5_TEXTS, campaign_faq, genuine_late_question, brochure_decision, safe_tts_text, fragment_transcript, whatsapp_answer, CALL7_TEXTS, visit_time, visit_intent, whatsapp_ready, postcall_whatsapp_plan, manual_whatsapp_message, record_manual_whatsapp, closing_after_work)
 from stall_watchdog import StallWatchdog, ProviderErrorMonitor
 
 
@@ -541,6 +542,40 @@ def _attach_resilient_failover(service: Any, provider_name: str, config: dict) -
     if hasattr(service, "_client") and hasattr(service._client, "max_retries"):
         service._client.max_retries = 0
 
+    # BACKUP MODEL (second Groq model, same Groq key/client). Config key is optional:
+    #   llm_backup_groq_model: "llama-3.3-70b-versatile"   (set to "" to disable)
+    backup_model = str(
+        (config or {}).get("llm_backup_groq_model", "") or ""
+    ).strip()
+    primary_model = str(getattr(getattr(service, "_settings", None), "model", "") or "")
+    has_backup = bool(
+        provider_name == "groq"
+        and backup_model
+        and backup_model != primary_model
+        and hasattr(service, "_client")
+        and hasattr(service, "build_chat_completion_params")
+    )
+
+    async def _open_backup_stream(context: Any):
+        """Open a stream on the backup Groq model. Returns (iterator, first_chunk)."""
+        from pipecat.utils.types import assert_given
+
+        adapter = service.get_llm_adapter()
+        params_from_context = adapter.get_llm_invocation_params(
+            context,
+            system_instruction=assert_given(service._settings.system_instruction),
+            convert_developer_to_user=not service.supports_developer_role,
+        )
+        params = service.build_chat_completion_params(params_from_context)
+        params["model"] = backup_model
+        # reasoning_effort is a Qwen/gpt-oss option; Llama models reject it with a 400.
+        params.pop("reasoning_effort", None)
+        params.pop("service_tier", None)
+        stream = await asyncio.wait_for(service._client.chat.completions.create(**params), timeout=3.0)
+        it = stream.__aiter__()
+        first = await asyncio.wait_for(it.__anext__(), timeout=3.0)
+        return it, first
+
     def _extract_err_details(exc: Exception) -> tuple[str, str]:
         cls_name = type(exc).__name__
         detail = str(exc) if str(exc).strip() else repr(exc)
@@ -566,7 +601,16 @@ def _attach_resilient_failover(service: Any, provider_name: str, config: dict) -
             iter_stream = None
 
             call_metrics = getattr(context, "call_metrics", None) or getattr(service, "_call_metrics", None)
-            lead_mem = getattr(context, "lead_memory", None) or getattr(service, "_lead_memory", None)
+            lead_mem = getattr(context, "lead_memory", None)
+            if lead_mem is None:
+                lead_mem = getattr(service, "_lead_memory", None)
+            msgs = getattr(context, "messages", []) or []
+
+            if isinstance(msgs, list):
+                msgs[:] = [m for m in msgs if not (m.get("role") == "assistant" and any(p in str(m.get("content", "")) for p in (
+                    "I've noted your preference. Let me check the details for you.",
+                    "I'm having connection trouble. Please give me a moment.",
+                    "The connection is still unavailable. Please try this call again later.")))]
 
             # Circuit breaker: if primary failed earlier this call, skip Groq for circuit duration
             now_mono = time.monotonic()
@@ -574,7 +618,7 @@ def _attach_resilient_failover(service: Any, provider_name: str, config: dict) -
             skip_until = float(skip_val) if isinstance(skip_val, (int, float)) else 0.0
             if now_mono < skip_until:
                 logger.info(
-                    "[LLM Skip] Primary provider '{}' failed earlier this call; skipping for {:.1f}s more and using recovery line directly",
+                    "[LLM Skip] Primary provider '{}' failed earlier this call; skipping for {:.1f}s more and using backup model / recovery line directly",
                     provider_name,
                     skip_until - now_mono,
                 )
@@ -615,7 +659,7 @@ def _attach_resilient_failover(service: Any, provider_name: str, config: dict) -
                             except (ValueError, IndexError):
                                 pass
 
-                        if is_429 and retry_val is not None and retry_val <= 2.0:
+                        if is_429 and retry_val is not None and retry_val <= 2.0 and not has_backup:
                             logger.warning(
                                 "[LLM 429] Provider '{}' hit 429 with retry-after={:.1f}s <= 2.0s; waiting and retrying once...",
                                 provider_name,
@@ -661,7 +705,7 @@ def _attach_resilient_failover(service: Any, provider_name: str, config: dict) -
                                 service._skip_primary_until = time.monotonic() + 60.0
                                 primary_failed = True
                         else:
-                            skip_dur = min(60.0, max(10.0, retry_val)) if (is_429 and retry_val is not None) else 60.0
+                            skip_dur = min(60.0, max(0.25, retry_val)) if (is_429 and retry_val is not None) else 60.0
                             service._skip_primary_until = time.monotonic() + skip_dur
                             logger.warning(
                                 "[LLM Failover] Primary LLM provider '{}' first token failed/timed out after {}ms ({}); skipping primary for {:.1f}s...",
@@ -679,13 +723,16 @@ def _attach_resilient_failover(service: Any, provider_name: str, config: dict) -
 
                     is_429 = "429" in err_str or "ratelimit" in err_str.lower()
                     retry_val = None
+                    prose_retry = re.search(r"try again in ([0-9.]+)s", err_str)
+                    if prose_retry:
+                        retry_val = float(prose_retry.group(1))
                     if "retry-after=" in err_str:
                         try:
                             retry_val = float(err_str.split("retry-after=")[1].split()[0])
                         except (ValueError, IndexError):
                             pass
 
-                    if is_429 and retry_val is not None and retry_val <= 2.0:
+                    if is_429 and retry_val is not None and retry_val <= 2.0 and not has_backup:
                         logger.warning(
                             "[LLM 429] Provider '{}' stream init hit 429 with retry-after={:.1f}s <= 2.0s; waiting and retrying once...",
                             provider_name,
@@ -731,7 +778,7 @@ def _attach_resilient_failover(service: Any, provider_name: str, config: dict) -
                             service._skip_primary_until = time.monotonic() + 60.0
                             primary_failed = True
                     else:
-                        skip_dur = min(60.0, max(10.0, retry_val)) if (is_429 and retry_val is not None) else 60.0
+                        skip_dur = min(60.0, max(0.25, retry_val)) if (is_429 and retry_val is not None) else 60.0
                         service._skip_primary_until = time.monotonic() + skip_dur
                         logger.warning(
                             "[LLM Failover] Primary LLM provider '{}' stream creation failed after {}ms ({}); skipping primary for {:.1f}s...",
@@ -743,16 +790,25 @@ def _attach_resilient_failover(service: Any, provider_name: str, config: dict) -
                         primary_failed = True
 
             if not primary_failed and first_chunk is not None:
-                yield first_chunk
-                pri_tokens = 1
-                async for chunk in iter_stream:
-                    if hasattr(chunk, "choices") and chunk.choices and hasattr(chunk.choices[0], "delta"):
-                        if getattr(chunk.choices[0].delta, "content", None):
-                            pri_tokens += 1
-                    yield chunk
-                if call_metrics and hasattr(call_metrics, "record_llm_token_usage"):
-                    prompt_est = max(1, sum(len(str(m.get("content", ""))) for m in msgs if isinstance(m, dict)) // 4)
-                    call_metrics.record_llm_token_usage(provider_name, getattr(service, "_model", "qwen/qwen3.8-27b"), prompt_est, pri_tokens)
+                service._billing_model = primary_model
+                service._recovery_count = 0
+                saw_usage = bool(getattr(first_chunk, "usage", None))
+                try:
+                    context._response_truncated = any(getattr(c, "finish_reason", None) == "length" for c in (getattr(first_chunk, "choices", None) or []))
+                    yield first_chunk
+                    async for chunk in iter_stream:
+                        saw_usage = saw_usage or bool(getattr(chunk, "usage", None))
+                        if any(getattr(c, "finish_reason", None) == "length" for c in (getattr(chunk, "choices", None) or [])):
+                            context._response_truncated = True
+                        yield chunk
+                except Exception as stream_error:
+                    if call_metrics:
+                        call_metrics.record_provider_failure(provider_name, str(stream_error))
+                    # Already yielded output: never replay/retry a partial tool-bearing turn.
+                    raise
+                finally:
+                    if call_metrics and not saw_usage:
+                        call_metrics._missing_native_usage_requests += 1
                 return
 
             # Primary provider failed: check if cancelled/superseded first.
@@ -763,17 +819,54 @@ def _attach_resilient_failover(service: Any, provider_name: str, config: dict) -
             ):
                 return
 
-            fail_count = 1
-            if isinstance(lead_mem, dict):
-                fail_count = lead_mem.get("_llm_dual_failures", 0) + 1
-                lead_mem["_llm_dual_failures"] = fail_count
+            # Backup stage: second Groq model. Only if nothing was spoken yet (nothing yielded above).
+            if has_backup and not getattr(service, "_backup_unavailable", False):
+                t_bk = time.monotonic()
+                bk_it = None
+                bk_first = None
+                try:
+                    bk_it, bk_first = await _open_backup_stream(context)
+                except (asyncio.TimeoutError, Exception) as bk_err:
+                    if getattr(bk_err, "status_code", None) in (400, 401, 403, 404):
+                        service._backup_unavailable = True
+                    bk_ms = round((time.monotonic() - t_bk) * 1000, 1)
+                    _, bk_err_str = _extract_err_details(bk_err)
+                    logger.error("[LLM Failover] Backup Groq model '{}' failed after {}ms ({})", backup_model, bk_ms, bk_err_str)
+                    if call_metrics and hasattr(call_metrics, "record_provider_failure"):
+                        call_metrics.record_provider_failure(provider_name + ":" + backup_model, bk_err_str, bk_ms)
+                if bk_it is not None and bk_first is not None:
+                    logger.info(
+                        "[LLM Failover] Serving this turn from backup Groq model '{}' (TTFC={}ms)",
+                        backup_model,
+                        round((time.monotonic() - t_bk) * 1000, 1),
+                    )
+                    service._billing_model = backup_model
+                    service._recovery_count = 0
+                    saw_usage = bool(getattr(bk_first, "usage", None))
+                    try:
+                        context._response_truncated = any(getattr(c, "finish_reason", None) == "length" for c in (getattr(bk_first, "choices", None) or []))
+                        yield bk_first
+                        async for chunk in bk_it:
+                            saw_usage = saw_usage or bool(getattr(chunk, "usage", None))
+                            if any(getattr(c, "finish_reason", None) == "length" for c in (getattr(chunk, "choices", None) or [])):
+                                context._response_truncated = True
+                            yield chunk
+                    finally:
+                        if call_metrics and not saw_usage:
+                            call_metrics._missing_native_usage_requests += 1
+                    return
 
-            if fail_count >= 3:
-                recovery_line = "I seem to be having connection trouble. Our advisor will reach out to you directly. Thank you and have a wonderful day!"
-            elif isinstance(lead_mem, dict) and (lead_mem.get("time_slot") or lead_mem.get("preferred_visit_date") or lead_mem.get("bhk")):
-                recovery_line = "I've noted your preference. Let me check the details for you."
-            else:
-                recovery_line = "I didn't quite catch that. Could you repeat that, please?"
+            prior_count = getattr(service, "_recovery_count", 0)
+            fail_count = (prior_count if isinstance(prior_count, int) else 0) + 1
+            service._recovery_count = fail_count
+            recovery_line = (
+                "I'm having connection trouble. Please give me a moment."
+                if fail_count == 1 else
+                "The connection is still unavailable. Please try this call again later."
+            )
+            if fail_count > 2:
+                return
+            service._last_recovery_line = recovery_line
 
             logger.info("[LLM Fallback] Speaking deterministic recovery line (failure count={}): {!r}", fail_count, recovery_line)
 
@@ -795,9 +888,22 @@ def _attach_resilient_failover(service: Any, provider_name: str, config: dict) -
                 usage=None,
             )
             yield synthetic_chunk
+            if fail_count == 2:
+                on_exhausted = getattr(service, "_on_provider_exhausted", None)
+                if callable(on_exhausted):
+                    await on_exhausted()
 
         return _stream_wrapper()
 
+    original_usage = service.start_llm_usage_metrics
+    async def native_usage(usage):
+        metrics = getattr(service, "_call_metrics", None)
+        if metrics:
+            metrics.record_llm_token_usage(provider_name,
+                getattr(service, "_billing_model", primary_model),
+                usage.prompt_tokens or 0, usage.completion_tokens or 0, usage_object=usage)
+        await original_usage(usage)
+    service.start_llm_usage_metrics = native_usage
     service.get_chat_completions = _resilient_get_chat_completions
     logger.info("Attached resilient LLM failover to {} service", provider_name)
 
@@ -874,7 +980,9 @@ class ServiceFactory:
         if service_type == "stt":
             stt_lang = params.get("language")
 
-            if not stt_lang or stt_lang == "unknown":
+            if provider_name == "sarvam" and (not stt_lang or stt_lang == "unknown"):
+                params["language"] = None  # SDK v4 resolves None to unknown, not forced English
+            elif not stt_lang or stt_lang == "unknown":
                 params["language"] = "en-IN"
 
         if "voice_id" in params and "voice" not in params:
@@ -1118,7 +1226,7 @@ def _extract_lead_preferences(text: str, agent_text: str = "") -> dict[str, str]
     # 1. Configuration (e.g. 2/3 BHK, bedrooms, villa, penthouse, study/large variants - strictly caller's speech)
     m_cfg = re.search(r"\b([1-5]|one|two|three|four|five|teen|do|ek|char|paanch)?\s*(?:bhk|bed(?:room)?s?|kamre)\b", user_lower)
     has_large = bool(re.search(r"\b(large|larger|big|bigger|study|bada|2100|twenty[- ]one hundred|(?:2|two|do)\s*balcon(?:y|ies)?)\b", user_lower))
-    has_std = bool(re.search(r"\b(standard|regular|small|chota|1580|fifteen eighty|(?:1|one|ek)\s*balcon(?:y|ies)?)\b", user_lower))
+    has_std = bool(re.search(r"\b(standard|regular|small|smaller|chota|1580|fifteen eighty|(?:1|one|ek)\s*balcon(?:y|ies)?)\b", user_lower))
 
     # If both large and standard words appear (e.g. comparing "bigger or standard?"), don't guess
     if has_large and has_std:
@@ -1136,10 +1244,8 @@ def _extract_lead_preferences(text: str, agent_text: str = "") -> dict[str, str]
             extracted["configuration"] = f"{digit} BHK"
         else:
             extracted["configuration"] = "3 BHK"
-    elif has_large:
-        extracted["configuration"] = "3 BHK Large (with study & 2 balconies)"
-    elif has_std:
-        extracted["configuration"] = "3 BHK Standard (1 balcony)"
+    elif has_large or has_std:
+        extracted["unit_size_choice"] = "large" if has_large else "small"
     elif "villa" in user_lower:
         extracted["configuration"] = "Villa"
     elif "penthouse" in user_lower:
@@ -1191,51 +1297,10 @@ def _extract_lead_preferences(text: str, agent_text: str = "") -> dict[str, str]
         if m_loc_known:
             extracted["location"] = m_loc_known.group(1).title()
 
-    # 4. Caller Name (flexible: user intro in English/Hindi OR agent acknowledgment)
-    m_name_user = re.search(
-        r"\b(?:my name is|i am|call me|myself|mera naam)\s+([A-Za-z]+)\b",
-        text,
-        re.IGNORECASE,
-    )
-    if not m_name_user:
-        m_name_user = re.search(
-            r"\bmain\s+([A-Za-z]+)\s+(?:bol\s+raha|bol\s+rahi|hoon|hun)\b",
-            text,
-            re.IGNORECASE,
-        )
-    if not m_name_user:
-        m_name_user = re.search(
-            r"\b(?:it'?s|this is)\s+(?!the\b|a\b|an\b|just\b|actually\b|not\b|my\b|our\b)([A-Za-z]+)\b",
-            text,
-            re.IGNORECASE,
-        )
-    if not m_name_user:
-        m_name_user = re.search(r"\b([A-Za-z]+)\s+(?:here|this side|speaking)\b", text, re.IGNORECASE)
-
-    m_name_agent = None
-    if agent_text:
-        m_name_agent = re.search(r"\b(?:thanks|thank you|sure|noted|hi|hello),?\s+([A-Z][a-z]+)\b", agent_text)
-
-    chosen_name_match = m_name_user or m_name_agent
-    if chosen_name_match:
-        candidate_name = chosen_name_match.group(1).strip()
-        name_stopwords = {
-            "not", "nahi", "nah", "mat", "never",
-            "fine", "good", "okay", "ok", "yes", "no", "sure", "interested", "done",
-            "clear", "available", "free", "ananya", "meridian", "looking", "ready",
-            "here", "there", "tomorrow", "today", "yesterday", "morning", "evening",
-            "afternoon", "night", "east", "north", "south", "west", "bhk", "flat",
-            "apartment", "villa", "unit", "property", "self", "investment", "number",
-            "brochure", "whatsapp", "great", "nice", "hello", "hi", "noted", "working",
-            "the", "a", "an", "this", "that", "it", "its", "location", "price", "budget",
-            "actually", "basically", "just", "really", "area", "size", "facing",
-            "study", "balcony", "corporatish", "lively", "happening", "social",
-            "bada", "chota", "what", "which", "where", "how", "who", "why",
-            "site", "visit", "kal", "aaj", "parso", "baje", "shaam", "subah", "dopahar",
-            "ha", "haan", "bhejo", "aa", "jaunga", "jaungi",
-        }
-        if candidate_name.lower() not in name_stopwords and len(candidate_name) > 1:
-            extracted["spoken_name"] = candidate_name.capitalize()
+    # Name evidence is only the caller's explicit self-identification, never our own words.
+    candidate_name = explicit_caller_name(text)
+    if candidate_name:
+        extracted["spoken_name"] = candidate_name
 
     is_farewell = any(f in user_lower for f in ("bye", "goodbye", "cya", "never mind", "later", "thank you", "thanks"))
     user_has_refusal = any(neg in user_lower for neg in ("not interested", "dont want", "don't want", "nahi chahiye", "kuch nahi"))
@@ -1258,14 +1323,6 @@ def _extract_lead_preferences(text: str, agent_text: str = "") -> dict[str, str]
             # Hindi Devanagari: \b unreliable — use Unicode-aware search
             if not m_vdate:
                 m_vdate = re.search(r"(कल|आज|परसों)", user_lower, re.UNICODE)
-            # If user didn't state date directly, check if user affirmed an agent visit proposal
-            if not m_vdate and any(user_lower.startswith(aff) or aff in user_lower.split() for aff in ("yes", "sure", "theek hai", "chalega", "done")):
-                agent_lower = agent_text.lower()
-                if any(p in agent_lower for p in ("how about", "can you come", "would you like to visit", "free on", "available on")):
-                    m_vdate = re.search(
-                        r"\b(tomorrow|today|this\s+weekend|next\s+weekend|this\s+saturday|this\s+sunday|saturday|sunday|monday|tuesday|wednesday|thursday|friday)\b",
-                        agent_lower,
-                    )
 
             if m_vdate:
                 raw_d = m_vdate.group(1).title()
@@ -1276,7 +1333,7 @@ def _extract_lead_preferences(text: str, agent_text: str = "") -> dict[str, str]
                 else:
                     extracted["preferred_visit_date"] = raw_d
 
-        norm_t = normalize_visit_time(user_lower)
+        norm_t = visit_time(user_lower)
         if norm_t:
             extracted["time_slot"] = norm_t
             extracted["preferred_visit_time"] = norm_t
@@ -1302,7 +1359,7 @@ def _extract_lead_preferences(text: str, agent_text: str = "") -> dict[str, str]
         v_t = extracted.get("time_slot") or extracted.get("preferred_visit_time")
         if v_d or v_t:
             parts = [p for p in (v_d, v_t) if p]
-            extracted["site_visit"] = f"Confirmed ({' at '.join(parts)})"
+            extracted["site_visit"] = f"Requested ({' at '.join(parts)})"
         elif re.search(r"\b(?:not\s*(?:available|free|possible|interested)|can'?t\s*make\s*it|busy|no\s*time)\b.*?\b(?:visit|come|weekend|today|tomorrow)\b|\b(?:visit|come)\b.*?\b(?:not\s*(?:available|free|possible)|can'?t)\b", user_lower):
             extracted["site_visit"] = "Declined/Not free right now"
         elif re.search(r"\b(?:this|next)?\s*(?:saturday|sunday|weekend|tomorrow|today)\b", user_lower) and ("visit" in user_lower or "come" in user_lower or "free" in user_lower):
@@ -1320,14 +1377,14 @@ def _extract_lead_preferences(text: str, agent_text: str = "") -> dict[str, str]
     elif re.search(r"\b(self\s*use|living|end\s*use|family|parents|son|daughter)\b", lower):
         extracted["purpose"] = "Self-use"
 
-    # 8. WhatsApp (only when user asks for details or affirms a brochure proposal)
+    # 8. Channel mention is not a consent grant or delivery result.
     if not user_has_refusal:
         if re.search(r"\b(whatsapp|brochure|video\s*tour|details\s+on\s+whatsapp|send\s+(?:the\s+)?details|send\s+(?:the\s+)?brochure)\b", user_lower) or (
             any(k in user_lower for k in ("sure", "yes", "send", "share", "theek hai", "bhejo", "chalega"))
             and any(w in lower for w in ("whatsapp", "brochure", "video", "details"))
             and not any(neg in user_lower for neg in ("no", "nahi", "mat", "don't"))
         ):
-            extracted["whatsapp"] = "Confirmed on dialed number"
+            extracted["whatsapp"] = "Mentioned/requested, not sent"
 
     return extracted
 
@@ -1372,6 +1429,12 @@ def _sync_working_memory(
                 agent_text = messages[i + 1].get("content", "")
             if isinstance(content, str):
                 extracted = _extract_lead_preferences(content, agent_text if isinstance(agent_text, str) else "")
+                if extracted.get("unit_size_choice"):
+                    existing_bhk = str(lead_memory.get("configuration") or lead_memory.get("bhk") or "")
+                    if existing_bhk.startswith("3 BHK"):
+                        extracted["configuration"] = "3 BHK Large (with study & 2 balconies)" if extracted["unit_size_choice"] == "large" else "3 BHK Standard (1 balcony)"
+                    elif existing_bhk.startswith("2 BHK"):
+                        extracted["configuration"] = "2 BHK"
                 for k, v in extracted.items():
                     # Preserve existing specific configuration if newly extracted is generic
                     if k == "configuration" and k in lead_memory:
@@ -1379,8 +1442,10 @@ def _sync_working_memory(
                         if len(existing) > len(v) and v.lower() in existing.lower():
                             continue
                     # Tool value always wins: never overwrite a visit date/time
-                    # already committed by book_site_visit or set in lead_memory.
-                    if k in ("preferred_visit_date", "preferred_visit_time", "visit_date_iso", "time_slot") and lead_memory.get(k):
+                    # already committed by book_site_visit; pending requests remain correctable.
+                    if k in ("preferred_visit_date", "preferred_visit_time", "visit_date_iso", "time_slot") and lead_memory.get("disposition") == "SITE_VISIT_BOOKED":
+                        continue
+                    if k == "site_visit" and lead_memory.get("disposition") == "SITE_VISIT_BOOKED":
                         continue
                     lead_memory[k] = v
                     newly_extracted[k] = v
@@ -1400,7 +1465,8 @@ def _sync_working_memory(
             discrepancy_msg = f"Caller stated '{spoken_name}', registered lead was '{registered_name}'"
             lead_memory["identity_discrepancy"] = discrepancy_msg
             lead_memory["registered_name"] = registered_name
-            lead_memory["client"] = f"{spoken_name} (registered: {registered_name})"
+            # Keep the registered identity stable; a stated different name needs confirmation.
+            lead_memory["client"] = registered_name
             newly_extracted["identity_discrepancy"] = discrepancy_msg
             newly_extracted["registered_name"] = registered_name
             newly_extracted["spoken_name"] = spoken_name
@@ -1424,7 +1490,7 @@ def _sync_working_memory(
     )
     if lead_memory.get("identity_discrepancy"):
         slots.append(
-            f"Client: {lead_memory.get('spoken_name')} "
+            f"Client: {registered_name}; caller-stated name (unverified): {lead_memory.get('spoken_name')} "
             f"(Discrepancy: registered as {lead_memory.get('registered_name')}; confirm on dialed number without interrogating)"
         )
     elif client_name:
@@ -1433,7 +1499,6 @@ def _sync_working_memory(
     config_val = lead_memory.get("configuration") or lead_memory.get("bhk")
     if config_val:
         slots.append(f"Configuration: {config_val}")
-        slots.append(f"Looking for: {config_val}")
 
     # Preference (combines Timeline and Location if both exist, e.g. "Ready-to-move in Prime Tech Corridor")
     if "preference" in lead_memory:
@@ -1445,6 +1510,8 @@ def _sync_working_memory(
     elif "location" in lead_memory:
         slots.append(f"Location: {lead_memory['location']}")
 
+    if lead_memory.get("unit_size_choice"):
+        slots.append(f"Unit size choice: {lead_memory['unit_size_choice']}")
     if "budget" in lead_memory:
         slots.append(f"Budget: {lead_memory['budget']}")
     if "purpose" in lead_memory:
@@ -1460,7 +1527,7 @@ def _sync_working_memory(
     if "site_visit" in lead_memory:
         sv_val = lead_memory["site_visit"]
         if has_visit_slot or "Confirmed" in sv_val:
-            slots.append(f"Site Visit: {sv_val}")
+            slots.append(f"Site Visit: {sv_val}" if lead_memory.get("disposition") == "SITE_VISIT_BOOKED" else f"Site Visit: {sv_val}; not booked")
             if v_date:
                 slots.append(f"Visit Date ISO: {v_date}")
             if v_time:
@@ -1468,7 +1535,7 @@ def _sync_working_memory(
         elif "Declined" in sv_val:
             slots.append(f"Site Visit: {sv_val}")
         else:
-            slots.append("Site Visit Requested: Day/time NOT yet chosen. MANDATORY: You MUST ask what day or time (e.g. this Saturday or Sunday morning) they would prefer before confirming any visit slot. DO NOT say 'I will confirm the slot' until day/time is stated!")
+            slots.append("Site Visit Requested: ask missing day/time; not booked.")
     elif has_visit_slot:
         v_parts = [p for p in (v_date, v_time) if p]
         slots.append(f"Site Visit: {' at '.join(v_parts)}")
@@ -1480,18 +1547,22 @@ def _sync_working_memory(
         re.search(r"\b(site\s*visit|visit\s*the\s*property|come\s*(?:and|to)?\s*see|schedule\s*(?:a\s*)?visit|want\s*to\s*visit)\b", m.get("content", "").lower())
         for m in user_msgs
     ):
-        slots.append("Site Visit Requested: Day/time NOT yet chosen. MANDATORY: You MUST ask what day or time (e.g. this Saturday or Sunday morning) they would prefer before confirming any visit slot. DO NOT say 'I will confirm the slot' until day/time is stated!")
+        slots.append("Site Visit Requested: ask missing day/time; not booked.")
 
+    if lead_memory.get('_postcall_whatsapp_actions'):
+        slots.append('Manual WhatsApp consent recorded for ' + ', '.join(lead_memory['_postcall_whatsapp_actions']) + '; prepared after call, not sent. Do not ask consent again or call send_brochure for recorded actions.')
+    if lead_memory.get("_brochure_consent_pending"):
+        slots.append("Brochure pending channel consent: yes to the immediately preceding WhatsApp question calls send_brochure; no cancels. Never claim sent from consent.")
     if "whatsapp" in lead_memory:
-        slots.append(f"WhatsApp: {lead_memory['whatsapp']} (DO NOT ask or pitch WhatsApp again)")
+        slots.append(f"WhatsApp: {lead_memory['whatsapp']} (not delivery proof)")
     if "language" in lead_memory:
         lang_val = lead_memory["language"]
         if lang_val == "Hindi":
-            slots.append("Active Language: Everyday Hinglish. Respond in natural conversational Hindi mixed with English. Use standard English loanwords (BHK, balcony, possession, budget, sq ft, crore, lakh, location, price). Avoid formal or archaic Hindi (do not use स्थान, कीमत, शुभ दिन).")
+            slots.append("Language: natural Hinglish, English property terms.")
         elif lang_val == "Telugu":
-            slots.append("Active Language: Conversational Telugu. Respond in natural spoken Telugu with standard English property terms (BHK, balcony, sq ft, price, possession, budget). If the caller mixes English and Telugu, respond naturally in a conversational Telugu/English mix.")
+            slots.append("Language: conversational Telugu, English property terms.")
         else:
-            slots.append(f"Active Language: {lang_val}. If the caller uses words from another language, respond naturally while acknowledging their intent.")
+            slots.append(f"Active Language: {lang_val}; match mixed caller speech.")
 
     # Track topics already discussed/covered across turns to prevent repetitive questions
     # CRITICAL: Persist in lead_memory["_covered_topics"] so history pruning never erases them!
@@ -1513,11 +1584,12 @@ def _sync_working_memory(
 
     # Accumulate newly covered topics into the persistent set
     if "configuration" in lead_memory:
+        covered_set.difference_update({v for v in covered_set if v.startswith("Configuration confirmed (")})
         covered_set.add(f"Configuration confirmed ({lead_memory['configuration']})")
     if "budget" in lead_memory:
         covered_set.add("Budget shared")
     if any(k in spoken_assistant_text for k in ("sq ft", "carpet area", "dimensions", "floor plan", "brochure", "video")) or any(k in spoken_dialog_text for k in ("floor plan", "brochure", "video")):
-        covered_set.add("Floor plan & brochure shared (do NOT re-offer)")
+        covered_set.add("Floor plan/brochure discussed (not delivery proof)")
     if any(k in spoken_assistant_text for k in ("crore", "lakh", "price", "pricing")):
         covered_set.add("Pricing shared")
     if any(k in spoken_assistant_text for k in ("10 mins from", "connectivity", "metro station", "commute")):
@@ -1527,10 +1599,10 @@ def _sync_working_memory(
     if any(k in spoken_dialog_text for k in ("site visit", "visit scheduled", "visit confirmed")):
         covered_set.add("Site visit discussed")
     if "whatsapp" in lead_memory or any(k in spoken_dialog_text for k in ("on whatsapp", "share details on whatsapp", "send the brochure", "video tour on whatsapp", "send me those")):
-        covered_set.add("WhatsApp confirmed (do NOT ask or pitch WhatsApp again)")
+        covered_set.add("WhatsApp discussed (not consent or delivery proof)")
 
     if covered_set:
-        slots.append(f"Already Covered: {', '.join(sorted(covered_set))} (do NOT re-offer unless customer asks)")
+        slots.append(f"Already Covered: {', '.join(sorted(covered_set))}; do not repeat")
 
     # Track caller objection/hesitation attempts deterministically across turns
     is_active_objection_turn = False
@@ -1551,49 +1623,7 @@ def _sync_working_memory(
 
     obj_count = lead_memory.get("_objection_count", 0)
 
-    has_confirmed_whatsapp = (
-        bool(lead_memory.get("whatsapp"))
-        or any(
-            bool(re.search(
-                r"\b(?:haan|ha|yes|sure|ok|okay|theek|bhej|send|share)\b.*?\b(?:whatsapp|brochure|detail|floor\s*plan)\b|\b(?:whatsapp|brochure)\b.*?\b(?:bhej|send|share|kar\s*do|karo)\b",
-                m.get("content", "").lower().strip()
-            ))
-            for m in user_msgs
-        )
-    )
-    if not has_confirmed_whatsapp:
-        for i, msg in enumerate(messages):
-            if msg.get("role") == "user" and i > 0 and messages[i - 1].get("role") == "assistant":
-                prev_agent = (messages[i - 1].get("content") or "").lower()
-                user_txt = (msg.get("content") or "").strip().lower()
-                if "whatsapp" in prev_agent:
-                    # Clear caller yes (not preceded by negation)
-                    is_clear_yes = bool(re.search(
-                        r"^(?:yes|yeah|yep|sure|definitely|absolutely|haan|ha|haanji|theek hai|send it|please do)[\.\!\?]*$",
-                        user_txt,
-                    )) or bool(
-                        re.search(r"\b(?:yes|sure|haan|send)\b", user_txt)
-                        and not re.search(r"\b(?:no|not|don'?t|dont|nahi|mat)\b", user_txt)
-                    )
-                    if is_clear_yes:
-                        has_confirmed_whatsapp = True
-                        break
-
-    if has_confirmed_whatsapp and not lead_memory.get("whatsapp"):
-        lead_memory["whatsapp"] = "Confirmed on dialed number"
-        lead_memory["whatsapp_opt_in"] = True
-        if stream_id:
-            try:
-                import asyncio
-                asyncio.create_task(
-                    lead_state.record_fields_async(
-                        stream_id,
-                        {"whatsapp": "Confirmed on dialed number", "whatsapp_opt_in": True},
-                    )
-                )
-            except Exception:
-                pass
-
+    has_confirmed_whatsapp = bool(lead_memory.get("whatsapp_opt_in"))
     has_rejected_whatsapp = False
     for i, msg in enumerate(messages):
         if msg.get("role") == "user":
@@ -1624,8 +1654,10 @@ def _sync_working_memory(
     if whatsapp_already_pitched:
         lead_memory["_whatsapp_pitched"] = True
 
-    if has_confirmed_whatsapp:
-        slots.append("WhatsApp Brochure: Confirmed on this number. DO NOT ask or re-pitch WhatsApp brochure. Answer caller's questions consultative-style and engage.")
+    if lead_memory.get('_postcall_whatsapp_actions'):
+        pass  # recorded manual consent above is the authoritative call state
+    elif has_confirmed_whatsapp:
+        slots.append("WhatsApp Brochure: mentioned, not sent. Only send_brochure result establishes queued/API acceptance. Answer caller questions.")
     elif is_active_objection_turn:
         if obj_count == 1 and not pivot_already_spoken:
             slots.append(
@@ -1634,7 +1666,7 @@ def _sync_working_memory(
         elif not has_rejected_whatsapp:
             if not whatsapp_already_pitched:
                 slots.append(
-                    'Objection Attempt: 2 of 2 (Consultative Step). Address concern concisely: If price concern, highlight the flexible 10% booking payment plan (construction-linked, loan-approved by SBI/HDFC/ICICI, or 2 BHK from 95L). If location, highlight Prime Tech Corridor connectivity (10 mins to Metro). Offer WhatsApp fallback once: "May I share the brochure and floor plans on WhatsApp so you can review at your leisure?" DO NOT introduce costlier comparison areas. DO NOT close yet.'
+                    'Objection Attempt: 2 of 2 (Consultative Step). Address concern concisely: If price concern, highlight the flexible 10% booking payment plan (construction-linked, loan-approved by SBI/HDFC/ICICI, or 2 BHK from 95L). If location, highlight Prime Tech Corridor connectivity (10 mins to Metro). Ask one question about their price or location concern. DO NOT introduce costlier comparison areas. DO NOT close yet.'
                 )
             else:
                 slots.append(
@@ -1651,7 +1683,7 @@ def _sync_working_memory(
             )
         elif not whatsapp_already_pitched:
             slots.append(
-                'Consultative Step: Address concern concisely (10% flexible booking plan, loan approved by SBI/HDFC/ICICI, or 2 BHK from 95L). Offer WhatsApp fallback once: "May I share the brochure and floor plans on WhatsApp so you can review at your leisure?" DO NOT introduce costlier comparison areas. DO NOT close.'
+                'Consultative Step: Address concern concisely (10% flexible booking plan, loan approved by SBI/HDFC/ICICI, or 2 BHK from 95L). Ask one question about their price or location concern. DO NOT introduce costlier comparison areas. DO NOT close.'
             )
         else:
             slots.append(
@@ -1680,12 +1712,12 @@ def _sync_working_memory(
         if msg.get("role") == "system":
             last_sys_msg = msg
 
-    if last_sys_msg is not None:
+    if last_sys_msg is not None and sum(m.get("role") == "system" for m in messages) > 1:
         content = last_sys_msg.get("content", "")
         last_sys_msg["content"] = f"{content.rstrip()}\n\n{memory_str}".strip()
     else:
         # Fallback if no system message exists
-        messages.insert(0, {"role": "system", "content": memory_str})
+        messages.insert(1 if messages and messages[0].get("role") == "system" else 0, {"role": "system", "content": memory_str})
 
 
 def _coalesce_consecutive_messages(messages: list) -> None:
@@ -1749,6 +1781,8 @@ def _load_audio_cache() -> dict[int, dict[str, bytes]]:
     8000Hz for telephony) using soxr for pristine audio quality and zero runtime latency.
     """
     import wave
+    from audio_provenance import effective_config, fresh_audio, PHRASES
+    expected_config = effective_config(Path(__file__).parent)
     import numpy as np
     import soxr
 
@@ -1758,7 +1792,7 @@ def _load_audio_cache() -> dict[int, dict[str, bytes]]:
     if not static_dir.exists():
         static_dir = base_dir
 
-    phrase_files = {
+    phrase_files = {"short_goodbye": "short_goodbye.wav", **{k: k + ".wav" for k in {**FAQ_TEXTS, **CALL5_TEXTS, **CALL7_TEXTS}},
         "greeting_alex": "greeting_alex.wav",
         "greeting_generic": "greeting_generic.wav",
         "inbound_greeting": "inbound_greeting.wav",
@@ -1786,6 +1820,9 @@ def _load_audio_cache() -> dict[int, dict[str, bytes]]:
 
     def _load_file(path: Path, key: str):
         if not path.exists():
+            return
+        if not fresh_audio(path, key, PHRASES.get(key, ""), expected_config):
+            logger.info("Audio cache skipped {}: missing/stale voice provenance; regenerate Sarvam cache", key)
             return
         try:
             with wave.open(str(path), "rb") as wf:
@@ -1828,6 +1865,9 @@ def _match_cached_phrase(text: str, turn_count: int = 1) -> str | None:
     if not text:
         return None
     t = text.lower().strip()
+    for key, phrase in {"short_goodbye": SHORT_GOODBYE, **FAQ_TEXTS, **CALL5_TEXTS, **CALL7_TEXTS}.items():
+        if t == phrase.lower():
+            return key
 
     # Outbound greetings
     if "am i speaking with alex" in t:
@@ -1875,7 +1915,7 @@ def _match_cached_phrase(text: str, turn_count: int = 1) -> str | None:
         return "objection_pivot"
 
     # Brochure close
-    if "brochure and floor plans on whatsapp" in t:
+    if t == "sure, our team will share the brochure and floor plans on whatsapp shortly. have a wonderful day!":
         return "brochure_close"
 
     # Farewells
@@ -1887,7 +1927,7 @@ def _match_cached_phrase(text: str, turn_count: int = 1) -> str | None:
     return None
 
 
-_CACHED_PHRASE_TEXTS: dict[str, str] = {
+_CACHED_PHRASE_TEXTS: dict[str, str] = {"short_goodbye": SHORT_GOODBYE, **FAQ_TEXTS, **CALL5_TEXTS, **CALL7_TEXTS,
     "greeting_alex": "Hi, am I speaking with Alex?",
     "greeting_generic": "Hi, this is Ananya from Meridian Group. Is this a good time to talk?",
     "inbound_greeting": "Hello, thank you for calling Meridian Group. How may I assist you today?",
@@ -2266,6 +2306,8 @@ class _SpokenTextGuard(FrameProcessor):
             if remainder:
                 return remainder
             return "Yes, I'm listening. What's on your mind?"
+        if self._turn_count > 1:
+            text = re.sub(r"^\s*(?:hi|hello)[, ]+(?:alex[, ]+)?(?:main|मैं)\s+Ananya\s+(?:hoon|हूँ|हूं)\s+Meridian Group\s+(?:se|से)[, .]*", "", text, flags=re.I)
         return text
 
     def __init__(
@@ -2355,10 +2397,40 @@ class _SpokenTextGuard(FrameProcessor):
             if not p_clean:
                 continue
             lower_p = p_clean.lower()
+            recorded = (self._lead_memory or {}).get('_postcall_whatsapp_actions') or []
+            if self._in_llm_turn and 'brochure' in recorded and '?' in p_clean and 'whatsapp' in lower_p and re.search(r'brochure|floor plans', lower_p) and re.search(r'\b(?:may|can|shall|would|want|like|send|share)\b', lower_p):
+                dropped_any = True  # model cannot re-ask already-recorded consent
+                continue
+            if self._in_llm_turn and self._call_end_coordinator and getattr(self._call_end_coordinator, "_dedicated_goodbye_queued", False) and re.search(r"\b(?:goodbye|bye|thank you|have a (?:great|wonderful) day)\b", lower_p):
+                dropped_any = True
+                continue
+            if re.fullmatch(r"yes,?\s*go ahead[?.!]?", lower_p):
+                caller = ""
+                if self._context:
+                    for msg in reversed(self._context.messages):
+                        if msg.get("role") == "user":
+                            caller = str(msg.get("content", ""))
+                            break
+                kept.append(clarification_for(caller))
+                dropped_any = True
+                continue
+
             is_booking = bool(re.search(
-                r"\b(?:have\s+)?(?:booked|scheduled|confirmed)\b|\b(?:site\s+visit|visit)\s+(?:is|has\s+been)\s+(?:booked|scheduled|confirmed)\b|बुक|कन्फर्म|शिड्यूल",
+                r"\b(?:have\s+)?(?:booked|scheduled|confirmed)\b|\b(?:book|confirm)\s+kar|बुक\s*कर|कन्फर्म\s*कर|\b(?:site\s+visit|visit)\s+(?:is|has\s+been)\s+(?:booked|scheduled|confirmed)\b|बुक|कन्फर्म|शिड्यूल",
                 lower_p,
             ))
+            caller = ""
+            if self._context:
+                for msg in reversed(self._context.messages):
+                    if msg.get("role") == "user":
+                        caller = str(msg.get("content", ""))
+                        break
+            is_visit_acceptance = bool((re.search(r"\b(?:come|visit|tomorrow|site|slot)\b", caller, re.I) or ((self._lead_memory or {}).get("site_visit") and (self._lead_memory or {}).get("disposition") != "SITE_VISIT_BOOKED")) and re.search(r"\b(?:works|noted|see you|all set|done|reserved|aa sakte|can come|same slot|already|i have your site visit|we have a slot)\b", lower_p))
+            if is_visit_acceptance and not self._site_visit_succeeded_this_turn:
+                if not any("not booked" in k for k in kept):
+                    kept.append("The visit is not booked yet. What time would you like to visit?")
+                dropped_any = True
+                continue
             if is_booking:
                 dropped_any = True
                 if self._site_visit_succeeded_this_turn:
@@ -2373,12 +2445,13 @@ class _SpokenTextGuard(FrameProcessor):
                     )
                 continue
 
+            is_send_claim = bool(re.search(r"\b(?:i(?:'ve| have)?|we(?:'ve| have)?)\s+(?:shared|sent|delivered|am sending|will send)|\b(?:shared|sent|delivered)\b.*\b(?:brochure|floor plans?|location|details)\b|\bcheck your phone\b|bhej (?:diya|diye)|भेज (?:दिया|दी)", lower_p))
             is_wa = bool(re.search(
                 r"\b(?:receive|sending|sent)\s+(?:the\s+)?(?:location|details|brochure|link)\s+(?:on|via)\s+whatsapp\b|\b(?:location|details)\s+on\s+whatsapp\b|whatsapp|व्हाट्सएप",
                 lower_p,
-            ))
-            if is_wa and not self._whatsapp_succeeded_this_turn:
-                is_wa_question = bool(re.search(r"\b(?:shall|can|may|would|should)\s+(?:i|we)\b|(?:\?)$", lower_p.strip()))
+            )) or bool(re.search(r"(?:brochure|floor plans?|details).*?(?:sent|bhej diye|bhej diya)|(?:sent|bhej diye|bhej diya).*?(?:brochure|floor plans?|details)", lower_p))
+            if (is_send_claim or is_wa) and not self._whatsapp_succeeded_this_turn:
+                is_wa_question = not is_send_claim and bool(re.search(r"\b(?:shall|can|may|would|should)\s+(?:i|we)\b|\blike (?:me|us) to share\b|(?:\?)$", lower_p.strip()))
                 if not is_wa_question:
                     dropped_any = True
                     logger.warning(
@@ -2395,6 +2468,25 @@ class _SpokenTextGuard(FrameProcessor):
         leading_ws = text[:len(text) - len(text.lstrip())]
         trailing_ws = text[len(text.rstrip()):]
         return leading_ws + " ".join(kept) + trailing_ws
+
+    _DUP_WINDOW_SECS = 3.0
+
+    def _is_recent_duplicate(self, norm_text: str) -> bool:
+        """True only for an exact / near-exact repeat of the previous bot turn spoken within ~3s.
+
+        Short fragments ("it", "sent", "sure") never count as duplicates unless they equal the
+        whole previous turn; substring matching needs >= 12 chars of overlap.
+        """
+        clean_norm = re.sub(r"[^\w\s]", "", (norm_text or "").lower()).strip()
+        clean_last = re.sub(r"[^\w\s]", "", self._normalize(self._last_spoken_turn_text).lower()).strip()
+        if not clean_norm or not clean_last:
+            return False
+        if time.monotonic() - self._last_spoken_turn_time >= self._DUP_WINDOW_SECS:
+            return False
+        if clean_norm == clean_last:
+            return True
+        shorter = min(len(clean_norm), len(clean_last))
+        return shorter >= 12 and (clean_norm in clean_last or clean_last in clean_norm)
 
     def _record_assistant_spoken(self, text: str, cached_key: str | None = None) -> None:
         if not text:
@@ -2482,6 +2574,8 @@ class _SpokenTextGuard(FrameProcessor):
                 self._cached_playback_active = False
                 self._current_turn_spoken_text = ""
                 self._suppressing_duplicate_turn = False
+                if self._context:
+                    self._context._response_truncated = False
                 # Primary watchdog disarm: new bot turn supersedes any pending re-delivery.
                 # Called here because this frame reliably passes through SpokenTextGuard.
                 if self._on_new_bot_turn:
@@ -2496,7 +2590,7 @@ class _SpokenTextGuard(FrameProcessor):
                         self._lead_memory["confirmation_spoken"] = True
                     logger.info("SpokenTextGuard: Booking confirmation playback completed (actually_played=True)")
             elif isinstance(frame, TTSSpeakFrame):
-                is_silence_nudge = any(
+                is_silence_nudge = getattr(frame, "is_silence_nudge", False) or any(
                     nudge.lower() in getattr(frame, "text", "").lower()
                     for nudge in ("Hello? Are you there?", "are you still there", "can you hear me", "Looks like you're busy")
                 )
@@ -2521,7 +2615,7 @@ class _SpokenTextGuard(FrameProcessor):
                     return
                 original = getattr(frame, "text", None)
                 if isinstance(original, str) and original:
-                    cached_key = _match_cached_phrase(original, turn_count=self._turn_count)
+                    cached_key = None if getattr(frame, "is_deterministic_confirmation", False) else _match_cached_phrase(original, turn_count=self._turn_count)
                     if cached_key and self._interruption_audio_gate:
                         # Never repeat objection_pivot if it has already been spoken in this call
                         if cached_key == "objection_pivot" and (self._lead_memory or {}).get("_objection_pivot_spoken"):
@@ -2549,7 +2643,7 @@ class _SpokenTextGuard(FrameProcessor):
                                     )
                                     return
                                 logger.info(
-                                    "SpokenTextGuard: TTSSpeakFrame matches cache '%s' -> streaming cached PCM",
+                                    "SpokenTextGuard: TTSSpeakFrame matches cache '{}' -> streaming cached PCM",
                                     cached_key,
                                 )
                                 self._cached_playback_active = True
@@ -2579,6 +2673,17 @@ class _SpokenTextGuard(FrameProcessor):
                     return
                 original = getattr(frame, "text", None)
                 if isinstance(original, str) and original:
+                    caller = ""
+                    if self._context:
+                        for msg in reversed(self._context.messages):
+                            if msg.get("role") == "user":
+                                caller = str(msg.get("content", ""))
+                                break
+                    # Hold only visit-slot acceptance turns until complete: streamed fragments
+                    # like "Sure, tomorrow at two" must not escape before "works" is checked.
+                    if re.search(r"\b(?:can I come|book.{0,12}visit|schedule.{0,12}visit|visit tomorrow|come.*visit|come tomorrow|which slot|what slot)\b", caller, re.I) or ((self._lead_memory or {}).get("site_visit") and (self._lead_memory or {}).get("disposition") != "SITE_VISIT_BOOKED"):
+                        self._leading_buffer += original
+                        return
                     if not self._leading_flushed:
                         self._leading_buffer += original
                         cached_key = _match_cached_phrase(self._leading_buffer, turn_count=self._turn_count)
@@ -2623,22 +2728,13 @@ class _SpokenTextGuard(FrameProcessor):
                                         self._call_end_coordinator.request_ending()
                                     return
 
-                        # FIX 3: Start TTS earlier without making the bot dumber.
-                        # Flush first chunk at first clause boundary (comma, "-", ~6 words, or sentence end).
-                        split_idx = _find_clause_or_sentence_end(self._leading_buffer)
-                        if split_idx > 0 or len(self._leading_buffer) >= 60:
-                            if split_idx > 0:
-                                chunk_to_flush = self._leading_buffer[:split_idx]
-                                self._leading_buffer = self._leading_buffer[split_idx:]
-                            else:
-                                last_space = self._leading_buffer.rfind(" ")
-                                if last_space > 25:
-                                    chunk_to_flush = self._leading_buffer[:last_space]
-                                    self._leading_buffer = self._leading_buffer[last_space:]
-                                else:
-                                    chunk_to_flush = self._leading_buffer
-                                    self._leading_buffer = ""
-
+                        # Speak complete sentences, never a safety decision on a lone token.
+                        split_idx = _find_sentence_end(self._leading_buffer)
+                        chunk_to_flush = ""
+                        if split_idx > 0:
+                            chunk_to_flush = self._leading_buffer[:split_idx]
+                            self._leading_buffer = self._leading_buffer[split_idx:]
+                        if chunk_to_flush:
                             cleaned = self._strip_meta_announcements(chunk_to_flush)
                             cleaned = self._strip_repeated_opening(cleaned)
                             cleaned = self._filter_unverified_claims(cleaned)
@@ -2646,43 +2742,14 @@ class _SpokenTextGuard(FrameProcessor):
                             if cleaned.strip():
                                 norm = self._normalize(cleaned)
                                 if norm.strip():
-                                    clean_norm = re.sub(r"[^\w\s]", "", norm.lower()).strip()
-                                    clean_last = re.sub(r"[^\w\s]", "", self._last_spoken_turn_text.lower()).strip()
-                                    is_dup = bool(
-                                        clean_last
-                                        and len(clean_last) >= 8
-                                        and (clean_norm == clean_last or clean_norm in clean_last or clean_last in clean_norm)
-                                    )
-                                    if is_dup:
+                                    if self._is_recent_duplicate(norm):
                                         logger.warning(
-                                            "SpokenTextGuard: Suppressed duplicate assistant utterance {!r} (previous turn {!r})",
+                                            "SpokenTextGuard: Suppressed exact repeat {!r} (spoken <{:.0f}s ago); no regeneration",
                                             norm.strip(),
-                                            self._last_spoken_turn_text[:60],
+                                            self._DUP_WINDOW_SECS,
                                         )
                                         self._suppressing_duplicate_turn = True
-
-                                        latest_user_text = ""
-                                        if self._context and hasattr(self._context, "messages"):
-                                            for m in reversed(self._context.messages):
-                                                if m.get("role") == "user":
-                                                    c = m.get("content", "")
-                                                    if isinstance(c, str):
-                                                        latest_user_text = c.strip()
-                                                    elif isinstance(c, list):
-                                                        latest_user_text = " ".join(p.get("text", "") for p in c if isinstance(p, dict)).strip()
-                                                    break
-
-                                        if latest_user_text and not self._stale_regeneration_attempted:
-                                            self._stale_regeneration_attempted = True
-                                            logger.info(
-                                                "SpokenTextGuard: Fresh user utterance {!r} but LLM emitted duplicate turn; re-triggering LLM turn",
-                                                latest_user_text[:60],
-                                            )
-                                            if self._task:
-                                                try:
-                                                    await self._task.queue_frames([LLMContextFrame(context=self._context)])
-                                                except Exception as _re_err:
-                                                    logger.warning("SpokenTextGuard: Failed to queue re-trigger frame: {}", _re_err)
+                                        self._leading_buffer = ""  # drop the unspoken tail of the repeated turn too
                                         return
 
                                     self._current_turn_spoken_text += norm
@@ -2695,24 +2762,22 @@ class _SpokenTextGuard(FrameProcessor):
                     else:
                         if self._suppressing_duplicate_turn:
                             return
-                        to_process = original
-                        if self._leading_buffer:
-                            to_process = self._leading_buffer + original
-                            self._leading_buffer = ""
-                        filtered = self._filter_unverified_claims(to_process)
-                        if not filtered.strip():
-                            if not to_process.strip():
-                                frame.text = to_process
-                                await self.push_frame(frame, direction)
+                        self._leading_buffer += original
+                        split_idx = _find_sentence_end(self._leading_buffer)
+                        if split_idx <= 0:
                             return
-                        norm = self._normalize(filtered)
-                        if norm.strip():
+                        to_process = self._leading_buffer[:split_idx]
+                        self._leading_buffer = self._leading_buffer[split_idx:]
+                        filtered = self._filter_unverified_claims(to_process)
+                        if filtered.strip():
+                            norm = self._normalize(filtered)
+                            if self._is_recent_duplicate(norm):
+                                self._suppressing_duplicate_turn = True
+                                self._leading_buffer = ""
+                                return
                             self._current_turn_spoken_text += norm
                             self._turn_has_spoken_or_generated = True
-                        if self._in_llm_turn and norm.strip():
-                            self._turn_tokens += len(norm.split())
-                        frame.text = norm
-                        await self.push_frame(frame, direction)
+                            await self.push_frame(TextFrame(text=norm), direction)
                         return
             elif isinstance(frame, LLMFullResponseEndFrame):
                 if self._cached_playback_active:
@@ -2726,6 +2791,19 @@ class _SpokenTextGuard(FrameProcessor):
                     await self.push_frame(frame, direction)
                     return
 
+                if self._leading_buffer and getattr(self._context, "_response_truncated", False):
+                    # Preserve any completed sentences in a multi-sentence residual chunk.
+                    complete_end = 0
+                    while True:
+                        end = _find_sentence_end(self._leading_buffer[complete_end:])
+                        if end <= 0:
+                            break
+                        complete_end += end
+                    if self._leading_buffer[complete_end:].strip():
+                        logger.warning("SpokenTextGuard: Suppressed unfinished length-limited tail")
+                    self._leading_buffer = self._leading_buffer[:complete_end]
+                if self._leading_buffer and self._suppressing_duplicate_turn:
+                    self._leading_buffer = ""
                 if self._leading_buffer:
                     cleaned = self._strip_meta_announcements(self._leading_buffer)
                     cleaned = self._strip_repeated_opening(cleaned)
@@ -2735,13 +2813,7 @@ class _SpokenTextGuard(FrameProcessor):
                     if cleaned.strip():
                         norm = self._normalize(cleaned)
                         if norm.strip():
-                            clean_norm = re.sub(r"[^\w\s]", "", norm.lower()).strip()
-                            clean_last = re.sub(r"[^\w\s]", "", self._last_spoken_turn_text.lower()).strip()
-                            is_dup = bool(
-                                clean_last
-                                and len(clean_last) >= 8
-                                and (clean_norm == clean_last or clean_norm in clean_last or clean_last in clean_norm)
-                            )
+                            is_dup = self._is_recent_duplicate(norm)
                             if not is_dup:
                                 self._current_turn_spoken_text += norm
                                 self._turn_has_spoken_or_generated = True
@@ -3075,6 +3147,25 @@ def _compute_pcm_rms(audio: bytes) -> int:
         return int(np.sqrt(np.mean(samples.astype(np.float32)**2)))
 
 
+class _TTSStallObserver(FrameProcessor):
+    """Lives after the audio gate. Actual output cancels the pending first-audio hedge."""
+    def __init__(self, state):
+        super().__init__()
+        self.state = state
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, (UserStartedSpeakingFrame, InterruptionFrame)):
+            self.state.cancel(new_turn=True)
+        elif isinstance(frame, (AudioRawFrame, BotStartedSpeakingFrame)) or frame.__class__.__name__ in ("CancelFrame", "EndFrame", "EndTaskFrame"):
+            self.state.cancel()
+        await self.push_frame(frame, direction)
+
+    async def cleanup(self):
+        self.state.cancel()
+        await super().cleanup()
+
+
 class _AudioInputGate(FrameProcessor):
     """Pre-STT Voice Activity & Energy Gate (Priority 2).
 
@@ -3150,7 +3241,7 @@ def _is_name_confirmation_affirmative(user_text: str) -> bool:
     clean = re.sub(r"[^\w\s]", "", user_text.lower()).strip()
     if clean in _AFFIRMATIVE_CONFIRMATIONS:
         return True
-    if any(clean.startswith(prefix) for prefix in ("yes ", "yeah ", "haan ", "speaking", "this is ")):
+    if any(clean.startswith(prefix) for prefix in ("yes ", "yeah ", "haan ", "speaking", "this is ")) and len(clean.split()) <= 4:
         if not any(neg in clean for neg in ("not", "no", "wrong", "busy", "later", "who", "which")):
             return True
     return False
@@ -3174,8 +3265,13 @@ class _FastPathRouter(FrameProcessor):
         history_pruner: Any = None,
         call_metrics: Any = None,
         delayed_race_filler: Any = None,
+        call_end_coordinator: Any = None,
+        on_whatsapp_consent=None,
+        on_visit_ready=None,
     ):
         super().__init__()
+        self._on_whatsapp_consent = on_whatsapp_consent
+        self._on_visit_ready = on_visit_ready
         self._stream_id = stream_id
         self._lead_memory = lead_memory if lead_memory is not None else {}
         self._config = config or {}
@@ -3183,6 +3279,7 @@ class _FastPathRouter(FrameProcessor):
         self._call_metrics = call_metrics
         self._delayed_race_filler = delayed_race_filler
         self._turn_count = 0
+        self._call_end_coordinator = call_end_coordinator
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -3217,7 +3314,74 @@ class _FastPathRouter(FrameProcessor):
                         latest_user_text = c.strip()
                     break
 
+            if self._call_end_coordinator and getattr(self._call_end_coordinator, "_ended", False):
+                return
             if latest_user_text:
+                if self._call_end_coordinator and getattr(self._call_end_coordinator, "is_ending", False):
+                    if not genuine_late_question(latest_user_text):
+                        return
+                    if getattr(self._call_end_coordinator, "_late_reply_routed", False):
+                        return
+                    self._call_end_coordinator._late_reply_routed = True
+
+                memory = self._lead_memory or {}
+                if visit_intent(latest_user_text, memory):
+                    date = memory.get("visit_date_iso")
+                    slot = memory.get("time_slot")
+                    if date and slot and self._on_visit_ready:
+                        await self._on_visit_ready(date, slot)
+                        return
+                    if date and not slot:
+                        line = "Kal kitne baje aana chahenge?" if re.search(r"[\u0900-\u097f]|\bkal\b", latest_user_text, re.I) else "What time would you like to visit?"
+                        await self.push_frame(TTSSpeakFrame(text=line, append_to_context=True), direction)
+                        return
+
+                if self._call_end_coordinator and (pure_farewell(latest_user_text) or closing_after_work(latest_user_text, memory)):
+                    if getattr(self._call_end_coordinator, "_dedicated_goodbye_queued", False):
+                        return
+                    self._call_end_coordinator._dedicated_goodbye_queued = True
+                    self._call_end_coordinator.request_ending()
+                    await self.push_frame(TTSSpeakFrame(text=SHORT_GOODBYE, append_to_context=True), direction)
+                    return
+
+                if fragment_transcript(latest_user_text):
+                    await self.push_frame(TTSSpeakFrame(text="Sorry, could you repeat that?", append_to_context=True), direction)
+                    return
+                if re.fullmatch(r"(?:okay|ok|sure|yes)[.!]?", latest_user_text.lower()) and any("connection" in str(m.get("content", "")).lower() and any(w in str(m.get("content", "")).lower() for w in ("trouble", "unavailable")) for m in messages[-3:] if m.get("role") == "assistant"):
+                    return
+                pending_action = (self._lead_memory or {}).get("_whatsapp_consent_action")
+                answer = whatsapp_answer(messages, pending_action)
+                if answer == "consent" and self._on_whatsapp_consent:
+                    self._lead_memory.pop('_whatsapp_consent_action', None)
+                    if pending_action == 'brochure':
+                        self._lead_memory.pop('_brochure_consent_pending', None)
+                    await self._on_whatsapp_consent(pending_action)
+                    return
+                if answer == "declined":
+                    self._lead_memory.pop("_whatsapp_consent_action", None)
+                    self._lead_memory.pop("_brochure_consent_pending", None)
+                    await self.push_frame(TTSSpeakFrame(text="Okay, I won't send it.", append_to_context=True), direction)
+                    return
+
+                decision = brochure_decision(messages, bool((self._lead_memory or {}).get("_brochure_consent_pending")))
+                if decision == "needs_consent":
+                    self._lead_memory["_brochure_consent_pending"] = True
+                    self._lead_memory["_whatsapp_consent_action"] = "brochure"
+                    await self.push_frame(TTSSpeakFrame(text="May I send you the brochure and floor plans on WhatsApp?", append_to_context=True), direction)
+                    return
+                if decision == "declined":
+                    self._lead_memory.pop("_brochure_consent_pending", None)
+                    await self.push_frame(TTSSpeakFrame(text="Okay, I won't send it. What else would you like to know?", append_to_context=True), direction)
+                    return
+                if decision == "consent":
+                    self._lead_memory.pop('_brochure_consent_pending', None)
+                    self._lead_memory.pop('_whatsapp_consent_action', None)
+                    if self._on_whatsapp_consent:
+                        await self._on_whatsapp_consent("brochure")
+                        return
+                    await self.push_frame(frame, direction)
+                    return
+
                 assistant_msgs = [m for m in messages if m.get("role") == "assistant"]
 
                 # Priority 5: Turn-1 Affirmative confirmation
@@ -3232,6 +3396,23 @@ class _FastPathRouter(FrameProcessor):
                         self._call_metrics.record_cached_answer("opening_intro")
                     await self.push_frame(LLMFullResponseStartFrame(), direction)
                     await self.push_frame(TextFrame(text=fast_reply), direction)
+                    await self.push_frame(LLMFullResponseEndFrame(), direction)
+                    return
+
+                matched = campaign_faq(latest_user_text, self._lead_memory, self._config)
+                # Preserve old opt-in router for explicitly supplied minimal configs/test harnesses.
+                key = faq_key(latest_user_text)
+                if matched and self._config.get("faq_cache_enabled", False):
+                    key, reply = matched
+                elif key and self._config.get("faq_cache_enabled", False) and not self._config.get("real_estate_sales_script"):
+                    reply = FAQ_TEXTS[key]
+                else:
+                    key = None
+                if key:
+                    if self._call_metrics:
+                        self._call_metrics.record_cached_answer(key)
+                    await self.push_frame(LLMFullResponseStartFrame(), direction)
+                    await self.push_frame(TTSSpeakFrame(text=reply, append_to_context=True), direction)
                     await self.push_frame(LLMFullResponseEndFrame(), direction)
                     return
 
@@ -3498,6 +3679,31 @@ class _DelayedRaceFiller(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+# Human-style silence ladder lines. Spoken through live TTS (no LLM call).
+# Rules for editing: do NOT use phrases that _match_cached_phrase() maps to a cached wav
+# ("are you still there", "hello? are you there", "didn't catch that", "say that again",
+# "thanks for your time" + "have a great day"/"bye"), and keep the GOODBYE lines free of
+# farewell words ("bye", "take care", "have a ... day") - the call is ended by the
+# call-end coordinator, not by farewell-pattern detection.
+_SILENCE_SOFT_LINES = (
+    "Hello? Can you hear me okay?",
+    "Take your time, I'm right here whenever you're ready.",
+    "Hello? Just checking you're still on the line.",
+    "Hi, the line went quiet for a moment. Are you with me?",
+    "Hi, I can't hear you at the moment. Is everything alright?",
+)
+_SILENCE_SECOND_LINES = (
+    "Hello? I'm not hearing anything on my side. Could you say something if you can hear me?",
+    "Just checking once more, are you able to hear me? If it's a bad time, I'm happy to call back.",
+    "The line might be unclear. If now isn't a good time, just let me know and I'll call you later.",
+)
+_SILENCE_GOODBYE_LINES = (
+    "It sounds like now isn't a good time, so I'll let you go. Thank you for your time, and we'll try you again later.",
+    "Looks like you're tied up, so I'll let you get back to it. Thank you for your time. We'll reach out again soon.",
+    "I'm not able to hear you, so I'll end the call here. Thank you for your time. Feel free to call us back anytime.",
+)
+
+
 class _SilenceChecker(FrameProcessor):
     """
     Production-grade silence monitor adhering to enterprise voice standards:
@@ -3516,9 +3722,9 @@ class _SilenceChecker(FrameProcessor):
         silence_threshold_secs: float = 15.0,
         second_threshold_secs: float = 14.0,
         third_threshold_secs: float = 14.0,
-        check_in_message: str = "Hello? Are you there?",
-        second_check_in_message: str = "Looks like you're busy right now. I'll call you later, have a great day!",
-        goodbye_message: str = "Looks like you're busy right now. I'll call you later, have a great day!",
+        check_in_message: str | None = None,
+        second_check_in_message: str | None = None,
+        goodbye_message: str | None = None,
         force_hangup_fn: Callable[[str], Awaitable[None]] | None = None,
         poll_interval_secs: float = 1.0,
         call_metrics: Any = None,
@@ -3541,6 +3747,8 @@ class _SilenceChecker(FrameProcessor):
         self._lead_memory = lead_memory
         self._shutdown_state: dict[str, bool] | None = None
         self._termination_processor: Any = None
+        self._rng = random.Random()
+        self._used_lines: set[str] = set()
 
         self._last_user_speech_time: float | None = None
         self._bot_speaking_finish_time: float | None = None
@@ -3564,6 +3772,32 @@ class _SilenceChecker(FrameProcessor):
 
     def set_task(self, task: PipelineTask) -> None:
         self._task = task
+
+    def _pick_line(self, fixed: str | None, pool: tuple[str, ...]) -> str:
+        """An explicit constructor message wins; otherwise a random unused line from the pool."""
+        if fixed:
+            return fixed
+        fresh = [l for l in pool if l not in self._used_lines] or list(pool)
+        line = self._rng.choice(fresh)
+        self._used_lines.add(line)
+        return line
+
+    async def _say_goodbye_and_end(self, line: str) -> None:
+        """Speak the goodbye through TTS, then end the call after it has actually played."""
+        try:
+            if line and self._task and not self._is_call_ending:
+                await self._task.queue_frames([TTSSpeakFrame(text=line, append_to_context=False)])
+                # Wait (max 4s) for goodbye audio to start, so the coordinator's 0.8s
+                # "no closing line yet" fallback cannot speak a second goodbye.
+                t0 = time.monotonic()
+                while not self._bot_is_speaking and time.monotonic() - t0 < 4.0:
+                    await asyncio.sleep(0.1)
+            if self._call_end_coordinator is not None:
+                self._call_end_coordinator.request_ending()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error("[{}] SilenceChecker goodbye failed: {}", self._stream_id, e)
 
     @property
     def _is_call_ending(self) -> bool:
@@ -3602,8 +3836,12 @@ class _SilenceChecker(FrameProcessor):
         
         if self._hangup_action_task and not self._hangup_action_task.done():
             self._hangup_action_task.cancel()
-            self._hangup_action_task = None
             logger.info("[{}] SilenceChecker: user spoke — aborted pending auto-termination", self._stream_id)
+        self._hangup_action_task = None
+
+        if self._call_end_coordinator and getattr(self._call_end_coordinator, "_dedicated_goodbye_queued", False):
+            # Deliberate farewell is not an idle warning. Preserve quiet barge-in window.
+            return
 
         if self._call_end_coordinator and getattr(self._call_end_coordinator, "is_ending", False):
             self._call_end_coordinator.cancel_ending("user spoke after silence warning")
@@ -3658,13 +3896,15 @@ class _SilenceChecker(FrameProcessor):
                 self._last_user_speech_time = now
                 self._bot_speaking_finish_time = now
                 self._turn_in_flight = False
-                if self._check_in_message:
+                if not self._is_call_ending:
                     logger.info("[{}] SilenceChecker: {}s user silence -> sending first soft nudge", self._stream_id, self._silence_threshold_secs)
                     try:
                         if self._call_metrics and hasattr(self._call_metrics, "mark_silence_nudge"):
                             self._call_metrics.mark_silence_nudge(stage=1)
                         if self._task and not self._is_call_ending:
-                            await self._task.queue_frames([TTSSpeakFrame(text=self._check_in_message, append_to_context=False)])
+                            _nudge = TTSSpeakFrame(text=self._pick_line(self._check_in_message, _SILENCE_SOFT_LINES), append_to_context=False)
+                            _nudge.is_silence_nudge = True
+                            await self._task.queue_frames([_nudge])
                     except Exception as e:
                         logger.error("[{}] SilenceChecker failed to queue first nudge: {}", self._stream_id, e)
 
@@ -3677,13 +3917,15 @@ class _SilenceChecker(FrameProcessor):
                 self._last_user_speech_time = now
                 self._bot_speaking_finish_time = now
                 self._turn_in_flight = False
-                if self._second_check_in_message:
+                if not self._is_call_ending:
                     logger.info("[{}] SilenceChecker: {}s user silence -> sending second soft nudge", self._stream_id, self._second_threshold_secs)
                     try:
                         if self._call_metrics and hasattr(self._call_metrics, "mark_silence_nudge"):
                             self._call_metrics.mark_silence_nudge(stage=2)
                         if self._task and not self._is_call_ending:
-                            await self._task.queue_frames([TTSSpeakFrame(text=self._second_check_in_message, append_to_context=False)])
+                            _nudge = TTSSpeakFrame(text=self._pick_line(self._second_check_in_message, _SILENCE_SECOND_LINES), append_to_context=False)
+                            _nudge.is_silence_nudge = True
+                            await self._task.queue_frames([_nudge])
                     except Exception as e:
                         logger.error("[{}] SilenceChecker failed to queue second nudge: {}", self._stream_id, e)
 
@@ -3700,15 +3942,14 @@ class _SilenceChecker(FrameProcessor):
                 except Exception:
                     pass
 
+                goodbye_line = self._pick_line(self._goodbye_message, _SILENCE_GOODBYE_LINES)
                 if self._call_end_coordinator is not None:
-                    if self._goodbye_message and self._task and not self._is_call_ending:
-                        await self._task.queue_frames([TTSSpeakFrame(text=self._goodbye_message, append_to_context=False)])
-                    self._call_end_coordinator.request_ending()
+                    self._hangup_action_task = asyncio.create_task(self._say_goodbye_and_end(goodbye_line))
                 else:
                     async def _execute_hangup():
                         try:
-                            if self._goodbye_message and self._task and not self._is_call_ending:
-                                await self._task.queue_frames([TTSSpeakFrame(text=self._goodbye_message, append_to_context=False)])
+                            if goodbye_line and self._task and not self._is_call_ending:
+                                await self._task.queue_frames([TTSSpeakFrame(text=goodbye_line, append_to_context=False)])
                                 await asyncio.sleep(2.0)
                             if self._force_hangup_fn and not self._is_call_ending:
                                 await self._force_hangup_fn("silence_timeout_unanswered")
@@ -3949,6 +4190,9 @@ class _TranscriptionTap(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
+        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, TranscriptionFrame) and frame.text.strip() and (not valid_transcript(frame.text) or fragment_transcript(frame.text)):
+            logger.info("Dropping nonlinguistic STT noise before aggregation: {!r}", frame.text[:60])
+            frame.text = ""  # preserve the empty-turn lifecycle, never add noise to LLM context
         if self._collector and direction == FrameDirection.DOWNSTREAM:
             if isinstance(frame, ProposedUserStoppedSpeakingFrame):
                 self._collector._speech_stop_at = time.monotonic()
@@ -4175,7 +4419,7 @@ class DebouncedExternalUserTurnStopStrategy(ExternalUserTurnStopStrategy):
         # If user gave a definitive 1-2 word answer and VAD has cleared, trigger immediately.
         # For longer sentences, let _task_handler wait for the debounced timeout so the user
         # is never cut off mid-sentence while pausing to think or formulate their thoughts.
-        if not self._user_speaking and self._turn_open and self._is_immediate_answer(self._text):
+        if not self._user_speaking and self._turn_open and (self._is_immediate_answer(self._text) or terminal_answer(self._text, self._is_pure_filler(self._text), self._ends_with_continuation_connector(self._text))):
             await self._maybe_trigger_user_turn_stopped()
 
     async def _maybe_trigger_user_turn_stopped(self):
@@ -4600,6 +4844,16 @@ class _TerminationProcessor(FrameProcessor):
     ) -> None:
         await super().process_frame(frame, direction)
 
+        # Exactly one timer owner. Dedicated farewell/coordinator owns grace and late replies.
+        if self._call_end_coordinator and self._call_end_coordinator.is_ending:
+            for attr in ("_hangup_task", "_safety_task"):
+                pending = getattr(self, attr, None)
+                if pending and pending is not asyncio.current_task() and not pending.done():
+                    pending.cancel()
+                setattr(self, attr, None)
+            await self.push_frame(frame, direction)
+            return
+
         # FIX 7: In _TerminationProcessor, do not cancel hangup on caller interruption; allow max 1 post-farewell reply, then hang up logging "hangup completed reason=farewell"
         if isinstance(frame, (InterruptionFrame, UserStartedSpeakingFrame)):
             if self._termination_requested:
@@ -4787,6 +5041,7 @@ class _CallEndCoordinator(FrameProcessor):
         self._fallback_seconds = fallback_seconds
 
         self._requested = False
+        self._dedicated_goodbye_queued = False
         self._awaiting_closing = False
         self._closing_in_progress = False
         self._in_grace = False
@@ -4824,6 +5079,8 @@ class _CallEndCoordinator(FrameProcessor):
         return self._closing_in_progress
 
     def request_ending(self) -> None:
+        if self._ended or self._requested:
+            return
         self._requested = True
         self._cancel_task("_safety_task")
         self._cancel_task("_closing_fallback_task")
@@ -4864,6 +5121,7 @@ class _CallEndCoordinator(FrameProcessor):
         )
 
         self._requested = False
+        self._dedicated_goodbye_queued = False
         self._awaiting_closing = False
         self._closing_in_progress = False
         self._in_grace = False
@@ -4880,7 +5138,7 @@ class _CallEndCoordinator(FrameProcessor):
     def _cancel_task(self, attr: str) -> None:
         task = getattr(self, attr)
 
-        if task is not None and not task.done():
+        if task is not None and task is not asyncio.current_task() and not task.done():
             task.cancel()
 
         setattr(self, attr, None)
@@ -4940,6 +5198,13 @@ class _CallEndCoordinator(FrameProcessor):
             except Exception as e:
                 logger.error("[{}] Failed to queue fallback closing line: {}", self._stream_id, e)
 
+    async def _wait_late_transcript(self) -> None:
+        try:
+            await asyncio.sleep(min(8.0, self._safety_seconds))
+            await self._finish()
+        except asyncio.CancelledError:
+            return
+
     async def _run_grace_timeout(self) -> None:
         try:
             await asyncio.sleep(self._grace_seconds)
@@ -4979,9 +5244,12 @@ class _CallEndCoordinator(FrameProcessor):
                 or self._in_grace
             )
         ):
-            # Prior late-barge-in contract:
-            # Does NOT cancel the final hangup. Closing audio is preserved by AudioGate.
-            pass
+            # Speech that starts inside grace gets bounded time for final STT.
+            # Only start once: noise/repeated VAD must not extend ending indefinitely.
+            if self._in_grace and self._extra_reply_count < 1 and not getattr(self, '_late_speech_started', False):
+                self._late_speech_started = True
+                self._cancel_task('_grace_task')
+                self._grace_task = asyncio.create_task(self._wait_late_transcript())
 
         if isinstance(frame, (TTSStartedFrame, TTSAudioRawFrame, BotStartedSpeakingFrame)):
             self._current_audio_active = True
@@ -5028,9 +5296,12 @@ class _CallEndCoordinator(FrameProcessor):
                     text,
                 )
                 frame.text = ""
-                await self._finish()
+                # No extra speech. Bound a VAD-started transcript allowance after an acknowledgment.
+                if getattr(self, '_late_speech_started', False):
+                    self._cancel_task('_grace_task')
+                    self._grace_task = asyncio.create_task(self._run_grace_timeout())
                 return
-            elif text and len(text) > 2:
+            elif genuine_late_question(text):
                 # Late-barge-in contract: does NOT cancel the final hangup; allows at most ONE extra reply!
                 if getattr(self, "_extra_reply_count", 0) < 1:
                     self._extra_reply_count = getattr(self, "_extra_reply_count", 0) + 1
@@ -5366,7 +5637,7 @@ async def execute_book_site_visit(
         from leads.worker import normalize_visit_date, normalize_visit_time, _resolve_visit_datetime, format_spoken_date, format_spoken_time
         _now_ist = datetime.now(_zi.ZoneInfo("Asia/Kolkata"))
         date_result = normalize_visit_date(date_raw, _now_ist)
-        norm_time = normalize_visit_time(time_raw)
+        norm_time = visit_time(time_raw)
         vague_times = {"morning", "afternoon", "evening", "night", "subah", "dopahar", "shaam", "raat", "anytime", "any time"}
         if time_raw.lower().strip() in vague_times:
             norm_time = None
@@ -5430,12 +5701,18 @@ async def execute_book_site_visit(
                 idemp_spoken_date = format_spoken_date(stored_date, _now_ist, active_lang)
                 idemp_spoken_time = format_spoken_time(stored_time, active_lang)
                 confirm_msg = f"Site visit confirmed for {idemp_spoken_date} at {idemp_spoken_time}."
-                if existing_sv.whatsapp_status == "sent":
-                    confirm_msg += " You will receive the location on WhatsApp."
+                if (config or {}).get("whatsapp_after_call_only", False):
+                    if lead_memory and 'location' not in (lead_memory.get('_postcall_whatsapp_actions') or []):
+                        confirm_msg += " Want the location on WhatsApp after this call?"
+                        lead_memory['_whatsapp_consent_action'] = 'location'
+                elif existing_sv.whatsapp_status == "sent":
+                    confirm_msg += " The location is on its way."
                 elif existing_sv.whatsapp_status == "queued":
-                    confirm_msg += " We have queued the location details to your WhatsApp."
+                    confirm_msg += " I'll WhatsApp you the location."
                 elif not existing_sv.whatsapp_opt_in:
-                    confirm_msg += " Shall I send the details on WhatsApp?"
+                    confirm_msg += " Want the location on WhatsApp after this call?"
+                    if lead_memory is not None:
+                        lead_memory["_whatsapp_consent_action"] = "location"
 
                 wa_confirmed = existing_sv.whatsapp_status in ("sent", "queued")
                 if spoken_text_guard and hasattr(spoken_text_guard, "mark_tool_succeeded"):
@@ -5503,8 +5780,8 @@ async def execute_book_site_visit(
                     return
 
             # 5. WhatsApp opt-in and dispatch
-            whatsapp_opt_in = bool(
-                (lead_memory and lead_memory.get("whatsapp"))
+            whatsapp_opt_in = not (config or {}).get("whatsapp_after_call_only", False) and bool(
+                (lead_memory and lead_memory.get("whatsapp_opt_in"))
                 or call_rec.get("whatsapp_opt_in")
             )
             wa_status = "not_requested"
@@ -5602,13 +5879,15 @@ async def execute_book_site_visit(
             lead_memory["disposition"] = "SITE_VISIT_BOOKED"
             lead_memory["lead_id"] = str(lead_obj.id)
 
-        confirm_msg = f"Site visit confirmed for {spoken_date} at {spoken_time}."
+        confirm_msg = f"Perfect, you're booked for {spoken_date} at {spoken_time}."
         if wa_status == "sent":
-            confirm_msg += " You will receive the location on WhatsApp."
+            confirm_msg += " The location is on its way."
         elif wa_status == "queued":
-            confirm_msg += " We have queued the location details to your WhatsApp."
+            confirm_msg += " I'll WhatsApp you the location."
         elif not whatsapp_opt_in:
-            confirm_msg += " Shall I send the details on WhatsApp?"
+            confirm_msg += " Want the location on WhatsApp after this call?"
+            if lead_memory is not None:
+                lead_memory["_whatsapp_consent_action"] = "location"
 
         wa_confirmed = wa_status in ("sent", "queued")
         if spoken_text_guard and hasattr(spoken_text_guard, "mark_tool_succeeded"):
@@ -5908,7 +6187,13 @@ async def run_bot(
             return
 
         hangup_state["done"] = True
-        await force_provider_hangup(trigger)
+        if call_type != "web":
+            await force_provider_hangup(trigger)
+        elif websocket:
+            try:
+                await websocket.close(code=1000, reason="Call completed")
+            except Exception as exc:
+                logger.debug("[{}] Web close notice: {}", stream_id, exc)
         # Cancel pipeline task upon call completion
         await task.cancel()
 
@@ -6056,7 +6341,7 @@ async def run_bot(
 
         # Fire and forget -- runs concurrently with greeting playback,
         # so the socket and prefix cache are hot before caller finishes their first turn.
-        if config.get("llm_cache_prewarm_enabled", True):
+        if config.get("llm_cache_prewarm_enabled", False):
             asyncio.create_task(_warm_llm_context_cache())
 
         async def _fast_side_channel_reply(
@@ -6240,9 +6525,9 @@ async def run_bot(
                 stream_id,
             )
 
-            await force_provider_hangup(
-                "call_end_coordinator"
-            )
+            silence_checker.stop()
+            if call_type != "web":
+                await force_provider_hangup("call_end_coordinator")
 
             # Farewell drain order on web calls: allow browser audio buffer to drain (0.8s) before closing websocket
             if call_type == "web" and websocket:
@@ -6257,7 +6542,7 @@ async def run_bot(
 
         rejection_attempts = {"count": 0}
 
-        grace_seconds = float(config.get("hangup_grace_seconds", 0.8))
+        grace_seconds = float(config.get("hangup_grace_seconds", 3.0))
         logger.info("[{}] Resolved hangup grace_seconds={:.2f}s", stream_id, grace_seconds)
 
         termination_processor = _TerminationProcessor(
@@ -6349,7 +6634,7 @@ async def run_bot(
             ]) or any(w in str(reason).lower() for w in ["declin", "not_interested", "reject"])
 
             # If caller expressed an objection, it takes precedence over "bye" on first 2 objection attempts
-            is_objection = has_objection_phrase and rejection_attempts["count"] <= 2
+            is_objection = has_objection_phrase and not pure_farewell(latest_user_text) and rejection_attempts["count"] <= 2
             is_clean_close = not is_objection and (is_explicit_end or is_soft_close_phrase)
 
             has_question = any(q in lower_text for q in [
@@ -6376,8 +6661,8 @@ async def run_bot(
                             "status": "ignored",
                             "message": (
                                 f"Do NOT hang up yet! (Convincing attempt {rejection_attempts['count']}/2). "
-                                "Acknowledge that you are Meridian Group's AI assistant warmly, and convince them slightly: "
-                                "probe if Prime Tech Corridor location or price is their concern, or offer to WhatsApp the brochure. "
+                                "Ask one natural question about their stated concern; do not reintroduce yourself. "
+                                "Probe if Prime Tech Corridor location or price is their concern. "
                                 "Keep them engaged!"
                             ),
                         },
@@ -6414,7 +6699,7 @@ async def run_bot(
             )
 
             # Request call ending through coordinator: ensures closing speech finishes before hangup
-            call_end_coordinator.request_ending()
+            await queue_goodbye(call_end_coordinator, task)
 
             # Return success to Pipecat with run_llm=False so the model DOES NOT generate again!
             await params.result_callback(
@@ -6452,7 +6737,10 @@ async def run_bot(
                 await params.result_callback({"status": "error"})
 
         async def book_site_visit(params) -> None:
-            """Tool handler for booking property site visit slots."""
+            """Model arguments alone do not establish a caller-selected slot."""
+            if not caller_slot_matches(context.messages, params.arguments or {}):
+                await params.result_callback({"status": "needs_confirmation", "message": "Ask only for the missing day or time. Do not invent a slot."}, properties=FunctionCallResultProperties(run_llm=False))
+                return
             await execute_book_site_visit(
                 params,
                 stream_id=stream_id,
@@ -6464,60 +6752,78 @@ async def run_bot(
             )
 
         async def send_brochure(params) -> None:
-            """Tool handler for dispatching property brochure & payment plans via WhatsApp."""
-            tool_call_started_at = time.monotonic()
-            args = params.arguments or {}
-            notes = str(args.get("notes", ""))
-            logger.info(f"[{stream_id}] Tool send_brochure called: notes={notes}")
-
+            if config.get('whatsapp_after_call_only', False) and 'brochure' in (lead_memory.get('_postcall_whatsapp_actions') or []):
+                await params.result_callback({'status':'prepared_not_sent'}, properties=FunctionCallResultProperties(run_llm=False))
+                return
+            decision = whatsapp_answer(context.messages, "brochure" if lead_memory.get("_brochure_consent_pending") else None) or brochure_decision(context.messages, bool(lead_memory.get("_brochure_consent_pending")))
+            if decision == "not_requested":
+                # An unsolicited tool call must not turn goodbye/unrelated text into another pitch.
+                await params.result_callback({'status':'not_requested'}, properties=FunctionCallResultProperties(run_llm=False))
+                return
+            if decision == "declined":
+                lead_memory.pop("_brochure_consent_pending", None)
+                await params.result_callback({"status": "declined", "message": "No send. Continue with the caller's question."}, properties=FunctionCallResultProperties(run_llm=True))
+                return
+            if decision == "needs_consent":
+                lead_memory["_brochure_consent_pending"] = True
+                lead_memory["_whatsapp_consent_action"] = "brochure"
+                await finish_brochure(params, {"status": "needs_consent"}, task, spoken_text_guard)
+                return
+            lead_memory.pop("_brochure_consent_pending", None)
+            lead_memory.pop("_whatsapp_consent_action", None)
+            lead_memory["whatsapp_opt_in"] = True
+            if config.get("whatsapp_after_call_only", False):
+                line = record_manual_whatsapp(lead_memory, config, 'brochure')
+                await params.result_callback({'status':'prepared_not_sent'}, properties=FunctionCallResultProperties(run_llm=False))
+                if line:
+                    frame = TTSSpeakFrame(text=line, append_to_context=True)
+                    frame.is_deterministic_confirmation = True
+                    await task.queue_frames([frame])
+                return
+            if not whatsapp_ready():
+                await finish_brochure(params, {"status":"not_configured"}, task, spoken_text_guard)
+                return
+            started = time.monotonic()
+            result = {"status": "failed", "error": "Unable to queue brochure"}
             try:
-                await lead_state.record_fields_async(
-                    stream_id,
-                    {
-                        "whatsapp": "sent",
-                        "disposition": "CALLBACK_REQUESTED",
-                    },
-                )
-
-                call_rec = (await lead_state.get_call_async(stream_id)) or {}
-                lead_id_val = call_rec.get("lead_id")
-
-                if lead_id_val:
-                    try:
-                        from leads.db import get_session
-                        from leads.models import Lead, Touchpoint
-                        from leads.outbox import queue_outbox_item
-                        async with get_session() as session:
-                            lead_obj = await session.get(Lead, uuid.UUID(lead_id_val))
-                            if lead_obj:
-                                tp = Touchpoint(
-                                    lead_id=lead_obj.id,
-                                    kind="whatsapp_out",
-                                    call_id=stream_id,
-                                    summary=f"Brochure dispatched via WhatsApp. {notes}".strip(),
-                                    occurred_at=datetime.now(timezone.utc),
-                                )
-                                session.add(tp)
-                                await queue_outbox_item(lead_obj.id, "whatsapp", {"action": "send_brochure", "notes": notes})
-                    except Exception as exc:
-                        logger.warning(f"[{stream_id}] send_brochure DB sync warning: {exc}")
-
-                call_metrics.record_tool_call(
-                    "send_brochure",
-                    success=True,
-                    latency_ms=(time.monotonic() - tool_call_started_at) * 1000,
-                )
-                await params.result_callback(
-                    {"status": "sent", "message": "Brochure and floor plans sent via WhatsApp."}
-                )
+                from sqlalchemy import select
+                from leads.db import get_session
+                from leads.models import Lead, SiteVisit
+                from leads.outbox import queue_outbox_item
+                rec = (await lead_state.get_call_async(stream_id)) or {}
+                fields = json.loads(rec.get("lead_fields") or "{}")
+                consent = bool(lead_memory.get("whatsapp_opt_in") or fields.get("whatsapp_opt_in") or rec.get("whatsapp_opt_in"))
+                async with get_session() as session:
+                    lid = rec.get("lead_id") or fields.get("lead_id")
+                    lead = await session.get(Lead, uuid.UUID(lid)) if lid else None
+                    phone = (rec.get("customer_phone") or rec.get("phone") or lead_memory.get("phone") or (lead.phone if lead else ""))
+                    if call_type == "web":
+                        phone = os.getenv("WHATSAPP_TEST_RECIPIENT", "")
+                    payload, error = brochure_payload(stream_id, phone,
+                        lead.name if lead else rec.get("customer_name"),
+                        lead_memory.get("visit_date_iso") or fields.get("visit_date_iso"),
+                        lead_memory.get("time_slot") or fields.get("time_slot"), config, consent)
+                    if error:
+                        result = {"status": error}
+                    elif not lead:
+                        result = {"status": "needs_lead"}
+                    else:
+                        item = await queue_outbox_item(lead.id, "whatsapp", payload, session=session)
+                        await session.flush()
+                        result = {"status": "queued", "outbox_id": str(item.id)}
+                        if item.status == "done" and (item.payload or {}).get("message_id"):
+                            result = {"status": "sent", "message_id": item.payload["message_id"]}
+                        elif item.status == "failed":
+                            result = {"status": "failed", "error": item.last_error, "error_code": 131031 if "131031" in (item.last_error or "") else None}
+                        if consent:
+                            lead.consent_at = lead.consent_at or datetime.now(timezone.utc)
+                        await session.commit()
+                await lead_state.record_fields_async(stream_id, {"whatsapp": result["status"]})
             except Exception as exc:
-                logger.error(f"[{stream_id}] send_brochure error: {exc}")
-                call_metrics.record_tool_call(
-                    "send_brochure",
-                    success=False,
-                    latency_ms=(time.monotonic() - tool_call_started_at) * 1000,
-                )
-                await params.result_callback({"status": "error", "message": "Unable to send brochure automatically."})
+                logger.warning("[{}] Brochure queue failed: {}", stream_id, exc)
+            call_metrics.record_tool_call("send_brochure", success=result["status"] in ("queued", "sent"),
+                latency_ms=(time.monotonic() - started) * 1000)
+            await finish_brochure(params, result, task, spoken_text_guard)
 
         async def handoff_to_human(params) -> None:
             """Tool handler for human advisor escalation."""
@@ -6661,20 +6967,25 @@ async def run_bot(
             user_turn_start_strategies.insert(0, VADUserTurnStartStrategy())
 
         user_turn_stop_strategies = []
-        # Item 3: Try Pipecat Smart Turn (local ONNX model) first for sub-250ms endpointing
-        try:
-            from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
-            smart_analyzer = LocalSmartTurnAnalyzerV3()
-            user_turn_stop_strategies.append(
-                SarvamSmartTurnStopStrategy(turn_analyzer=smart_analyzer, stream_id=stream_id)
-            )
-            logger.info("[{}] Smart Turn endpointing enabled (SarvamSmartTurnStopStrategy with LocalSmartTurnAnalyzerV3)", stream_id)
-        except Exception as _st_err:
-            logger.info(
-                "[{}] Smart Turn not available ({}); fallback to debounced stop strategy",
-                stream_id,
-                _st_err,
-            )
+        # Default (restores the Oct 4 behaviour): transcript-aware 200ms debounce.
+        # Smart Turn (local ONNX model) is now OPT-IN: set turn_management.smart_turn_enabled: true.
+        use_smart_turn = bool(turn_config.get("smart_turn_enabled", False))
+        if use_smart_turn:
+            try:
+                from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+                smart_analyzer = LocalSmartTurnAnalyzerV3()
+                user_turn_stop_strategies.append(
+                    SarvamSmartTurnStopStrategy(turn_analyzer=smart_analyzer, stream_id=stream_id)
+                )
+                logger.info("[{}] Smart Turn endpointing enabled (SarvamSmartTurnStopStrategy with LocalSmartTurnAnalyzerV3)", stream_id)
+            except Exception as _st_err:
+                logger.info(
+                    "[{}] Smart Turn not available ({}); using debounced stop strategy",
+                    stream_id,
+                    _st_err,
+                )
+                use_smart_turn = False
+        if not use_smart_turn:
             user_turn_stop_strategies.append(
                 DebouncedExternalUserTurnStopStrategy(
                     timeout=float(
@@ -6686,7 +6997,7 @@ async def run_bot(
                     filler_debounce_seconds=float(
                         turn_config.get(
                             "filler_debounce_seconds",
-                            0.25,
+                            0.15,
                         )
                     ),
                     wait_for_transcript=True,
@@ -6775,9 +7086,6 @@ async def run_bot(
             silence_threshold_secs=float(config.get("silence_nudge_first_secs", 15.0)),
             second_threshold_secs=15.0,
             third_threshold_secs=15.0,
-            check_in_message="Hello? Are you still there?",
-            second_check_in_message="Sorry, I didn't catch that. Could you say that again?",
-            goodbye_message="Understood, thanks for your time. Have a wonderful day!",
             force_hangup_fn=_force_hangup_and_mark_done,
             call_metrics=call_metrics,
             lead_memory=lead_memory,
@@ -6800,13 +7108,71 @@ async def run_bot(
             context=context,
         )
 
+        fast_path_config = dict(config)
+        # An API-supplied campaign may override the bundled script. Never speak bundled facts
+        # unless they actually occur in the effective model prompt selected by prompt_builder.
+        fast_path_config["real_estate_sales_script"] = system_prompt
+        async def run_consented_whatsapp(action):
+            if lead_memory.get("_whatsapp_dispatching"):
+                return
+            lead_memory["_whatsapp_dispatching"] = True
+            consent_started = time.monotonic()
+            try:
+                if config.get('whatsapp_after_call_only', False):
+                    line = record_manual_whatsapp(lead_memory, config, action)
+                    if line:
+                        frame = TTSSpeakFrame(text=line, append_to_context=True)
+                        frame.is_deterministic_confirmation = True
+                        await task.queue_frames([frame])
+                    return
+                if action == "brochure":
+                    from types import SimpleNamespace
+                    async def record_result(result, **kwargs):
+                        logger.info("[{}] Deterministic brochure result: {}", stream_id, result.get("status"))
+                    await send_brochure(SimpleNamespace(arguments={}, result_callback=record_result))
+                elif action == "location":
+                    result = await queue_consented_location(stream_id)
+                    lead_memory.pop("_whatsapp_consent_action", None)
+                    lead_memory["whatsapp_opt_in"] = True
+                    lead_memory["whatsapp"] = result["status"]
+                    call_metrics.record_tool_call("send_visit_location", success=result["status"] in ("queued", "accepted"), latency_ms=(time.monotonic() - consent_started) * 1000)
+                    line = "I'll WhatsApp you the location." if result["status"] == "queued" else "The location is on its way." if result["status"] == "accepted" else "Our WhatsApp account is unavailable right now." if "131031" in (result.get("error") or "") else "I can't WhatsApp it right now."
+                    f = TTSSpeakFrame(text=line, append_to_context=True)
+                    f.is_deterministic_confirmation = True
+                    await task.queue_frames([f])
+            except Exception:
+                logger.exception("[{}] Deterministic WhatsApp queue failed", stream_id)
+                await task.queue_frames([TTSSpeakFrame(text="I can't send it right now. Please try again later.", append_to_context=True)])
+            finally:
+                lead_memory["_whatsapp_dispatching"] = False
+
+        async def finish_provider_failure():
+            await queue_goodbye(call_end_coordinator, task)
+        llm._on_provider_exhausted = finish_provider_failure
+
+        async def run_visit_ready(date, slot):
+            if lead_memory.get("_visit_dispatching") or lead_memory.get("disposition") == "SITE_VISIT_BOOKED":
+                return
+            lead_memory["_visit_dispatching"] = True
+            try:
+                from types import SimpleNamespace
+                async def record_booking(result, **kwargs):
+                    if result.get("status") != "confirmed":
+                        await task.queue_frames([TTSSpeakFrame(text="I couldn't book that visit yet. Please try again later.", append_to_context=True)])
+                await execute_book_site_visit(SimpleNamespace(arguments={"date":date,"time":slot}, result_callback=record_booking), stream_id=stream_id, call_metrics=call_metrics, spoken_text_guard=spoken_text_guard, lead_memory=lead_memory, call_type=call_type, config=config)
+            finally:
+                lead_memory["_visit_dispatching"] = False
+
         fast_path_router = _FastPathRouter(
             stream_id=stream_id,
             lead_memory=lead_memory,
-            config=config,
+            config=fast_path_config,
+            on_whatsapp_consent=run_consented_whatsapp,
+            on_visit_ready=run_visit_ready,
             history_pruner=history_pruner,
             call_metrics=call_metrics,
             delayed_race_filler=delayed_race_filler,
+            call_end_coordinator=call_end_coordinator,
         )
 
         spam_qualify_gate = _SpamQualifyGate(
@@ -6814,6 +7180,27 @@ async def run_bot(
             force_hangup_fn=_force_hangup_and_mark_done,
             is_call_ending=lambda: call_end_coordinator.is_ending,
         )
+
+        async def hedge_tts_stall():
+            if call_end_coordinator.is_ending or hangup_state["done"]:
+                return
+            pcm = _AUDIO_CACHE.get(sample_rate, {}).get("clarify_repeat")
+            if not pcm:
+                logger.error("[{}] TTS stall; cached hedge unavailable", stream_id)
+                return
+            logger.warning("[{}] TTS first audio stalled >2s; cancel stale synthesis and ask repeat once", stream_id)
+            await tts.process_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+            spoken_text_guard._record_assistant_spoken(_CACHED_PHRASE_TEXTS["clarify_repeat"], "clarify_repeat")
+            tts_stall_state.used = True
+            await interruption_audio_gate.play_cached_audio(pcm, sample_rate)
+
+        tts_stall_state = TTSStallState(hedge_tts_stall)
+        attach_safe_tts(tts, stream_id, tts_stall_state)
+        tts_stall_observer = _TTSStallObserver(tts_stall_state)
+        @tts.event_handler("on_tts_request")
+        async def watch_tts_request(service, context_id, text):
+            if not call_end_coordinator.is_ending:
+                tts_stall_state.arm()
 
         pipeline_elements = [transport.input()]
         if fallback_vad_processor is not None:
@@ -6830,6 +7217,7 @@ async def run_bot(
             spoken_text_guard,
             tts,
             interruption_audio_gate,
+            tts_stall_observer,
             call_end_coordinator,
             termination_processor,
             silence_checker,
@@ -7012,7 +7400,7 @@ async def run_bot(
                 # FIX 4: Drop STT garbage produced by music/noise (e.g. 'Iyamya.', 'लाळवान.').
                 # A valid user utterance must have at least 3 alphabetic characters total.
                 _alpha_count = sum(1 for c in str(user_content) if c.isalpha())
-                if _alpha_count < 3:
+                if not valid_transcript(str(user_content)):
                     silence_checker._turn_in_flight = False
                     silence_checker._user_is_speaking = False
                     stall_watchdog.disarm()
@@ -7073,7 +7461,7 @@ async def run_bot(
                         for pat in termination_processor.spoken_termination_patterns
                     )
 
-                if is_prev_farewell and str(user_content).strip():
+                if (is_prev_farewell or getattr(call_end_coordinator, "_dedicated_goodbye_queued", False)) and str(user_content).strip():
                     is_reciprocated = _is_farewell_or_acknowledgment(str(user_content))
                     clean_u = _PUNCT_RE.sub(" ", str(user_content).lower()).strip()
                     u_words = set(clean_u.split())
@@ -7091,9 +7479,7 @@ async def run_bot(
                             stream_id,
                             user_content,
                         )
-                        shutdown_state["active"] = True
-                        await _force_hangup_and_mark_done("farewell_reciprocated")
-                        await task.cancel()
+                        # Coordinator owns the eight-second quiet window; do not end early or re-speak.
                         return
 
             _coalesce_consecutive_messages(context.messages)
@@ -7205,6 +7591,18 @@ async def run_bot(
 
         # 2. Finalize call in SQLite so ended_at and disposition are persisted BEFORE report generation
         await lead_state.finalize_call_async(stream_id)
+        # Manual delivery only: export one copyable message in the report below.
+        # Meta is restricted. No queue/network send, even when credentials exist.
+
+        # Persist Sheets work BEFORE launching analysis/scoring. A missing lead must not lose a call.
+        try:
+            from leads.outbox import queue_call_sheet_export
+            await queue_call_sheet_export(stream_id)
+        except Exception:
+            logger.exception("[{}] SHEETS_QUEUE_FAILED: call saved but export not queued; retry required", stream_id)
+
+        if current_lead_mem is not None:
+            current_lead_mem['_manual_whatsapp_output'] = manual_whatsapp_message(current_lead_mem, config)
 
         # 3. Immediate, deterministic local report generation: takes <1ms, $0 cost,
         # never waits on external LLMs, guaranteed to write on every call completion.
@@ -7219,14 +7617,11 @@ async def run_bot(
             except BaseException as e:
                 logger.warning("[{}] Failed writing local test report: {}", stream_id, e)
 
-            # Background AI post-call analysis (runs fire-and-forget, zero live latency impact)
-            if os.getenv("GROQ_API_KEY") or os.getenv("CRM_WEBHOOK_URL") or os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID"):
-                asyncio.create_task(call_analytics.analyze_call(stream_id, transcript_to_use))
-
+            # One analytics owner only: the scoring job receives the real transcript.
             # Background arq lead worker scoring, touchpoint logging, and CRM dispatch
             try:
                 from leads.worker import enqueue_on_call_finished
-                asyncio.create_task(enqueue_on_call_finished(stream_id))
+                asyncio.create_task(enqueue_on_call_finished(stream_id, transcript_to_use))
             except Exception as exc:
                 logger.debug(f"[{stream_id}] Enqueue on_call_finished warning: {exc}")
 
@@ -7259,3 +7654,63 @@ async def run_bot(
         logger.remove(
             log_handler
         )
+
+def caller_slot_matches(messages, arguments):
+    from leads.worker import normalize_visit_date, normalize_visit_time
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    selected = {}
+    for message in messages:
+        if message.get("role") == "user" and isinstance(message.get("content"), str):
+            fields = _extract_lead_preferences(message["content"])
+            for key in ("visit_date_iso", "time_slot"):
+                if fields.get(key):
+                    selected[key] = fields[key]
+    requested_date = normalize_visit_date(str(arguments.get("date", "")), now)
+    raw_time = str(arguments.get("time", ""))
+    requested_time = visit_time(raw_time)
+    return bool(requested_date and requested_time and selected.get("visit_date_iso") == requested_date[0]
+                and selected.get("time_slot") == requested_time)
+
+
+def attach_safe_tts(tts, stream_id="", stall_state=None):
+    original = tts.run_tts
+    async def run_safe(text, context_id):
+        clean = safe_tts_text(text)
+        if not clean:
+            logger.info("[{}] Skipped nonlinguistic aggregated TTS segment", stream_id)
+            return
+        if stall_state is not None:
+            stall_state.arm()
+        async for output in original(clean, context_id):
+            yield output
+    tts.run_tts = run_safe
+
+
+async def queue_consented_location(stream_id):
+    if not whatsapp_ready():
+        return {"status":"not_configured", "error":"WhatsApp is not set up"}
+    from sqlalchemy import select
+    from leads.db import get_session
+    from leads.models import SiteVisit, Lead
+    from leads.outbox import queue_outbox_item
+    async with get_session() as session:
+        visit = (await session.execute(select(SiteVisit).where(SiteVisit.call_id == stream_id))).scalars().first()
+        if not visit:
+            return {"status": "needs_visit"}
+        lead = await session.get(Lead, visit.lead_id)
+        if not lead or not lead.phone:
+            return {"status": "needs_phone"}
+        item = await queue_outbox_item(lead.id, "whatsapp", {
+            "call_id": stream_id, "phone": lead.phone, "name": lead.name,
+            "visit_date_iso": visit.visit_date_iso, "time_slot": visit.time_slot}, session=session)
+        visit.whatsapp_opt_in = True
+        visit.whatsapp_opt_in_at = datetime.now(timezone.utc)
+        if item.status == "done" and (item.payload or {}).get("message_id"):
+            status = "accepted"
+            visit.whatsapp_message_id = item.payload["message_id"]
+        else:
+            status = "failed" if item.status == "failed" else "queued"
+        visit.whatsapp_status = "sent" if status == "accepted" else status
+        await session.commit()
+        return {"status": status, "error": item.last_error, "outbox_id": str(item.id)}

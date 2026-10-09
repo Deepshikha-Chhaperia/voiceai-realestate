@@ -31,7 +31,7 @@ async def queue_outbox_item(
                 select(OutboxItem).where(OutboxItem.target == target)
             )).scalars().all()
             for it in existing:
-                if isinstance(it.payload, dict) and it.payload.get("call_id") == call_id:
+                if isinstance(it.payload, dict) and it.payload.get("call_id") == call_id and it.payload.get("action", "location") == payload.get("action", "location"):
                     logger.info("queue_outbox_item: idempotent skip for target={} call_id={}", target, call_id)
                     return it
 
@@ -52,7 +52,7 @@ async def queue_outbox_item(
                 select(OutboxItem).where(OutboxItem.target == target)
             )).scalars().all()
             for it in existing:
-                if isinstance(it.payload, dict) and it.payload.get("call_id") == call_id:
+                if isinstance(it.payload, dict) and it.payload.get("call_id") == call_id and it.payload.get("action", "location") == payload.get("action", "location"):
                     logger.info("queue_outbox_item: idempotent skip for target={} call_id={}", target, call_id)
                     return it
 
@@ -85,6 +85,8 @@ async def start_outbox_worker() -> None:
     if is_outbox_worker_running():
         return
 
+    from leads.db import ensure_call_sheet_schema
+    await ensure_call_sheet_schema()
     _outbox_worker_running = True
 
     async def _worker_loop():
@@ -92,9 +94,13 @@ async def start_outbox_worker() -> None:
         logger.info("CRM/WhatsApp outbox worker started (drain_outbox active)")
         while _outbox_worker_running:
             try:
+                try:
+                    await drain_call_sheet_exports()
+                except Exception as exc:
+                    logger.error("Sheets worker error (other outbox continues): {}", exc)
                 await drain_outbox()
             except Exception as e:
-                logger.debug("Outbox worker loop error: {}", e)
+                logger.error("Outbox worker loop error: {}", e)
             await asyncio.sleep(5)
 
     import asyncio
@@ -139,18 +145,24 @@ async def drain_outbox() -> int:
                     v_date = payload.get("visit_date_iso") or payload.get("visit_date", "")
                     v_time = payload.get("time_slot") or payload.get("visit_time", "")
                     c_name = payload.get("name") or payload.get("client_name", "Valued Customer")
-                    res_wa = await send_whatsapp_location(
-                        to_phone,
-                        visit_date=v_date,
-                        visit_time=v_time,
-                        client_name=c_name,
-                    )
+                    if payload.get("action") == "send_brochure":
+                        from call_repairs import dispatch_brochure
+                        res_wa = await dispatch_brochure(payload)
+                    else:
+                        res_wa = await send_whatsapp_location(
+                            to_phone,
+                            visit_date=v_date,
+                            visit_time=v_time,
+                            client_name=c_name,
+                        )
                     if res_wa.get("ok") and res_wa.get("message_id"):
                         success = True
                         item.payload = {**payload, "message_id": res_wa.get("message_id")}
                     else:
                         success = False
                         error_msg = res_wa.get("error") or "WhatsApp send failed or unconfigured"
+                        if res_wa.get("status") == "uncertain":
+                            error_msg = "outcome unknown; manual reconciliation required"
 
                 elif item.target == "sheets":
                     spreadsheet_id = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
@@ -207,6 +219,7 @@ async def drain_outbox() -> int:
                 item.last_error = error_msg
                 is_permanent = (
                     item.attempts >= 5
+                    or "outcome unknown" in (error_msg or "").lower()
                     or "not configured" in (error_msg or "").lower()
                     or "131031" in (error_msg or "")
                     or "authentication" in (error_msg or "").lower()
@@ -258,3 +271,69 @@ async def update_outbox_whatsapp_delivery_status(
         return updated
 
 
+
+
+async def queue_call_sheet_export(call_id: str) -> None:
+    """Persist without scoring/Redis or a Lead; primary key enforces queue idempotency."""
+    from leads.models import CallSheetExport
+    from leads.db import ensure_call_sheet_schema
+    await ensure_call_sheet_schema()
+    from sqlalchemy.exc import IntegrityError
+    try:
+        async with get_session() as session:
+            if await session.get(CallSheetExport, call_id) is None:
+                session.add(CallSheetExport(call_id=call_id))
+                await session.flush()
+        logger.info("[{}] SHEETS_QUEUED (durable finished-call export)", call_id)
+    except IntegrityError:
+        logger.info("[{}] SHEETS_QUEUE_EXISTS", call_id)
+
+
+_sheet_drain_lock = None
+
+
+async def drain_call_sheet_exports() -> int:
+    import asyncio
+    import lead_state
+    import google_sheets_export
+    from leads.models import CallSheetExport
+    global _sheet_drain_lock
+    if _sheet_drain_lock is None:
+        _sheet_drain_lock = asyncio.Lock()
+    if _sheet_drain_lock.locked():
+        return 0
+    done = 0
+    async with _sheet_drain_lock:
+        async with get_session() as session:
+            now = datetime.now(timezone.utc)
+            # PostgreSQL workers claim rows using DB locks. SQLite supported single-process only.
+            rows = (await session.execute(select(CallSheetExport).where(
+                CallSheetExport.status == "pending",
+                (CallSheetExport.next_attempt_at == None) | (CallSheetExport.next_attempt_at <= now),
+            ).with_for_update(skip_locked=True).limit(20))).scalars().all()
+            for job in rows:
+                job.attempts += 1
+                try:
+                    call = await lead_state.get_call_async(job.call_id)
+                    if not call:
+                        raise RuntimeError("Call record unavailable")
+                    analysis = call.get("analysis") or call.get("analysis_json") or {}
+                    if isinstance(analysis, str):
+                        import json
+                        analysis = json.loads(analysis)
+                    receipt = await asyncio.to_thread(google_sheets_export.append_call_row_verified, call, analysis)
+                    if not receipt.get("verified"):
+                        raise RuntimeError("Sheets export returned no verified receipt")
+                    job.receipt = receipt
+                    job.status = "done"
+                    job.last_error = None
+                    done += 1
+                    logger.info("[{}] SHEETS_VERIFIED {}", job.call_id, receipt)
+                except Exception as exc:
+                    job.last_error = str(exc)
+                    if job.attempts >= 5:
+                        job.status = "failed"
+                    else:
+                        job.next_attempt_at = now + timedelta(minutes=2 ** job.attempts)
+                    logger.error("[{}] SHEETS_EXPORT_FAILED attempt={} status={} error={}", job.call_id, job.attempts, job.status, exc)
+    return done

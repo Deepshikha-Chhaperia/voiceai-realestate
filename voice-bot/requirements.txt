@@ -28,3 +28,6 @@ pydantic==2.13.5
 # traffic, other voices) before audio reaches STT/VAD. Falls back gracefully
 # if not installed.
 pyrnnoise==0.4.3
+
+# Async SQLite local/demo runtime (leads.db).
+aiosqlite==0.22.1

@@ -570,7 +570,7 @@ async def test_whatsapp_four_states_spoken_and_outbox():
         params.arguments = {"date": "tomorrow", "time": "5:00 PM"}
         params.result_callback = cb
         call_id = f"test-wa-notcfg-{time.time()}"
-        lead_mem = {"whatsapp": "Confirmed"}
+        lead_mem = {"whatsapp_opt_in": True}
 
         await execute_book_site_visit(
             params,
@@ -600,7 +600,7 @@ async def test_whatsapp_four_states_spoken_and_outbox():
             params.arguments = {"date": "tomorrow", "time": "5:00 PM"}
             params.result_callback = cb_sent
             call_id_sent = f"test-wa-sent-{time.time()}"
-            lead_mem = {"whatsapp": "Confirmed"}
+            lead_mem = {"whatsapp_opt_in": True}
 
             await execute_book_site_visit(
                 params,
@@ -612,7 +612,7 @@ async def test_whatsapp_four_states_spoken_and_outbox():
             )
             assert result_holder.get("whatsapp_status") == "sent"
             spoken = result_holder.get("message", "")
-            assert "WhatsApp" in spoken
+            assert "on its way" in spoken
 
             async with get_session() as session:
                 sv = (await session.execute(select(SiteVisit).where(SiteVisit.call_id == call_id_sent))).scalars().first()
@@ -627,7 +627,7 @@ async def test_whatsapp_four_states_spoken_and_outbox():
         params.arguments = {"date": "tomorrow", "time": "5:00 PM"}
         params.result_callback = cb_q
         call_id_q = f"test-wa-queued-{time.time()}"
-        lead_mem = {"whatsapp": "Confirmed"}
+        lead_mem = {"whatsapp_opt_in": True}
 
         await execute_book_site_visit(
             params,
@@ -639,7 +639,7 @@ async def test_whatsapp_four_states_spoken_and_outbox():
         )
         assert result_holder.get("whatsapp_status") == "queued"
         spoken = result_holder.get("message", "")
-        assert "queued the location details" in spoken
+        assert "I'll WhatsApp" in spoken
         assert "WhatsApp" in spoken
 
         async with get_session() as session:
@@ -671,7 +671,7 @@ async def test_whatsapp_four_states_spoken_and_outbox():
             params.arguments = {"date": "tomorrow", "time": "5:00 PM"}
             params.result_callback = cb_fail
             call_id_fail = f"test-wa-fail-131031-{time.time()}"
-            lead_mem = {"whatsapp": "Confirmed"}
+            lead_mem = {"whatsapp_opt_in": True}
 
             await execute_book_site_visit(
                 params,
@@ -714,7 +714,7 @@ async def test_whatsapp_four_states_spoken_and_outbox():
                 stream_id=call_id_200,
                 call_metrics=MagicMock(),
                 spoken_text_guard=MagicMock(),
-                lead_memory={"whatsapp": "Confirmed"},
+                lead_memory={"whatsapp_opt_in": True},
                 call_type="web",
             )
             assert result_holder_200.get("whatsapp_status") == "failed"
@@ -786,6 +786,7 @@ def test_working_memory_retains_all_fields_after_pruning_to_3():
         "configuration": "3 BHK Large (with study & 2 balconies)",
         "visit_date_iso": "2026-10-08",
         "time_slot": "5:00 PM",
+        "disposition": "SITE_VISIT_BOOKED",
     }
 
     messages = [
@@ -802,9 +803,10 @@ def test_working_memory_retains_all_fields_after_pruning_to_3():
     _prune_history(messages, 3)
     _sync_working_memory(messages, lead_memory)
 
-    assert len(messages) <= 3
-
-    sys_content = messages[0]["content"]
+    # Two system messages are required to preserve the immutable shared prefix.
+    assert len(messages) <= 4
+    assert messages[0]["content"] == "You are Ananya, a real estate advisor."
+    sys_content = messages[1]["content"]
     assert "[ACTIVE LEAD STATE:" in sys_content
     # Must retain configuration, name, date, and time
     assert "3 BHK Large" in sys_content
@@ -911,7 +913,7 @@ async def test_book_site_visit_whatsapp_opt_in_yes_no():
     p_yes = MagicMock()
     p_yes.arguments = {"date": "tomorrow", "time": "2:00 PM"}
     p_yes.result_callback = AsyncMock()
-    await execute_book_site_visit(p_yes, stream_id=call_id_yes, lead_memory={"whatsapp": "Confirmed"}, call_type="web")
+    await execute_book_site_visit(p_yes, stream_id=call_id_yes, lead_memory={"whatsapp_opt_in": True}, call_type="web")
 
     async with get_session() as session:
         sv_yes = (await session.execute(select(SiteVisit).where(SiteVisit.call_id == call_id_yes))).scalars().first()
@@ -1259,13 +1261,13 @@ async def test_v5_1_dual_llm_failure_yields_recovery_line():
 
         assert len(chunks) == 1
         content = chunks[0].choices[0].delta.content
-        assert "noted your preference" in content.lower()
+        assert "connection trouble" in content.lower()
 
 
 @pytest.mark.asyncio
 async def test_v5_1_farewell_protects_audio_and_honors_late_barge_in():
     """Verify that during closing/grace, AudioGate suppresses clearAudio,
-    CallEndCoordinator allows at most 1 extra reply, and reciprocal farewell ends immediately.
+    CallEndCoordinator allows at most 1 extra reply, and reciprocal farewell preserves grace.
     """
     from bot import _CallEndCoordinator, _InterruptionAudioGate
     from pipecat.frames.frames import TranscriptionFrame
@@ -1299,9 +1301,15 @@ async def test_v5_1_farewell_protects_audio_and_honors_late_barge_in():
     assert coord.is_ending is True
     assert coord._extra_reply_count == 1
 
-    # 5. Caller reciprocates farewell -> cleanly finishes call
+    # 5. Caller reciprocates farewell -> no second speech; preserve owner-selected window
     farewell_frame = TranscriptionFrame(text="thank you bye bye", user_id="user", timestamp="2026-10-07T13:14:01Z")
     await coord.process_frame(farewell_frame, FrameDirection.DOWNSTREAM)
+    assert hangup_called is False
+    # Complete a simulated playback then allow the short test grace to elapse.
+    from pipecat.frames.frames import BotStoppedSpeakingFrame
+    coord._closing_in_progress = True
+    await coord.process_frame(BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+    await asyncio.sleep(0.15)
     assert hangup_called is True
 
 

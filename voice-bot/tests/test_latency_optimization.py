@@ -75,7 +75,7 @@ def test_item5_reply_length_cap():
         .get("params", {})
         .get("max_completion_tokens")
     )
-    assert groq_max_tokens == 60
+    assert groq_max_tokens == 90
 
 
 def test_item7_phrase_cache_expansion():
@@ -182,7 +182,8 @@ async def test_clause_boundary_first_chunk_streaming():
     # Push first clause: "Sure, "
     await guard.process_frame(TextFrame("Sure, "), FrameDirection.DOWNSTREAM)
     # The first clause should be flushed immediately on boundary
-    assert guard._leading_flushed is True
+    assert guard._leading_flushed is False
+    await guard.process_frame(TextFrame("I can help."), FrameDirection.DOWNSTREAM)
     text_frames = [f for f in pushed_frames if isinstance(f, TextFrame)]
     assert len(text_frames) >= 1
     assert "Sure" in text_frames[0].text

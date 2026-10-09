@@ -1,0 +1,15 @@
+{
+  "identity": {
+    "schema": 1,
+    "provider": "sarvam",
+    "model": "bulbul:v3",
+    "speaker": "pooja",
+    "language": "hi-IN",
+    "sample_rate": 16000,
+    "pace": 1.02,
+    "temperature": 0.6,
+    "text": "Dhanyavaad, aapka din shubh rahe!",
+    "api": "sarvam-rest"
+  },
+  "sha256": "915db8bdd053eda60011bbdec6ec9c7488621bfbe63febbc92bcbe221d87db39"
+}

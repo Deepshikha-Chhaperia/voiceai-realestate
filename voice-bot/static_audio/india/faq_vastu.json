@@ -1,0 +1,15 @@
+{
+  "identity": {
+    "schema": 1,
+    "provider": "sarvam",
+    "model": "bulbul:v3",
+    "speaker": "pooja",
+    "language": "en-IN",
+    "sample_rate": 16000,
+    "pace": 1.02,
+    "temperature": 0.6,
+    "text": "It is one hundred percent Vastu compliant with East or North entry.",
+    "api": "sarvam-rest"
+  },
+  "sha256": "18fe168eed3d25791d1c07f541e80d0399cfec680bacfdf9a679d4389951cf76"
+}

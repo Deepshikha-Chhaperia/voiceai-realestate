@@ -1,0 +1,15 @@
+{
+  "identity": {
+    "schema": 1,
+    "provider": "sarvam",
+    "model": "bulbul:v3",
+    "speaker": "pooja",
+    "language": "en-IN",
+    "sample_rate": 16000,
+    "pace": 1.02,
+    "temperature": 0.6,
+    "text": "There is a pool, gym, clubhouse, jogging track and round the clock security.",
+    "api": "sarvam-rest"
+  },
+  "sha256": "f2d92fc9d0131a136a0563a5c7ef98199af70393ecfd785a4cc5eb38c239c84e"
+}

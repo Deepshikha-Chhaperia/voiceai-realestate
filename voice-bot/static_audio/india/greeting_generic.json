@@ -1,0 +1,15 @@
+{
+  "identity": {
+    "schema": 1,
+    "provider": "sarvam",
+    "model": "bulbul:v3",
+    "speaker": "pooja",
+    "language": "en-IN",
+    "sample_rate": 16000,
+    "pace": 1.02,
+    "temperature": 0.6,
+    "text": "Hi, this is Ananya from Meridian Group. Is this a good time to talk?",
+    "api": "sarvam-rest"
+  },
+  "sha256": "bf0baa0c5004b251aa0551da81fc7d0f6257fad9c07e0697abf807399b6abb06"
+}
