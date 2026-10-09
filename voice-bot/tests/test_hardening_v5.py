@@ -1389,8 +1389,8 @@ async def test_spoken_text_guard_streaming_spaces():
     await guard.process_frame(LLMFullResponseEndFrame(), FrameDirection.DOWNSTREAM)
 
     combined_tts = "".join(pushed_texts)
-    assert combined_tts == "from 1.7 crores."
-    assert guard._last_spoken_turn_text == "from 1.7 crores."
+    assert combined_tts == "from one point seven crore."
+    assert guard._last_spoken_turn_text == "from one point seven crore."
 
 
 @pytest.mark.asyncio

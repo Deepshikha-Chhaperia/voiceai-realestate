@@ -121,7 +121,8 @@ from metrics_collector import CallMetricsCollector
 import lead_state
 import local_test_report
 from call_repairs import (SHORT_GOODBYE, FAQ_TEXTS, valid_transcript, terminal_answer, faq_key,
-                          brochure_payload, finish_brochure, queue_goodbye, TTSStallState, explicit_caller_name, clarification_for, unambiguous_visit_time, pure_farewell, CALL5_TEXTS, campaign_faq, genuine_late_question, brochure_decision, safe_tts_text, fragment_transcript, whatsapp_answer, CALL7_TEXTS, visit_time, visit_intent, whatsapp_ready, postcall_whatsapp_plan, manual_whatsapp_message, record_manual_whatsapp, closing_after_work)
+                          brochure_payload, finish_brochure, queue_goodbye, TTSStallState, explicit_caller_name, clarification_for, unambiguous_visit_time, pure_farewell, CALL5_TEXTS, campaign_faq, genuine_late_question, brochure_decision, safe_tts_text, fragment_transcript, whatsapp_answer, CALL7_TEXTS, visit_time, visit_intent, whatsapp_ready, postcall_whatsapp_plan, manual_whatsapp_message, record_manual_whatsapp, closing_after_work, queue_goal_close, goal_complete, manual_location_offer)
+from spoken_numbers import spoken_numbers
 from stall_watchdog import StallWatchdog, ProviderErrorMonitor
 
 
@@ -1965,6 +1966,9 @@ def _find_sentence_end(text: str) -> int:
             return idx
         if punct == '.':
             start = m.start(1)
+            # A stream ending digit-dot may still receive a decimal digit next.
+            if start > 0 and text[start - 1].isdigit() and not text[start + 1:].strip():
+                continue
             # Ignore decimal dot: digit before and digit after (e.g. 1.45, 3.5)
             if start > 0 and start + 1 < len(text):
                 if text[start - 1].isdigit() and text[start + 1].isdigit():
@@ -2065,7 +2069,7 @@ class _SpokenTextGuard(FrameProcessor):
         "1580": "fifteen eighty",
         "1750": "seventeen fifty",
         "1920": "nineteen twenty",
-        "2100": "twenty-one hundred",
+        "2100": "twenty one hundred",
         "1100": "eleven hundred",
         "1200": "twelve hundred",
         "1300": "thirteen hundred",
@@ -2074,9 +2078,9 @@ class _SpokenTextGuard(FrameProcessor):
         "1600": "sixteen hundred",
         "1800": "eighteen hundred",
         "2000": "two thousand",
-        "2200": "twenty-two hundred",
-        "2400": "twenty-four hundred",
-        "2500": "twenty-five hundred",
+        "2200": "twenty two hundred",
+        "2400": "twenty four hundred",
+        "2500": "twenty five hundred",
     }
 
     _REPLACEMENTS: list[tuple[re.Pattern, str]] = [
@@ -2190,9 +2194,6 @@ class _SpokenTextGuard(FrameProcessor):
     @classmethod
     def _expand_numbers(cls, text: str) -> str:
         text = cls._expand_quarters_and_years(text)
-        for num, words in cls._PROPERTY_NUMBER_MAP.items():
-            comma_num = f"{num[0]},{num[1:]}"
-            text = re.sub(rf"\b(?:{num}|{comma_num})\b", words, text)
         return text
 
     def _normalize(self_or_cls, text: str | None = None) -> str:
@@ -2224,6 +2225,12 @@ class _SpokenTextGuard(FrameProcessor):
             text = re.sub(r"<[^>]+>", "", text)
             text = text.replace("<", "").replace(">", "")
 
+        text = _SpokenTextGuard._expand_quarters_and_years(text)
+        opaque = []
+        def _protect_opaque(m):
+            opaque.append(m.group(0))
+            return "\ue000" + chr(0xe100 + len(opaque) - 1) + "\ue001"
+        text = re.sub(r"https?://\S+|\b\d{3}[- ]\d{3}[- ]\d{4}\b|\b[\w.+-]+@[\w.-]+\.[A-Za-z]+|\b[A-Za-z_][\w-]*\d[\w-]*\b|\+\d[\d -]{8,}\d|\b\d{8,}\b", _protect_opaque, text)
         # FIX 6: Safety net for dates and hyphens
         # 1. Convert any residual ISO date YYYY-MM-DD into natural conversational spoken date
         def _rep_iso_date(m: re.Match) -> str:
@@ -2247,6 +2254,9 @@ class _SpokenTextGuard(FrameProcessor):
             flags=re.IGNORECASE,
         )
 
+        # Expand once before pause punctuation, including already-spelled compound numbers.
+        text = re.sub(r"\b(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)-(one|two|three|four|five|six|seven|eight|nine)\b", r"\1 \2", text, flags=re.I)
+        text = spoken_numbers(text)
         # 3. Replace hyphens and dashes between words with commas so "Tomorrow - Thursday" never becomes "Tomorrow to Thursday"
         text = re.sub(r"(?<=[a-zA-Z])\s*[-–—]\s*(?=[a-zA-Z])", ", ", text)
 
@@ -2283,6 +2293,8 @@ class _SpokenTextGuard(FrameProcessor):
             flags=re.IGNORECASE,
         )
 
+        for i, value in enumerate(opaque):
+            text = text.replace("\ue000" + chr(0xe100 + i) + "\ue001", value)
         # NEVER call .strip() here: streaming TextFrames contain leading/trailing
         # spaces that must be preserved between words to prevent run-together speech.
         return text
@@ -2377,6 +2389,10 @@ class _SpokenTextGuard(FrameProcessor):
             self._confirmation_spoken = False
             if confirm_msg and self._task:
                 logger.info("SpokenTextGuard: Queueing deterministic booking confirmation directly to TTS: {!r}", confirm_msg)
+                if (self._lead_memory or {}).pop('_manual_close_after_booking', False) and self._call_end_coordinator and goal_complete(self._lead_memory):
+                    confirm_msg += ' ' + SHORT_GOODBYE
+                    self._call_end_coordinator._dedicated_goodbye_queued = True
+                    self._call_end_coordinator.request_ending()
                 conf_frame = TTSSpeakFrame(text=confirm_msg, append_to_context=True)
                 setattr(conf_frame, "is_deterministic_confirmation", True)
                 asyncio.create_task(
@@ -3336,7 +3352,7 @@ class _FastPathRouter(FrameProcessor):
                         await self.push_frame(TTSSpeakFrame(text=line, append_to_context=True), direction)
                         return
 
-                if self._call_end_coordinator and (pure_farewell(latest_user_text) or closing_after_work(latest_user_text, memory)):
+                if self._call_end_coordinator and ((pure_farewell(latest_user_text) and whatsapp_answer(messages, memory.get('_whatsapp_consent_action')) != 'declined') or closing_after_work(latest_user_text, memory)):
                     if getattr(self._call_end_coordinator, "_dedicated_goodbye_queued", False):
                         return
                     self._call_end_coordinator._dedicated_goodbye_queued = True
@@ -3360,7 +3376,9 @@ class _FastPathRouter(FrameProcessor):
                 if answer == "declined":
                     self._lead_memory.pop("_whatsapp_consent_action", None)
                     self._lead_memory.pop("_brochure_consent_pending", None)
-                    await self.push_frame(TTSSpeakFrame(text="Okay, I won't send it.", append_to_context=True), direction)
+                    async def emit_decline(frame):
+                        await self.push_frame(frame, direction)
+                    await queue_goal_close(self._lead_memory, self._call_end_coordinator, emit_decline, "Okay, I won't send it.")
                     return
 
                 decision = brochure_decision(messages, bool((self._lead_memory or {}).get("_brochure_consent_pending")))
@@ -5703,8 +5721,7 @@ async def execute_book_site_visit(
                 confirm_msg = f"Site visit confirmed for {idemp_spoken_date} at {idemp_spoken_time}."
                 if (config or {}).get("whatsapp_after_call_only", False):
                     if lead_memory and 'location' not in (lead_memory.get('_postcall_whatsapp_actions') or []):
-                        confirm_msg += " Want the location on WhatsApp after this call?"
-                        lead_memory['_whatsapp_consent_action'] = 'location'
+                        confirm_msg += manual_location_offer(lead_memory, config)
                 elif existing_sv.whatsapp_status == "sent":
                     confirm_msg += " The location is on its way."
                 elif existing_sv.whatsapp_status == "queued":
@@ -5880,7 +5897,9 @@ async def execute_book_site_visit(
             lead_memory["lead_id"] = str(lead_obj.id)
 
         confirm_msg = f"Perfect, you're booked for {spoken_date} at {spoken_time}."
-        if wa_status == "sent":
+        if (config or {}).get('whatsapp_after_call_only', False):
+            confirm_msg += manual_location_offer(lead_memory, config)
+        elif wa_status == "sent":
             confirm_msg += " The location is on its way."
         elif wa_status == "queued":
             confirm_msg += " I'll WhatsApp you the location."
@@ -6635,14 +6654,12 @@ async def run_bot(
 
             # If caller expressed an objection, it takes precedence over "bye" on first 2 objection attempts
             is_objection = has_objection_phrase and not pure_farewell(latest_user_text) and rejection_attempts["count"] <= 2
-            is_clean_close = not is_objection and (is_explicit_end or is_soft_close_phrase)
+            is_clean_close = not is_objection and (is_explicit_end or is_soft_close_phrase or closing_after_work(latest_user_text, lead_memory))
 
             has_question = any(q in lower_text for q in [
                 "amenit", "price", "cost", "budget", "bhk", "where", "location", "what", "how", "tell me", "kya", "kitna", "?"
             ])
-            has_agreement = any(a in lower_text for a in [
-                "yeah", "yes", "sure", "tell", "listen", "batao", "ha", "haa", "haan", "suno", "okay", "ok"
-            ])
+            has_agreement = bool(re.search(r"\b(?:yeah|yes|sure|tell|listen|batao|ha|haa|haan|suno|okay|ok)\b", lower_text))
 
             # 1. Objection handling: convince slightly on true objections before concluding
             if is_objection:
@@ -7121,9 +7138,9 @@ async def run_bot(
                 if config.get('whatsapp_after_call_only', False):
                     line = record_manual_whatsapp(lead_memory, config, action)
                     if line:
-                        frame = TTSSpeakFrame(text=line, append_to_context=True)
-                        frame.is_deterministic_confirmation = True
-                        await task.queue_frames([frame])
+                        async def emit_goal(frame):
+                            await task.queue_frames([frame])
+                        await queue_goal_close(lead_memory, call_end_coordinator, emit_goal, line)
                     return
                 if action == "brochure":
                     from types import SimpleNamespace

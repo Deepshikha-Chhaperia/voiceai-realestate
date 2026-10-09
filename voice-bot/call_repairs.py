@@ -218,6 +218,11 @@ def campaign_faq(text, memory, config):
     if not all(v in script for v in required):
         return None
     t = text.strip().lower().rstrip('.?!')
+    comparison = re.fullmatch(r"(?:what(?:'s| is) (?:the )?difference(?: between (?:the )?(?:standard and large|two|both)(?: (?:ones|units|options))?)?|(?:can you )?compare (?:the )?(?:standard and large|two|both)(?: (?:ones|units|options))?|(?:dono|standard aur large) (?:mein |me )?(?:kya )?difference(?: hai)?)", t)
+    comparison = comparison or re.fullmatch(r"(?:actually )?(?:वो )?(?:छोटा वाला और ब[ड़ड़]े वाले में|standard और large में) difference क्या होगा", t)
+    comparison_facts = ('1750', '1920', 'east facing', 'east/north facing', '1 balcony', '2 balconies', 'one point four five to one point six five', 'one point seven to one point eight')
+    if comparison and '3' in str(memory.get('configuration') or memory.get('bhk') or '') and all(v in script for v in comparison_facts) and re.search(r'one point seven to one point eight crores?[.,\n]', script):
+        return 'compare_3bhk_v1', 'Standard: 1580-1750 square feet, 1.45-1.65 crore. Large: 1920-2100 sq ft, 1.7-1.8 crore, study, extra balcony.'
     key = faq_key(text)
     if key:
         return ('faq_amenities_v2', CALL5_TEXTS['faq_amenities_v2']) if key == 'faq_amenities' else (key, FAQ_TEXTS[key])
@@ -280,13 +285,15 @@ def whatsapp_answer(messages, pending):
     if 'whatsapp' not in previous or '?' not in previous or not any(w in previous for w in target_words):
         return None
     answer_text = str(messages[i].get('content','')).lower()
-    for word, replacement in {'हाँ':'yes','हां':'yes','जी':'ji','ठीक है':'okay','नहीं':'no','नही':'no','मत':'no'}.items():
+    for word, replacement in {'हाँ':'yes','हां':'yes','जी':'ji','ठीक है':'okay','नहीं':'no','नही':'no','मत':'no','आप':'you','भेज दीजिए':'send','भेज दीजिये':'send','ना':'please'}.items():
         answer_text = answer_text.replace(word, replacement)
+    if any(c.isalpha() and not ('a' <= c <= 'z') for c in answer_text):
+        return None
     t = re.sub(r'[^a-z ]', ' ', answer_text)
     words = t.split()
     if pending == 'location' and re.match(r'^(?:ah\s+)?(?:yes|yeah|sure|okay|ok)\b', t.strip()) and re.search(r'\b(?:send|share)\b.*\blocation\b', t) and not re.search(r'\b(?:no|not|dont|stop)\b', t):
         return 'consent'
-    if words and all(w in {'yes','yeah','sure','please','okay','ok','haan','ji','send','share','it','that','works','fine'} for w in words):
+    if words and all(w in {'yes','yeah','sure','please','okay','ok','haan','ji','send','share','it','that','works','fine','you'} for w in words):
         return 'consent'
     if words and all(w in {'no','thanks','thank','you','nahi','mat'} for w in words):
         return 'declined'
@@ -343,7 +350,7 @@ def postcall_whatsapp_plan(memory, config, action):
     actions = set(memory.get('_postcall_whatsapp_actions') or []) | {action}
     plan = {'actions': sorted(actions), 'delivery': 'manual', 'status': 'prepared_not_sent'}
     check = manual_whatsapp_message({**memory, '_postcall_whatsapp_actions': sorted(actions)}, config)
-    error = 'Our team needs to confirm the links first.' if check['blockers'] else None
+    error = ('The location link needs team confirmation.' if action == 'location' else 'The brochure links need team confirmation.') if check['blockers'] else None
     return plan, error
 
 
@@ -399,7 +406,49 @@ def closing_after_work(text, memory):
         return False  # don't erase a non-Latin follow-up question into a signoff
     t = re.sub(r'[^a-z ]', ' ', raw)
     words = t.split()
-    done = bool(memory.get('_postcall_whatsapp_actions')) or memory.get('disposition') == 'SITE_VISIT_BOOKED'
-    allowed = {'okay','ok','yeah','yes','sure','thank','thanks','you','bye','goodbye','no','nothing','all','good','that','is','it','alright'}
+    done = (bool(memory.get('_postcall_whatsapp_actions')) or memory.get('disposition') == 'SITE_VISIT_BOOKED') and not memory.get('_whatsapp_consent_action') and not memory.get('_brochure_consent_pending')
+    allowed = {'okay','ok','yeah','yes','sure','thank','thanks','you','bye','goodbye','no','nothing','all','good','that','is','it','alright','cool'}
     return bool(done and words and all(w in allowed for w in words) and
                 (('thank' in words or 'thanks' in words) or 'nothing' in words))
+
+
+def goal_complete(memory):
+    """A verified visit and a resolved channel decision, never a requested slot."""
+    return bool(memory.get('disposition') == 'SITE_VISIT_BOOKED'
+                and str(memory.get('site_visit', '')).startswith(('Confirmed (', 'Booked ('))
+                and memory.get('visit_date_iso') and memory.get('time_slot')
+                and not memory.get('_whatsapp_consent_action')
+                and not memory.get('_brochure_consent_pending'))
+
+
+async def queue_goal_close(memory, coordinator, emit, acknowledgment):
+    from pipecat.frames.frames import TTSSpeakFrame
+    close = coordinator is not None and goal_complete(memory)
+    if close and getattr(coordinator, '_dedicated_goodbye_queued', False):
+        return
+    frame = TTSSpeakFrame(text=acknowledgment + (' ' + SHORT_GOODBYE if close else ''), append_to_context=True)
+    frame.is_deterministic_confirmation = True
+    if close:
+        coordinator._dedicated_goodbye_queued = True
+        coordinator.request_ending()
+    await emit(frame)
+
+
+def manual_location_offer(memory, config):
+    """Never offer a link we cannot prepare; no consent or delivery inferred."""
+    if memory is None:
+        return ''
+    url = str(((config or {}).get('brochure_delivery') or {}).get('postcall_location_url') or '').strip()
+    parsed = urlparse(url)
+    if 'location' in (memory.get('_postcall_whatsapp_actions') or []):
+        memory['_manual_close_after_booking'] = True
+        return ''
+    if parsed.scheme == 'https' and parsed.netloc:
+        if memory.get('_whatsapp_consent_action') not in (None, 'location'):
+            return ''
+        memory['_whatsapp_consent_action'] = 'location'
+        return ' Want the location on WhatsApp after this call?'
+    if memory.get('_whatsapp_consent_action') == 'location':
+        memory.pop('_whatsapp_consent_action', None)
+    memory['_manual_close_after_booking'] = True
+    return ' The location link needs team confirmation.'

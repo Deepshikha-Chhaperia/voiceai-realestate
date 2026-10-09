@@ -115,4 +115,4 @@ async def test_length_tail_after_multiple_sentences_in_one_chunk(monkeypatch):
 def test_missing_links_do_not_make_spoken_send_promise():
     plan,error=postcall_whatsapp_plan({}, {}, 'brochure')
     assert plan['actions']==['brochure']
-    assert 'confirm the links' in error and 'will WhatsApp' not in error
+    assert 'need team confirmation' in error and 'will WhatsApp' not in error

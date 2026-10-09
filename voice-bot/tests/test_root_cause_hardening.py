@@ -167,7 +167,7 @@ async def test_spoken_text_guard_preserves_whitespace_only_text_frames():
 
     await guard.process_frame(TextFrame(text=" has one balcony."), FrameDirection.DOWNSTREAM)
     texts = [f.text for f in pushed if isinstance(f, TextFrame)]
-    assert texts == ["The 3 BHK has one balcony."]
+    assert texts == ["The three B H K has one balcony."]
 
 
 @pytest.mark.asyncio

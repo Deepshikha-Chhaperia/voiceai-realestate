@@ -23,7 +23,7 @@ async def test_actual_yes_routes_once_and_sticks_through_pruning(answer,monkeypa
     await router.process_frame(LLMContextFrame(ctx),FrameDirection.DOWNSTREAM)
     assert memory['_postcall_whatsapp_actions']==['brochure']
     assert '_brochure_consent_pending' not in memory and '_whatsapp_consent_action' not in memory
-    assert len(lines)==1 and 'confirm the links' in lines[0]
+    assert len(lines)==1 and 'need team confirmation' in lines[0]
     # A repeated stale consent turn cannot speak/prepare twice.
     await router.process_frame(LLMContextFrame(ctx),FrameDirection.DOWNSTREAM)
     assert len(lines)==1
