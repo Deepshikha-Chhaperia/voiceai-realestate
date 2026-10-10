@@ -76,7 +76,7 @@ async def refresh(client_factory=None):
                 if not phone:gaps.append('phone_number_id not in configured WABA')
                 elif phone.get('code_verification_status')!='VERIFIED':gaps.append('business phone verification incomplete')
                 for action,mapping in c['templates'].items():
-                    if action not in {'brochure','location'}:continue
+                    if action not in {'brochure','location','visit_pack'}:continue
                     if not isinstance(mapping,dict) or not re.fullmatch(r'[a-z0-9_]+',mapping.get('name','')):
                         gaps.append(action+' template name invalid');continue
                     response=await client.get(f"{root}/{c['waba_id']}/message_templates",params={'name':mapping['name'],'fields':'name,status,language,components,parameter_format','limit':100},headers=headers)
@@ -96,12 +96,16 @@ async def refresh(client_factory=None):
 
 def enqueue_postcall(tenant,call_id,phone,memory,telephony_session_id=None):
     actions=memory.get('_postcall_whatsapp_actions') or []
+    if memory.get('_wa_pack_test'):return {'status':'manual','gaps':['web test call: dry run, nothing sent']}
+    # The visit pack goes to the number the caller confirmed on the call (their own, or a read-back one), never an inferred one.
+    if 'visit_pack' in actions and e164(memory.get('_wa_pack_phone')):phone=memory['_wa_pack_phone']
     if not e164(phone):return {'status':'manual','gaps':['Valid real recipient phone missing']}
     c=meta_settings()
     if not state()['ready']:return {'status':'manual','gaps':state()['gaps']}
     queued=[]
     for action in actions:
-        if action not in {'brochure','location'}:continue
+        if action not in {'brochure','location','visit_pack'}:continue
+        if action=='visit_pack' and not meta_settings()['templates'].get('visit_pack'):return {'status':'manual','gaps':['visit_pack template not configured']}
         # Only the recorded exact scoped action, never blanket inferred lead consent.
         payload={'telephony_session_id':telephony_session_id,'sender_phone_id':c['phone_id'],'sender_waba_id':c['waba_id'],'action':action,'phone':phone,'consent':True,'consent_scope':action,'name':memory.get('client') or '',
           'project_name':memory.get('_project_name') or '', 'visit_date_iso':'Not booked','time_slot':'Not booked'}
@@ -116,6 +120,7 @@ def enqueue_postcall(tenant,call_id,phone,memory,telephony_session_id=None):
 async def send(payload,client_factory=None):
     if not state()['ready']:return {'status':'manual','ok':False,'error':'Meta readiness not configured'}
     c=meta_settings();action=payload.get('action');mapping=c['templates'].get(action,{})
+    if not isinstance(mapping,dict) or not mapping.get('name'):return {'status':'manual','ok':False,'error':'Template not configured for '+str(action)}
     if payload.get('sender_phone_id') not in {None,c['phone_id']} or payload.get('sender_waba_id') not in {None,c['waba_id']}:return {'status':'blocked','ok':False,'error':'Sender account changed since queueing'}
     if payload.get('consent') is not True or payload.get('consent_scope')!=action:return {'status':'blocked','ok':False,'error':'Exact scoped consent missing'}
     if not e164(payload.get('phone')):return {'status':'blocked','ok':False,'error':'Invalid recipient'}

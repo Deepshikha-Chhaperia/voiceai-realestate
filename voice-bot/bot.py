@@ -120,7 +120,7 @@ from metrics_collector import CallMetricsCollector
 
 import lead_state
 import local_test_report
-from call_repairs import (combo_parts, faq_keys, combo_key, combo_text, FAQ_COMBO_CLIPS, relative_visit_date, _strip_day_offsets, held_slot_message, assented_slot, slot_assented, log_postcall_whatsapp, caller_asked_something, SHORT_GOODBYE, FAQ_TEXTS, valid_transcript, terminal_answer, faq_key,
+from call_repairs import (repair_stt, correction_decision, pack_step, visit_pack_offer, whatsapp_ready as _wa_ready, combo_parts, faq_keys, combo_key, combo_text, FAQ_COMBO_CLIPS, relative_visit_date, _strip_day_offsets, held_slot_message, assented_slot, slot_assented, log_postcall_whatsapp, caller_asked_something, SHORT_GOODBYE, FAQ_TEXTS, valid_transcript, terminal_answer, faq_key,
                           brochure_payload, finish_brochure, queue_goodbye, TTSStallState, explicit_caller_name, clarification_for, unambiguous_visit_time, pure_farewell, CALL5_TEXTS, campaign_faq, genuine_late_question, brochure_decision, safe_tts_text, fragment_transcript, whatsapp_answer, CALL7_TEXTS, visit_time, visit_intent, whatsapp_ready, postcall_whatsapp_plan, manual_whatsapp_message, record_manual_whatsapp, closing_after_work, queue_goal_close, goal_complete, manual_location_offer)
 from spoken_numbers import spoken_numbers
 from faq_recovery import FAQReplyRecovery
@@ -1730,6 +1730,9 @@ def _sync_working_memory(
                 'Consultative Dialogue: Answer caller\'s property/pricing question directly. DO NOT re-pitch brochure. DO NOT close call while caller is asking questions.'
             )
 
+    if lead_memory.get("disposition") == "SITE_VISIT_BOOKED":
+        slots.append("Booking Locked: the visit is already booked and confirmed. Never re-ask the day or time, never say you made a mistake or jumped the gun. If the caller interrupts or says listen, say you are listening and answer what they ask. Change the booking only if they ask to.")
+
     # Strip any existing [ACTIVE LEAD STATE: ...] block cleanly across all system messages
     for msg in messages:
         if msg.get("role") == "system":
@@ -1899,6 +1902,18 @@ _AUDIO_CACHE: dict[int, dict[str, bytes]] = _load_audio_cache()
 
 
 _FAQ_COMBO_TEXTS: dict[str, str] = {}
+
+
+def _pack_cached_texts() -> set:
+    """Texts of WhatsApp-pack clips that are actually loaded (fresh WAV present). Missing clips speak live, never silently."""
+    loaded = _AUDIO_CACHE.get(16000, {})
+    return {t for k, t in CALL7_TEXTS.items() if k.startswith("wa_pack_") and k in loaded}
+
+
+def _pack_frame(text: str):
+    f = TTSSpeakFrame(text=text, append_to_context=True)
+    f.is_deterministic_confirmation = text not in _pack_cached_texts()
+    return f
 
 
 def _ensure_faq_combo(key: str, keys: list[str]) -> bool:
@@ -2425,6 +2440,7 @@ class _SpokenTextGuard(FrameProcessor):
         self._suppressing_duplicate_turn: bool = False
         self._stale_regeneration_attempted: bool = False
         self._site_visit_succeeded_this_turn: bool = False
+        self._correction_handled: bool = False
         self._whatsapp_succeeded_this_turn: bool = False
         self._confirmation_queued_to_tts: bool = False
         self._confirmation_actually_played: bool = False
@@ -2616,6 +2632,7 @@ class _SpokenTextGuard(FrameProcessor):
                 self._leading_buffer = ""
                 self._leading_flushed = False
                 self._site_visit_succeeded_this_turn = False
+                self._correction_handled = False
                 self._whatsapp_succeeded_this_turn = False
                 if getattr(self, "_confirmation_queued_to_tts", False) and not getattr(self, "_confirmation_actually_played", False):
                     logger.info("SpokenTextGuard: Booking confirmation interrupted before completion")
@@ -2742,6 +2759,9 @@ class _SpokenTextGuard(FrameProcessor):
                     frame.text = self._normalize(filtered)
             elif isinstance(frame, TextFrame):
                 if self._cached_playback_active:
+                    return
+                if self._correction_handled:
+                    logger.info("SpokenTextGuard: Suppressed LLM TextFrame {!r} (booking correction handled this turn)", str(getattr(frame, "text", ""))[:60])
                     return
                 if self._site_visit_succeeded_this_turn:
                     logger.info("SpokenTextGuard: Suppressed post-booking LLM TextFrame {!r} (deterministic confirmation active)", str(getattr(frame, "text", ""))[:60])
@@ -3410,6 +3430,19 @@ class _FastPathRouter(FrameProcessor):
                     self._call_end_coordinator._late_reply_routed = True
 
                 memory = self._lead_memory or {}
+                if memory.get("_wa_pack_state"):
+                    _line, _outcome = pack_step(latest_user_text, memory)
+                    if _outcome == "consent" and self._on_whatsapp_consent:
+                        await self._on_whatsapp_consent("visit_pack")
+                        return
+                    if _outcome == "declined":
+                        async def _emit_pack_decline(frame):
+                            await self.push_frame(frame, direction)
+                        await queue_goal_close(memory, self._call_end_coordinator, _emit_pack_decline, "No problem, I won't send anything.", _pack_cached_texts())
+                        return
+                    if _line:
+                        await self.push_frame(_pack_frame(_line), direction)
+                        return
                 _yes_slot = assented_slot(messages) if (self._on_visit_ready and memory.get("disposition") != "SITE_VISIT_BOOKED") else None
                 if _yes_slot and re.search(r"\b(?:book|confirm|slot|schedule|visit|mean)\b", str(next((m.get("content", "") for m in reversed(messages[:-1]) if m.get("role") == "assistant"), "")), re.I):
                     # Plain yes to our own "Shall I book <day> at <time>?": book exactly that slot now, no model round trip.
@@ -4319,6 +4352,16 @@ class _TranscriptionTap(FrameProcessor):
         if direction == FrameDirection.DOWNSTREAM and isinstance(frame, TranscriptionFrame) and frame.text.strip() and (not valid_transcript(frame.text) or fragment_transcript(frame.text)):
             logger.info("Dropping nonlinguistic STT noise before aggregation: {!r}", frame.text[:60])
             frame.text = ""  # preserve the empty-turn lifecycle, never add noise to LLM context
+        elif direction == FrameDirection.DOWNSTREAM and isinstance(frame, TranscriptionFrame) and frame.text.strip() and os.getenv("STT_REPAIR", "1") != "0":
+            try:
+                _fixed, _snaps = repair_stt(frame.text)
+            except Exception:
+                _fixed, _snaps = frame.text, []
+            if _snaps:
+                for _heard, _to, _rule in _snaps:
+                    logger.info("[STT-REPAIR] rule={} heard={!r} -> {!r}", _rule, _heard, _to)
+                logger.info("[STT-REPAIR] {!r} -> {!r}", frame.text[:120], _fixed[:120])
+                frame.text = _fixed
         if self._faq_recovery and direction == FrameDirection.DOWNSTREAM:
             if isinstance(frame, InterruptionFrame):
                 self._faq_recovery.interrupt()
@@ -5732,6 +5775,30 @@ async def get_provider_services(
     )
 
 
+async def _visit_pack_text(stream_id, lead_memory, config, call_type=None):
+    """Offer appended to a verified booking. Phone calls only; web/test calls keep the old behaviour."""
+    try:
+        rec = (await lead_state.get_call_async(stream_id)) or {}
+        is_web = str(stream_id).startswith("web-") or call_type == "web" or rec.get("source") == "web-test"
+        test_call = bool(is_web and (config or {}).get("visit_pack_web_test", False)
+                         and (rec.get("campaign_id") == "web-test" or rec.get("source") == "web-test"))
+        if is_web and not test_call:
+            return ""
+        try:
+            ready = bool(_wa_ready())
+        except Exception:
+            ready = False
+        if test_call:
+            # Conversation test only: no caller number on web, and the post-call send stays dry-run.
+            lead_memory["_wa_pack_test"] = True
+            logger.info("[WA-PACK-TEST] [{}] web-test call: visit pack offer enabled by visit_pack_web_test; NOTHING will be sent", stream_id)
+            return visit_pack_offer(lead_memory, config, "", False, ready)
+        return visit_pack_offer(lead_memory, config, rec.get("customer_phone") or rec.get("phone"), is_web, ready)
+    except Exception as exc:
+        logger.warning("[{}] visit pack offer skipped: {}", stream_id, exc)
+        return ""
+
+
 async def execute_book_site_visit(
     params: Any,
     *,
@@ -5834,6 +5901,29 @@ async def execute_book_site_visit(
             # 3. Enforce idempotency by call_id only
             stmt_idemp = select(SiteVisit).where(SiteVisit.call_id == stream_id)
             existing_sv = (await session.execute(stmt_idemp)).scalars().first()
+            _resched = None
+            if existing_sv and args.get("reschedule") is True and (existing_sv.visit_date_iso != iso_date or existing_sv.time_slot != norm_time):
+                # Caller-corrected slot (router only; the model tool never sets this): update the one booking, then verify the write.
+                old_slot = (existing_sv.visit_date_iso, existing_sv.time_slot)
+                _resched = {"date_changed": old_slot[0] != iso_date}
+                existing_sv.visit_date_iso = iso_date
+                existing_sv.visit_date_original = date_raw
+                existing_sv.time_slot = norm_time
+                existing_sv.slot_start = slot_dt
+                session.add(Touchpoint(lead_id=existing_sv.lead_id, kind="site_visit", call_id=stream_id,
+                                       summary=f"Site visit rescheduled from {old_slot[0]} {old_slot[1]} to {iso_date} {norm_time}",
+                                       occurred_at=datetime.now(timezone.utc)))
+                await session.commit()
+                chk = (await session.execute(select(SiteVisit).where(SiteVisit.id == existing_sv.id))).scalars().first()
+                if not chk or chk.visit_date_iso != iso_date or chk.time_slot != norm_time:
+                    raise RuntimeError("Reschedule read-back verification failed")
+                logger.info(f"[{stream_id}] Rescheduled SiteVisit {chk.id}: {old_slot} -> ({chk.visit_date_iso}, {chk.time_slot}) verified in DB")
+                await lead_state.record_fields_async(stream_id, {"preferred_visit_date": iso_date, "preferred_visit_time": norm_time,
+                    "visit_date_iso": iso_date, "time_slot": norm_time, "site_visit": f"Confirmed ({iso_date} at {norm_time})",
+                    "disposition": "SITE_VISIT_BOOKED"})
+                if lead_memory is not None:
+                    lead_memory.update({"preferred_visit_date": iso_date, "preferred_visit_time": norm_time, "visit_date_iso": iso_date,
+                                        "time_slot": norm_time, "site_visit": f"Confirmed ({iso_date} at {norm_time})"})
             if existing_sv:
                 logger.info(f"[{stream_id}] book_site_visit: idempotent replay detected for site_visit_id={existing_sv.id}")
                 if call_metrics and hasattr(call_metrics, "record_tool_call"):
@@ -5847,8 +5937,15 @@ async def execute_book_site_visit(
                 idemp_spoken_date = format_spoken_date(stored_date, _now_ist, active_lang)
                 idemp_spoken_time = format_spoken_time(stored_time, active_lang)
                 confirm_msg = f"Site visit confirmed for {idemp_spoken_date} at {idemp_spoken_time}."
-                if True:
-                    if lead_memory and 'location' not in (lead_memory.get('_postcall_whatsapp_actions') or []):
+                if _resched:
+                    # a caller-corrected slot gets one short line, not the whole first-booking pack again
+                    confirm_msg = f"Okay, {idemp_spoken_date + ' at ' if _resched['date_changed'] else ''}{idemp_spoken_time} it is."
+                if _resched:
+                    pass
+                elif True:
+                    _pk = await _visit_pack_text(stream_id, lead_memory, config, call_type)
+                    confirm_msg += _pk
+                    if not _pk and lead_memory and 'location' not in (lead_memory.get('_postcall_whatsapp_actions') or []):
                         confirm_msg += manual_location_offer(lead_memory, config)
                 elif existing_sv.whatsapp_status == "sent":
                     confirm_msg += " The location is on its way."
@@ -6026,7 +6123,8 @@ async def execute_book_site_visit(
 
         confirm_msg = f"Perfect, you're booked for {spoken_date} at {spoken_time}."
         if True:
-            confirm_msg += manual_location_offer(lead_memory, config)
+            _pk = await _visit_pack_text(stream_id, lead_memory, config, call_type)
+            confirm_msg += _pk or manual_location_offer(lead_memory, config)
         elif wa_status == "sent":
             confirm_msg += " The location is on its way."
         elif wa_status == "queued":
@@ -7304,7 +7402,7 @@ async def run_bot(
                     if line:
                         async def emit_goal(frame):
                             await task.queue_frames([frame])
-                        await queue_goal_close(lead_memory, call_end_coordinator, emit_goal, line)
+                        await queue_goal_close(lead_memory, call_end_coordinator, emit_goal, line, _pack_cached_texts())
                     return
                 if action == "brochure":
                     from types import SimpleNamespace
@@ -7334,8 +7432,8 @@ async def run_bot(
             call_end_coordinator.request_ending()
         llm._on_provider_exhausted = finish_provider_failure
 
-        async def run_visit_ready(date, slot):
-            if lead_memory.get("_visit_dispatching") or lead_memory.get("disposition") == "SITE_VISIT_BOOKED":
+        async def run_visit_ready(date, slot, reschedule=False):
+            if lead_memory.get("_visit_dispatching") or (lead_memory.get("disposition") == "SITE_VISIT_BOOKED" and not reschedule):
                 return
             lead_memory["_visit_dispatching"] = True
             try:
@@ -7343,7 +7441,7 @@ async def run_bot(
                 async def record_booking(result, **kwargs):
                     if result.get("status") != "confirmed":
                         await task.queue_frames([TTSSpeakFrame(text="I couldn't book that visit yet. Please try again later.", append_to_context=True)])
-                await execute_book_site_visit(SimpleNamespace(arguments={"date":date,"time":slot}, result_callback=record_booking), stream_id=stream_id, call_metrics=call_metrics, spoken_text_guard=spoken_text_guard, lead_memory=lead_memory, call_type=call_type, config=config)
+                await execute_book_site_visit(SimpleNamespace(arguments={"date":date,"time":slot,"reschedule":bool(reschedule)}, result_callback=record_booking), stream_id=stream_id, call_metrics=call_metrics, spoken_text_guard=spoken_text_guard, lead_memory=lead_memory, call_type=call_type, config=config)
             finally:
                 lead_memory["_visit_dispatching"] = False
 
@@ -7673,6 +7771,42 @@ async def run_bot(
                             )
                             return
 
+                async def _apply_correction(_dec):
+                    """Execute correction_decision(): write only on 'write'; 'ask' stores the question and speaks it."""
+                    from leads.worker import format_spoken_date, format_spoken_time
+                    silence_checker._turn_in_flight = False
+                    spoken_text_guard._correction_handled = True  # the correction path speaks for this turn; the LLM reply is dropped
+                    if _dec[0] == "write":
+                        lead_memory.pop("_pending_correction", None)
+                        try:
+                            await run_visit_ready(_dec[1], _dec[2], reschedule=True)
+                        except Exception:
+                            logger.exception("[{}] Booking correction write failed", stream_id)
+                            await task.queue_frames([TTSSpeakFrame(text="I couldn't change that visit yet. Please try again later.", append_to_context=True)])  # the LLM reply is suppressed this turn: never leave dead air
+                    elif _dec[0] == "ask":
+                        import zoneinfo as _zi2
+                        lead_memory["_pending_correction"] = (_dec[1], _dec[2], time.monotonic())
+                        _sd = f"{format_spoken_date(_dec[1], datetime.now(_zi2.ZoneInfo('Asia/Kolkata')), 'en')} at " if _dec[1] != lead_memory.get("visit_date_iso") else ""
+                        _q = ((_sd + format_spoken_time(_dec[2], "en") + " kar dein?")[:1].upper() + (_sd + format_spoken_time(_dec[2], "en") + " kar dein?")[1:]) if lead_memory.get("language") == "Hindi" else f"So, {_sd}{format_spoken_time(_dec[2], 'en')} instead?"
+                        await task.queue_frames([TTSSpeakFrame(text=_q, append_to_context=True)])
+                    elif _dec[0] == "keep":
+                        lead_memory.pop("_pending_correction", None)
+                        await task.queue_frames([TTSSpeakFrame(text=f"Okay, I'll keep it at {format_spoken_time(lead_memory.get('time_slot') or '', 'en')}.", append_to_context=True)])
+
+                _pending = lead_memory.get("_pending_correction") if lead_memory is not None else None
+                if _pending and str(user_content).strip():
+                    import zoneinfo as _zi3
+                    try:
+                        _dec = correction_decision(str(user_content), lead_memory, datetime.now(_zi3.ZoneInfo("Asia/Kolkata")), _pending, time.monotonic() - _pending[2])
+                    except Exception:
+                        _dec = ("drop",)
+                    lead_memory.pop("_pending_correction", None)
+                    if _dec[0] in ("write", "ask", "keep"):
+                        logger.info("[{}] Pending booking correction answered {!r}: {}", stream_id, str(user_content)[:60], _dec)
+                        await _apply_correction(_dec)
+                        return
+                    # expired or unrelated: the question is dropped, nothing is written, the turn goes on normally
+
                 # If the preceding assistant message was a farewell, check whether caller reciprocated
                 # or barged in with a continuation question/statement.
                 last_assistant_content = ""
@@ -7688,7 +7822,34 @@ async def run_bot(
                         for pat in termination_processor.spoken_termination_patterns
                     )
 
+                if lead_memory is not None and lead_memory.get("disposition") == "SITE_VISIT_BOOKED" and str(user_content).strip() \
+                        and not getattr(call_end_coordinator, "_dedicated_goodbye_queued", False) and not is_prev_farewell:
+                    import zoneinfo as _zi4
+                    try:
+                        _dec2 = correction_decision(str(user_content), lead_memory, datetime.now(_zi4.ZoneInfo("Asia/Kolkata")), strict=True)
+                    except Exception:
+                        _dec2 = ("none",)
+                    if _dec2[0] in ("ask", "write"):
+                        logger.info("[{}] Time mentioned after booking ({!r}); {}: {}", stream_id, str(user_content)[:60], "explicit change, writing" if _dec2[0] == "write" else "asking before any change", _dec2)
+                        await _apply_correction(_dec2)
+                        return
+
                 if (is_prev_farewell or getattr(call_end_coordinator, "_dedicated_goodbye_queued", False)) and str(user_content).strip():
+                    try:
+                        import zoneinfo as _zif
+                        _dec = correction_decision(str(user_content), lead_memory, datetime.now(_zif.ZoneInfo("Asia/Kolkata")))
+                    except Exception:
+                        _dec = ("none",)
+                    if _dec[0] != "none":
+                        # A different concrete time or day after our confirmation is a correction, never a goodbye: keep the call
+                        # open and either update the verified booking or ask first.
+                        logger.info("[{}] Caller corrected the booked slot after confirmation ({!r}): {}", stream_id, str(user_content)[:60], _dec)
+                        try:
+                            call_end_coordinator.cancel_ending("caller corrected the booked time")
+                        except Exception:
+                            pass
+                        await _apply_correction(_dec)
+                        return
                     is_reciprocated = _is_farewell_or_acknowledgment(str(user_content))
                     clean_u = _PUNCT_RE.sub(" ", str(user_content).lower()).strip()
                     u_words = set(clean_u.split())
@@ -7700,7 +7861,19 @@ async def run_bot(
                         "kahan", "kitna", "kaise", "enti", "ela", "eppudu", "ekada", "cheppandi", "aagandi"
                     }
                     is_genuine_question = ("?" in str(user_content)) or bool(u_words & continuation_kw)
-                    if is_reciprocated or not is_genuine_question:
+                    _closing_vocab = {"ok", "okay", "oky", "yes", "yeah", "yep", "sure", "fine", "alright", "all", "right", "great", "good", "nice", "perfect", "thanks", "thank",
+                                      "you", "so", "much", "very", "too", "bye", "goodbye", "see", "later", "talk", "soon", "then", "take", "care", "have", "a", "day",
+                                      "the", "same", "to", "sounds", "cool", "done", "welcome", "theek", "thik", "hai", "haan", "ji", "accha", "acha", "dhanyavad",
+                                      "shukriya", "namaste", "tata", "milte", "hain", "ठीक", "है", "हाँ", "जी", "धन्यवाद", "शुक्रिया", "अच्छा", "नमस्ते", "ok.", "hmm", "hm"}
+                    if not is_reciprocated and (is_genuine_question or (len(u_words) >= 2 and not u_words <= _closing_vocab) or (len(u_words) == 1 and not u_words <= _closing_vocab and any(ch.isdigit() for ch in clean_u)) or visit_time(str(user_content))):
+                        # Substantive speech after our goodbye is a barge-in, never a farewell: cancel the end, listen and answer
+                        # normally. The goodbye is re-armed by the normal closing flow when the conversation really ends.
+                        logger.info("[{}] Caller kept talking after the goodbye ({!r}); cancelling the call end and continuing", stream_id, user_content)
+                        try:
+                            call_end_coordinator.cancel_ending("caller kept talking after goodbye")
+                        except Exception:
+                            pass
+                    elif is_reciprocated or not is_genuine_question:
                         logger.info(
                             "[{}] Caller reciprocated or concluded farewell ({!r}); completing hangup without bot reply",
                             stream_id,

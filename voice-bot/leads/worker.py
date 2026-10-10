@@ -202,7 +202,9 @@ def normalize_visit_time(raw: str) -> str | None:
     m = re.search(r"(\b\d{1,2})(?:[:.](\d{2}))?\s*(?:baje|बजे|pm|am|o'?clock)?\b", s)
     if not m:
         # Check word numbers like 'two', 'three', etc.
-        word_match = re.search(r"\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|ek|do|teen|chaar|paanch|chhe|saat|aath|nau|das|gyarah|baarah)\b(?:\s*(?:baje|बजे|pm|am|o'?clock))?", s)
+        # A bare number word is a time only with a time marker or "at/around/by/about" before it ("can I do something" is not 2 o'clock).
+        _W = r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|ek|do|teen|chaar|paanch|chhe|saat|aath|nau|das|gyarah|baarah)"
+        word_match = re.search(r"\b(" + _W[3:-1] + r")\b\s*(?:baje|बजे|pm|am|o'?clock)", s) or re.search(r"\b(?:at|around|by|about|near)\s+(" + _W[3:-1] + r")\b", s)
         if word_match:
             word_map = {
                 "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,

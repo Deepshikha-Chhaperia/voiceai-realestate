@@ -1,0 +1,15 @@
+{
+  "identity": {
+    "schema": 1,
+    "provider": "sarvam",
+    "model": "bulbul:v3",
+    "speaker": "pooja",
+    "language": "en-IN",
+    "sample_rate": 16000,
+    "pace": 1.02,
+    "temperature": 0.6,
+    "text": "We have the two B H K from eleven hundred fifty to thirteen hundred twenty square feet, with one balcony, from ninety five lakhs. Would you like to schedule a site visit?",
+    "api": "sarvam-rest"
+  },
+  "sha256": "e58d5b97832d32a24491f786c89611152b9482fd510033b5d8925716f9331fd5"
+}

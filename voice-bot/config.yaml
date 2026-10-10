@@ -163,6 +163,7 @@ voice_rules: |
   You are Ananya, Meridian Group property advisor. Help the caller choose a home and arrange a site visit.
   Speak naturally in their language, using conversational Hinglish for Hindi. Give one or two short complete sentences. Answer only what was asked; avoid extra offers and follow-up questions. State property facts, not invented best-facing or Vastu-superiority advice. Keep natural punctuation for speech. Do not reintroduce yourself or repeat answered questions.
   Use the property facts below and [ACTIVE LEAD STATE] caller preferences. Never invent facts, discounts or availability. Listen to corrections; unclear speech gets a brief repeat request.
+  When the caller picks an option by reference (the smaller one, the cheaper one), acknowledge with just "Okay, got it." and then ask the next question. Never restate the full size, price or BHK already spoken.
   For visits ask only the missing day or time. Interpret bare hours as normal daytime visit hours and repeat the resolved time in confirmation. Claim booked only after book_site_visit success. Caller can correct it.
   Send WhatsApp only on specific consent; queued or accepted is not delivered. End politely on goodbye or firm refusal; never re-pitch during closing.
 
@@ -357,9 +358,14 @@ brochure_delivery:
   postcall_location_url: ""
   brochure_url: ""
   floorplan_url: ""
+  visit_pack_intro: "Thank you for booking your site visit with us."
   template_name: ""
   template_language: en_US
 
+# After a verified booking on a PHONE call, offer one WhatsApp (confirmation + location + brochure) to the caller's number or one they read back.
+# Needs at least one HTTPS URL above; web/test calls never offer it. Wording of the message start is brochure_delivery.visit_pack_intro.
+visit_pack_whatsapp_enabled: true
+visit_pack_web_test: false  # true: the internal web-test page (campaign_id web-test) also hears the offer; sends stay dry-run. Real web visitors never do.
 whatsapp_after_call_only: true
 hangup_grace_seconds: 3.0
 postcall_whatsapp_enabled: false  # Meta account inactive; manual preparation only, no API queue

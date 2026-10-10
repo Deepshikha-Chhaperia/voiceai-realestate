@@ -1,0 +1,15 @@
+{
+  "identity": {
+    "schema": 1,
+    "provider": "sarvam",
+    "model": "bulbul:v3",
+    "speaker": "pooja",
+    "language": "en-IN",
+    "sample_rate": 16000,
+    "pace": 1.02,
+    "temperature": 0.6,
+    "text": "Sorry, that doesn't look like a valid mobile number. Please say all ten digits again.",
+    "api": "sarvam-rest"
+  },
+  "sha256": "a85737a81133414a8f111995acc43b2d577c0e08ee82213171384ac7fab117dc"
+}

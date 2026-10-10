@@ -1,0 +1,15 @@
+{
+  "identity": {
+    "schema": 1,
+    "provider": "sarvam",
+    "model": "bulbul:v3",
+    "speaker": "pooja",
+    "language": "en-IN",
+    "sample_rate": 16000,
+    "pace": 1.02,
+    "temperature": 0.6,
+    "text": "May I send you the brochure and floor plans on WhatsApp?",
+    "api": "sarvam-rest"
+  },
+  "sha256": "58fa72289e46c6c46c267c6229d87212ecfc5c441a2d7ca44dc92085aaa7ecd9"
+}
