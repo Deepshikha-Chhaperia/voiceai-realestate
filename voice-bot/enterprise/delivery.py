@@ -62,14 +62,54 @@ def sync(config):
         reports = [dict(r) for r in db.execute("SELECT id FROM work WHERE tenant=? AND kind='report' AND state='prepared_not_sent'", (tenant,))] if n.get('reports') else []
     for a in alerts:
         pl = json.loads(a['payload'])
-        text = f"Voice bot usage reached {pl.get('threshold')}% of the monthly cap."
+        scope = 'daily call' if pl.get('scope') == 'daily' else 'monthly'
+        text = f"Voice bot usage reached {pl.get('threshold')}% of the {scope} cap."
         store.enqueue('notify', tenant, '', {'text': text, 'ref': f"event:{a['id']}"}, f"{tenant}:notify:alert:{a['id']}")
         queued += 1
     for r in reports:
         text = f"Fortnightly report is ready: {_base()}/enterprise/reports/{r['id']}/html (sign in with the dashboard key)."
         store.enqueue('notify', tenant, '', {'text': text, 'ref': f"report:{r['id']}"}, f"{tenant}:notify:report:{r['id']}")
         queued += 1
+    if n.get('alerts'):
+        queued += _sync_callbacks(tenant, config)
     return queued
+
+
+def _due_text(ts, config):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    try:
+        tz = ZoneInfo(policy(config).get('routing', {}).get('timezone') or 'UTC')
+    except Exception:
+        tz = ZoneInfo('UTC')
+    return datetime.fromtimestamp(ts, tz).strftime('%d %b %H:%M')
+
+
+def _sync_callbacks(tenant, config):
+    """Rep notification for the callback inbox: one message when raised, one when overdue.
+    No caller number in the message (same PII rule as every other notification): reps open the inbox link."""
+    now = time.time()
+    link = f"{_base()}/enterprise/callbacks/ui"
+    queued = 0
+    for c in store.callback_list(tenant, ('open', 'assigned')):
+        who = f" for {c['assignee']}" if c.get('assignee') else ''
+        store.enqueue('notify', tenant, c['session_id'], {'text': f"New callback request{who} ({c['reason']}). Due {_due_text(c['due_at'], config)}. Open: {link}",
+                      'ref': f"callback:{c['id']}"}, f"{tenant}:notify:callback:{c['id']}")
+        queued += 1
+        if c['due_at'] and c['due_at'] < now:
+            store.enqueue('notify', tenant, c['session_id'], {'text': f"OVERDUE callback{who} ({c['reason']}), was due {_due_text(c['due_at'], config)}. Open: {link}",
+                          'ref': f"callback_overdue:{c['id']}"}, f"{tenant}:notify:callback_overdue:{c['id']}")
+            queued += 1
+    return queued
+
+
+def notify_assignment(tenant, c, config):
+    """Tell the team a callback now has an owner. Silent no-op until notifications are ready."""
+    n = settings(config)
+    if not tenant or not n.get('alerts') or not readiness(config)['ready']:
+        return
+    store.enqueue('notify', tenant, c['session_id'], {'text': f"Callback assigned to {c['assignee']} (due {_due_text(c['due_at'], config)}). Open: {_base()}/enterprise/callbacks/ui",
+                  'ref': f"callback_assigned:{c['id']}"}, f"{tenant}:notify:callback_assigned:{c['id']}:{c['assignee']}:{int(c['assigned_at'] or 0)}")
 
 
 async def drain(config, client_factory=None):

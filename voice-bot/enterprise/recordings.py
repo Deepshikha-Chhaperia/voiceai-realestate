@@ -61,7 +61,7 @@ async def drain(config):
             documents=[json.loads(f.read_text()) for f in files]
             transcript='\n'.join(d.get('transcript','') for d in documents)
             if not transcript.strip():raise ValueError('Empty human call transcript')
-            await save_transcript(item,transcript,config)
+            await save_transcript(item,transcript,config,diarized_entries(documents))
             store.complete(item['id'],'completed',payload={'recording_id':payload['recording_id'],
               'lead_id':payload['lead_id'],'job_id':payload.get('job_id'),'transcript':transcript})
     except Exception as exc:
@@ -69,7 +69,23 @@ async def drain(config):
         store.complete(item['id'],'needs_operator',error=type(exc).__name__,payload=payload)
 
 
-async def save_transcript(item,transcript,config):
+def diarized_entries(documents):
+    """Speaker-labelled turns for the review screen. Tolerates SDK/API shape differences; [] when absent."""
+    out=[]
+    for d in documents:
+        block=d.get('diarized_transcript') if isinstance(d,dict) else None
+        rows=block.get('entries') if isinstance(block,dict) else block
+        if not isinstance(rows,list):continue
+        for r in rows:
+            if not isinstance(r,dict):continue
+            text=str(r.get('transcript') or r.get('text') or '').strip()
+            if not text:continue
+            out.append({'speaker':str(r.get('speaker_id',r.get('speaker','')) ),'text':text[:2000],
+                        'start':r.get('start_time_seconds',r.get('start')),'end':r.get('end_time_seconds',r.get('end'))})
+    return out[:2000]
+
+
+async def save_transcript(item,transcript,config,entries=None):
     import uuid
     from sqlalchemy import select
     from leads.db import get_session
@@ -84,7 +100,7 @@ async def save_transcript(item,transcript,config):
         if not existing:db.add(Touchpoint(lead_id=lead.id,kind='human_transcript',call_id=item['session_id'],
           summary='Human call transcribed; caller/rep attribution requires review',
           payload={'transcript':transcript,'recording_id':item['payload']['recording_id'],
-                   'expires_at':item['expires'],'speaker_attribution':'unverified','recording_status':'transcribed'}))
+                   'expires_at':item['expires'],'speaker_attribution':'unverified','recording_status':'transcribed','entries':entries or []}))
         if lead.tier in {'pending','cold'}:
             lead.score=0;lead.tier='pending';lead.score_reason='Human transcript available; assign caller speaker before qualification scoring'
 

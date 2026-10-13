@@ -6455,6 +6455,29 @@ async def run_bot(
     enterprise_on = bool((config.get("enterprise") or {}).get("enabled"))
     enterprise_session_id = (campaign_data or {}).get("enterprise_session_id") if enterprise_on else None
     transferred = {"active":False}
+    callback_close_state = {"started":False}
+    _CALLBACK_CLOSE_STATUSES = {"callback_required","failed","blocked","not_ready"}
+
+    async def enterprise_callback_close(result):
+        """Transfer/capacity failure: speak the approved callback wording once, then end the call.
+        The inbox record is already created by routing.callback(); an ambiguous transfer ('uncertain') is never closed here."""
+        if not enterprise_session_id or (result or {}).get("status") not in _CALLBACK_CLOSE_STATUSES:
+            return False
+        if callback_close_state["started"] or hangup_state["done"]:
+            return True
+        callback_close_state["started"] = True
+        from enterprise import routing as _routing
+        _routing.callback(enterprise_session_id, config, str((result or {}).get("reason") or (result or {}).get("status")))
+        message = str(((config.get("enterprise") or {}).get("routing") or {}).get("callback_message") or
+                      "Thank you for calling. Our team will call you back soon. Goodbye.")
+        try:
+            await task.queue_frames([TTSSpeakFrame(text=message, append_to_context=False)])
+            await asyncio.sleep(min(14.0, max(4.0, len(message) / 11.0)))
+        except Exception as exc:
+            logger.warning("[{}] Callback close speech failed: {}", stream_id, exc)
+        if not hangup_state["done"]:
+            await _force_hangup_and_mark_done("enterprise_callback_close")
+        return True
     enterprise_started = time.monotonic()
 
     try:
@@ -7097,6 +7120,11 @@ async def run_bot(
                     await params.result_callback(result)
                     await task.cancel()
                     return
+                if result["status"] in _CALLBACK_CLOSE_STATUSES:
+                    # No human reachable: do not let the model improvise. Speak the callback wording and end.
+                    await params.result_callback(result, properties=FunctionCallResultProperties(run_llm=False))
+                    asyncio.create_task(enterprise_callback_close(result))
+                    return
                 await params.result_callback(result)
                 return
 
@@ -7467,6 +7495,8 @@ async def run_bot(
                 transferred["active"] = True
                 hangup_state["done"] = True
                 await task.cancel()
+            else:
+                await enterprise_callback_close(result)
             return result
         if enterprise_on:
             from enterprise.processor import IntentGate
@@ -7658,6 +7688,9 @@ async def run_bot(
                     if result["status"] in {"initiated","connected","uncertain","processing"}:
                         transferred["active"] = True
                         hangup_state["done"] = True
+                        await task.cancel()
+                        return
+                    if await enterprise_callback_close(result):
                         await task.cancel()
                         return
                     await asyncio.sleep(max(0, call_deadline - time.monotonic()))
@@ -8054,7 +8087,9 @@ async def run_bot(
                     from enterprise import analytics,store
                     row=store.session(enterprise_session_id)
                     if row and row.get('lead_id'):
-                        analytics.enqueue(row['tenant'],stream_id,row['lead_id'],transcript_to_use,config['enterprise']['transcript_retention_days'])
+                        analytics.enqueue(row['tenant'],stream_id,row['lead_id'],transcript_to_use,config['enterprise']['transcript_retention_days'],
+                            meta={'early_intent':(current_lead_mem or {}).get('_early_intent') or (current_lead_mem or {}).get('_caller_intent') or 'unknown',
+                                  'repeat':bool((campaign_data or {}).get('repeat_caller'))})
                 else:
                     asyncio.create_task(enqueue_on_call_finished(stream_id, transcript_to_use))
             except Exception as exc:

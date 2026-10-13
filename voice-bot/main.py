@@ -145,6 +145,14 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Leads database initialization warning: {e}")
 
     await enterprise_api.start_worker(CONFIG)
+    try:
+        from enterprise.config import policy as _ent_policy, readiness as _ent_readiness
+        if _ent_policy(CONFIG).get("enabled"):
+            for _gate, _state in _ent_readiness(CONFIG).items():
+                if not _state["ready"]:
+                    logger.error("Enterprise gate '{}' NOT READY (live Vobiz calls fail closed until fixed): {}", _gate, "; ".join(_state["gaps"]))
+    except Exception as e:
+        logger.warning(f"Enterprise readiness startup check failed: {e}")
 
     # Start outbox background worker
     try:
@@ -286,7 +294,8 @@ async def handle_inbound_call(request: Request):
         cap = p.get("recording",{}).get("max_call_seconds",240) if human else 240
         admission = store.reserve(provider_id,p["tenant_id"],caller_phone,p["quota"],seconds=cap,mode="human" if human else "ai",lead_id=lead_id)
         if not admission["allowed"]:
-            store.event(p["tenant_id"],provider_id,"missed_call",{"lead_id":lead_id,"reason":"monthly_cap_reached"},provider_id+":missed")
+            # Cap hit (daily or monthly): the caller is never lost - event + callback inbox item for the team.
+            routing.missed_call(provider_id,CONFIG,admission.get("reason") or "cap_reached")
             return Response('<Response><Hangup/></Response>', media_type="application/xml")
         if human:
             if not routing.available(CONFIG):

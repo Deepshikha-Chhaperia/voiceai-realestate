@@ -373,32 +373,34 @@ postcall_whatsapp_enabled: false  # Meta account inactive; manual preparation on
 # Enterprise is dormant until deployment/account policies are filled and readiness is green.
 # Single-host only: enterprise.db requires a persistent local volume shared by app processes.
 enterprise:
-  enabled: false
+  enabled: true  # ON by default (fail-closed): live Vobiz calls are refused until every REQUIRED field below is filled; see GET /enterprise/readiness
   mode: ai  # ai | human
   outbound_enabled: false
   outbound_consent_policy: null # verified_lead_optin; no inferred permission
-  tenant_id: null
-  transcript_retention_days: null # New enterprise analytics/transcript retention, approved policy
-  project_id: null  # Existing projects.id UUID, never arbitrary default project
+  tenant_id: null  # REQUIRED PLACEHOLDER: short client id, e.g. 'bommaku'
+  transcript_retention_days: 30 # default 30 days; confirm with client.  New enterprise analytics/transcript retention, approved policy
+  project_id: null  # REQUIRED PLACEHOLDER: Existing projects.id UUID, never arbitrary default project
   project_name: null
-  deployment_scope: null  # single_host; distributed ledger unsupported
+  deployment_scope: single_host  # single_host; distributed ledger unsupported
   legacy_retention_policy_confirmed: false # logs/lead_state/vendor copies lifecycle
   persistent_volume_confirmed: false
   provider_hangup_webhook_confirmed: false # Vobiz app hangup URL /enterprise/call-ended
   quota:
-    monthly_calls: null
-    monthly_minutes: null
-    timezone: null
-    accounting: null  # all_routed_call_seconds, not invoice/B-leg billing
+    daily_calls: 50  # hard daily ceiling (alerts at 70/85/100%); remove the line for no daily cap
+    monthly_calls: 1500  # 50/day x 30; adjust to the client's plan
+    monthly_minutes: 6000  # 1500 calls x 4 min ceiling; adjust to the plan sold. Alerts at 70/85/100%, hard stop at 100%
+    timezone: Asia/Kolkata
+    accounting: all_routed_call_seconds  # all_routed_call_seconds, not invoice/B-leg billing
   routing:
-    rep_numbers: []  # E.164, simultaneous dialing, not sequential holds
-    timezone: null
-    weekdays: []  # 0 Monday .. 6 Sunday
-    open: null  # HH:MM local
-    close: null
-    max_call_seconds: null  # Human bridge extension, quota-reserved before transfer
-    callback_message: null  # Approved fallback wording; never invent a promised callback
-    broker_job_policy: null  # close | route
+    rep_numbers: []  # REQUIRED PLACEHOLDER: client's rep numbers, E.164 e.g. +91XXXXXXXXXX; E.164, simultaneous dialing, not sequential holds
+    timezone: Asia/Kolkata
+    weekdays: [0, 1, 2, 3, 4, 5]  # 0 Monday .. 6 Sunday
+    open: "10:00"  # HH:MM local; CONFIRM with client
+    close: "19:00" # rep hours only decide when it tries to transfer to a human
+    max_call_seconds: 600  # Human bridge extension, quota-reserved before transfer
+    callback_due_minutes: 30  # callback is created only in one case: the buyer explicitly asks for a human and no rep is reachable
+    callback_message: "Our team is busy right now. We have your number and will call you back shortly. Thank you for calling."  # CONFIRM wording with client; Approved fallback wording; never invent a promised callback
+    broker_job_policy: close  # close | route
   recording:
     notice: null
     consent_policy: null  # notice_continue only when approved; explicit opt-in IVR unsupported
@@ -408,6 +410,12 @@ enterprise:
     sarvam_model: null  # Explicit batch model supported by installed SDK/API; live STT unchanged
     language_code: null
     max_call_seconds: null
+  notifications:  # rep/owner alerts via enterprise/delivery.py (quota alerts, callbacks, reports); nothing is sent until ready
+    channel: null  # REQUIRED PLACEHOLDER: telegram | https_webhook (env TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID, or ENTERPRISE_NOTIFY_WEBHOOK_URL)
+    recipients_confirmed: false  # set true only after the client confirms who receives alerts
+    alerts: true
+    reports: true
+    hot_lead_alerts: true  # legacy-style hot-lead Telegram alert for enterprise calls (uses TELEGRAM_* env)
   reports:
     brand: null
     anchor_date: null  # ISO local date/time; every14days from this anchor

@@ -15,7 +15,7 @@ from sqlalchemy import select
 from leads.dashboard import verify_dashboard_auth
 from leads.db import get_session
 from leads.models import Lead,Project,Touchpoint,SiteVisit
-from enterprise import store,meta,routing,recordings,analytics,reconcile,delivery
+from enterprise import store,meta,routing,recordings,analytics,reconcile,delivery,crm,ui
 from enterprise.config import policy,readiness
 from enterprise.scoring import qualification
 from enterprise.forms import provider_form
@@ -115,8 +115,7 @@ async def call_status(session_id:str,request:Request):
     status=data.get('CallStatus','')
     if status in {'completed','busy','failed','no-answer','canceled'}:
         store.finish(session_id,status)
-        if status!='completed':
-            store.event(row['tenant'],session_id,'missed_call',{'phone':row['phone'],'lead_id':row['lead_id'],'status':status},session_id+':missed')
+        if status!='completed':routing.missed_call(session_id,_CONFIG,status)
     return {'ok':True}
 
 
@@ -139,27 +138,121 @@ async def acknowledge(event_id:int,auth=Depends(verify_dashboard_auth)):
     return {'status':'acknowledged'}
 
 
+def _page(html):
+    return HTMLResponse(html,headers={'Content-Security-Policy':ui.CSP,'Cache-Control':'no-store'})
+
+
+@router.get('/callbacks/ui',response_class=HTMLResponse)
+async def callbacks_ui(auth=Depends(verify_dashboard_auth)):
+    return _page(ui.CALLBACKS_HTML)
+
+
+@router.get('/callbacks')
+async def callbacks_list(status:str='open,assigned',auth=Depends(verify_dashboard_auth)):
+    wanted=tuple(x for x in status.split(',') if x in {'open','assigned','done','cancelled'}) or ('open','assigned')
+    return {'callbacks':store.callback_list(policy(_CONFIG).get('tenant_id'),wanted)}
+
+
+@router.post('/callbacks/{callback_id}/assign')
+async def callbacks_assign(callback_id:str,request:Request,auth=Depends(verify_dashboard_auth)):
+    body=await request.json()
+    if not isinstance(body,dict):raise HTTPException(422)
+    due=body.get('due_minutes')
+    if due is not None and (not isinstance(due,(int,float)) or isinstance(due,bool) or not 1<=due<=1440):raise HTTPException(422,detail='due_minutes 1..1440')
+    tenant=policy(_CONFIG).get('tenant_id')
+    try:row=store.callback_assign(tenant,callback_id,body.get('assignee'),due)
+    except ValueError as exc:raise HTTPException(422,detail=str(exc))
+    if not row:raise HTTPException(404)
+    delivery.notify_assignment(tenant,row,_CONFIG)
+    return row
+
+
+@router.post('/callbacks/{callback_id}/complete')
+async def callbacks_complete(callback_id:str,request:Request,auth=Depends(verify_dashboard_auth)):
+    body=await request.json()
+    if not isinstance(body,dict):raise HTTPException(422)
+    try:row=store.callback_complete(policy(_CONFIG).get('tenant_id'),callback_id,body.get('outcome'),body.get('notes',''))
+    except ValueError as exc:raise HTTPException(422,detail=str(exc))
+    if not row:raise HTTPException(404)
+    return row
+
+
+@router.get('/review/ui',response_class=HTMLResponse)
+async def review_ui(auth=Depends(verify_dashboard_auth)):
+    return _page(ui.REVIEW_HTML)
+
+
+def _project_id():
+    try:return uuid.UUID(policy(_CONFIG).get('project_id',''))
+    except (ValueError,TypeError):raise HTTPException(409,detail='enterprise.project_id not configured')
+
+
+@router.get('/human-reviews')
+async def human_reviews(auth=Depends(verify_dashboard_auth)):
+    project=_project_id()
+    async with get_session() as db:
+        rows=(await db.execute(select(Touchpoint,Lead).join(Lead,Lead.id==Touchpoint.lead_id).where(Lead.project_id==project,Touchpoint.kind=='human_transcript')
+              .order_by(Touchpoint.occurred_at.desc()).limit(50))).all()
+        calls=[t.call_id for t,_ in rows]
+        done={}
+        if calls:
+            for t in (await db.execute(select(Touchpoint).where(Touchpoint.kind=='qualification_review',Touchpoint.call_id.in_(calls)))).scalars().all():
+                done[t.call_id]=(t.payload or {}).get('tier')
+        return {'items':[{'lead_id':str(l.id),'call_id':t.call_id,'phone':l.phone,'name':l.name,'when':t.occurred_at.isoformat() if t.occurred_at else '',
+          'expired':(t.payload or {}).get('recording_status')=='retention_expired','reviewed':t.call_id in done,'tier':done.get(t.call_id)} for t,l in rows
+          if (t.payload or {}).get('recording_status')!='retention_expired']}
+
+
+@router.get('/human-review/{lead_id}/{call_id}')
+async def human_review_detail(lead_id:str,call_id:str,auth=Depends(verify_dashboard_auth)):
+    project=_project_id()
+    async with get_session() as db:
+        try:lead=await db.get(Lead,uuid.UUID(lead_id))
+        except ValueError:raise HTTPException(404)
+        if not lead or lead.project_id!=project:raise HTTPException(404)
+        t=(await db.execute(select(Touchpoint).where(Touchpoint.lead_id==lead.id,Touchpoint.call_id==call_id,Touchpoint.kind=='human_transcript'))).scalars().first()
+        if not t or (t.payload or {}).get('recording_status')=='retention_expired':raise HTTPException(409,detail='Transcript missing or expired')
+        p=t.payload or {}
+        return {'lead':{'id':str(lead.id),'phone':lead.phone,'name':lead.name,'tier':lead.tier,'score':lead.score},'entries':p.get('entries') or [],
+          'transcript':p.get('transcript',''),'speaker_attribution':p.get('speaker_attribution'),'caller_speaker':p.get('caller_speaker')}
+
+
 @router.post('/human-review/{lead_id}/{call_id}')
 async def human_review(lead_id:str,call_id:str,request:Request,auth=Depends(verify_dashboard_auth)):
     body=await request.json()
     if not isinstance(body,dict) or body.get('caller_evidence_reviewed') is not True:raise HTTPException(422,detail='Review caller-specific budget/timeline/visit evidence; do not score rep statements')
     analysis={k:body.get(k) for k in ('budget_min_lakhs','budget_max_lakhs','timeline_months','configuration','visit_intent')}
+    analysis['visit_intent']=analysis['visit_intent'] or 'none'
     for k in ('budget_min_lakhs','budget_max_lakhs','timeline_months'):
         v=analysis[k]
         if v is not None and (not isinstance(v,(float,int)) or isinstance(v,bool) or not math.isfinite(v) or v<0):raise HTTPException(422)
     if analysis['visit_intent'] not in {'none','maybe','requested','booked'}:raise HTTPException(422)
+    caller_speaker=body.get('caller_speaker')
+    snap=None
     async with get_session() as db:
         try:lead=await db.get(Lead,uuid.UUID(lead_id))
         except ValueError:raise HTTPException(404)
         if not lead or str(lead.project_id)!=policy(_CONFIG).get('project_id'):raise HTTPException(404)
         transcript=(await db.execute(select(Touchpoint).where(Touchpoint.lead_id==lead.id,Touchpoint.call_id==call_id,Touchpoint.kind=='human_transcript'))).scalars().first()
         if not transcript or (transcript.payload or {}).get('recording_status')=='retention_expired':raise HTTPException(409,detail='Transcript missing or expired')
+        tp=dict(transcript.payload or {})
+        speakers={str(e.get('speaker')) for e in tp.get('entries') or []}
+        if len(speakers)>=2 and str(caller_speaker) not in speakers:raise HTTPException(422,detail='Select which speaker is the caller')
+        if caller_speaker is not None:
+            tp['caller_speaker']=str(caller_speaker);tp['speaker_attribution']='operator_confirmed';transcript.payload=tp
+        already=(await db.execute(select(Touchpoint).where(Touchpoint.lead_id==lead.id,Touchpoint.call_id==call_id,Touchpoint.kind=='qualification_review'))).scalars().first() is not None
         project=await db.get(Project,lead.project_id)
         verified=(await db.execute(select(SiteVisit).where(SiteVisit.lead_id==lead.id,SiteVisit.call_id==call_id,SiteVisit.status.in_(('booked','done'))))).scalars().first() is not None
         lead.score,lead.tier,lead.score_reason,lead.visit_genuine=qualification(analysis,project.config if project else {},verified)
         db.add(Touchpoint(lead_id=lead.id,call_id=call_id,kind='qualification_review',summary=lead.score_reason,
-          payload={'analysis':analysis,'source':'operator-reviewed caller evidence','tier':lead.tier,'score':lead.score}))
-        return {'score':lead.score,'tier':lead.tier,'reason':lead.score_reason,'booking_verified':verified}
+          payload={'analysis':analysis,'source':'operator-reviewed caller evidence','tier':lead.tier,'score':lead.score,'caller_speaker':tp.get('caller_speaker')}))
+        crm.apply_outcome(lead,source='human_review',call_id=call_id,name=body.get('caller_name'),spoke=True,overwrite_name=True,visit_booked=verified)
+        if not already:  # a corrected re-review updates the lead but never re-fires external alerts
+            snap=crm.snapshot(lead,analysis=analysis,summary=lead.score_reason)
+            await crm.queue_webhook(db,snap,call_id)
+        result={'score':lead.score,'tier':lead.tier,'reason':lead.score_reason,'booking_verified':verified}
+    if snap:await crm.dispatch(snap,_CONFIG)
+    return result
 
 
 def report_readiness():
@@ -235,9 +328,12 @@ async def start_worker(config):
                     if time.time()-last_refresh>240:await meta.refresh();last_refresh=time.time()
                     await meta.drain()
                 elif kind=='recording' and policy(config).get('enabled'):await recordings.drain(config)
-                elif kind=='analytics' and policy(config).get('enabled'):await analytics.drain(policy(config).get('tenant_id'))
+                elif kind=='analytics' and policy(config).get('enabled'):await analytics.drain(policy(config).get('tenant_id'),config)
                 elif kind=='maintenance' and time.time()-last_maintenance>60:
-                    await reconcile.check_due(config);await recordings.prune(config);await fortnightly();delivery.sync(config);await delivery.drain(config);last_maintenance=time.time()
+                    await reconcile.check_due(config);await recordings.prune(config);await fortnightly();delivery.sync(config)
+                    for _ in range(5):  # several notices per minute so a callback burst is not throttled to 1/min
+                        if await delivery.drain(config) is None:break
+                    last_maintenance=time.time()
             except asyncio.CancelledError:raise
             except Exception:
                 from loguru import logger
@@ -299,7 +395,7 @@ async def app_call_end(request:Request):
     status=data.get('CallStatus','')
     if status not in {'completed','busy','failed','no-answer','canceled'}:return {'status':'awaiting_final_state'}
     store.finish(session_id,'signed_hangup_'+status)
-    if status!='completed':store.event(row['tenant'],session_id,'missed_call',{'lead_id':row['lead_id'],'phone':row['phone'],'status':status},session_id+':missed')
+    if status!='completed':routing.missed_call(session_id,_CONFIG,status)
     return {'status':'finalized'}
 
 

@@ -41,6 +41,8 @@ def readiness(config=None):
     for k in ('monthly_calls','monthly_minutes'):
         v = p.get('quota', {}).get(k)
         if not isinstance(v,int) or isinstance(v,bool) or v <= 0: quota.append('quota.'+k)
+    daily=p.get('quota',{}).get('daily_calls')
+    if daily is not None and (not isinstance(daily,int) or isinstance(daily,bool) or daily<=0): quota.append('quota.daily_calls (positive integer, or omit for no daily cap)')
     try: ZoneInfo(p.get('quota',{}).get('timezone',''))
     except (ValueError,KeyError,TypeError): quota.append('quota.timezone')
     if p.get('quota',{}).get('accounting') != 'all_routed_call_seconds': quota.append('quota.accounting=all_routed_call_seconds (not carrier invoice minutes)')

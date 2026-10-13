@@ -21,12 +21,27 @@ def available(config,now=None):
     return False
 
 
+def _due_minutes(config):
+    v=policy(config).get('routing',{}).get('callback_due_minutes',30)
+    return v if isinstance(v,int) and not isinstance(v,bool) and 1<=v<=1440 else 30
+
+
 def callback(session_id,config,reason):
     row=store.session(session_id)
     if row:
         store.event(row['tenant'],session_id,'callback_required',{'phone':row['phone'],'lead_id':row['lead_id'],
           'reason':reason,'status':'needs_operator','message':policy(config).get('routing',{}).get('callback_message','')},f'{session_id}:callback')
+        # Inbox item with owner/due/done state; idempotent per session.
+        store.callback_create(row['tenant'],session_id,row['phone'],row['lead_id'],reason,_due_minutes(config))
     return {'status':'callback_required','connected':False,'reason':reason}
+
+
+def missed_call(session_id,config,status):
+    """Every missed/failed call: keep the existing event AND put the caller in the callback inbox."""
+    row=store.session(session_id)
+    if not row:return
+    store.event(row['tenant'],session_id,'missed_call',{'phone':row['phone'],'lead_id':row['lead_id'],'status':status},session_id+':missed')
+    if row.get('phone'):store.callback_create(row['tenant'],session_id,row['phone'],row['lead_id'],'missed_call_'+str(status),_due_minutes(config))
 
 
 def callback_root():
