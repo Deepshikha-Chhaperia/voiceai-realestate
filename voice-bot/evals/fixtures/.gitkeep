@@ -1,0 +1,6 @@
+# Fixture files are auto-written here by harness.save_fixture() when a production
+# call fails a deterministic or statistical check. They are permanent regression
+# tests replayed by: python -m evals.regression --fixtures
+#
+# Commit this .gitkeep but add *.json to .gitignore if fixture transcripts
+# contain customer PII. Or commit fixtures if they use anonymized test data.

@@ -17,8 +17,7 @@ class FAQReplyRecovery:
         self.interrupted = False
 
     def interrupt(self):
-        if self.reply:
-            self.interrupted = True
+        self.interrupted = True
 
     def audio_completed(self):
         self.reply = None
@@ -33,7 +32,9 @@ class FAQReplyRecovery:
         return reply
 
     def take_clarification(self):
-        if self.clarified:
+        if not self.interrupted or self.clarified:
             return False
         self.clarified = True
+        self.interrupted = False
         return True
+

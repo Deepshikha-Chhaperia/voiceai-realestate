@@ -19,8 +19,11 @@ def transaction():
     path.parent.mkdir(parents=True,exist_ok=True)
     db = sqlite3.connect(path,timeout=10)
     db.row_factory = sqlite3.Row
-    db.execute('PRAGMA journal_mode=WAL')
     db.execute('PRAGMA busy_timeout=10000')
+    try:
+        db.execute('PRAGMA journal_mode=WAL')
+    except sqlite3.OperationalError:
+        pass
     db.executescript('''
     CREATE TABLE IF NOT EXISTS quota(tenant TEXT,month TEXT,calls INTEGER NOT NULL DEFAULT 0,
       seconds INTEGER NOT NULL DEFAULT 0,reserved INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(tenant,month));

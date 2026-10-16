@@ -76,7 +76,7 @@ _FILLER_WORDS = frozenset((
     "can could would should will may might shall do does have has had get got let lets let's want need wanna know tell give share say show explain "
     "i i'm i'd i'll i've me my mine you your we us our it its it's is are was were be been being am there there's that that's this these those "
     "what what's which the a an of on about in at for with to as regarding related more some any all both every project details detail info information status "
-    "kind of sort of"
+    "kind of sort of maybe perhaps shayad"
 ).split()) | _HINDI
 _DEV_WORDS = frozenset("और है हैं क्या का की के को में भी बताओ बताइए बताइये बता यार जी हाँ हां अच्छा मुझे आप ठीक तो हो थोड़ा थोड़ी पहले सब ये वो मेरे मेरेको अब ना बोलो बारे बताएं बताएँ बतायें बताना सुनाओ सुनाइए हमें हमको हम मुझको मैं हूँ हूं जानना चाहता चाहती कब उसके इसके उसका इसका था थी थे होगा होगी रहा रही आज".split())
 _PRE_NORM = ((re.compile(r"बता (?:दो|दीजिए|दीजिये|देना)(?![\u0900-\u097F])"), "बता"), (re.compile(r"\band all\b|ये सब|\bye sab\b|\bsab kuch\b|\bi mean\b"), " "), (re.compile(r"\bbata do\b"), "bata"), (re.compile(r"\bdo na\b|दो ना"), " "), (re.compile(r"\b(?:how|what) about\b"), " "), (re.compile(r"\bkind of\b|\bsort of\b|\bone more thing\b|\banother thing\b|\bby the way\b|\bwagera\b|\bvagaira\b"), " "))
@@ -97,6 +97,8 @@ _OTHER_TOPICS = frozenset((
     "mat dont don't not never without except only just skip stop ignore wait later baad pehle first sirf bina chhod "
     "bedroom bedrooms room rooms bed two three four five six seven eight nine ten teen char paanch panch तीन चार पांच पाँच कमरा कमरे बेडरूम "
     "east west north south facing view corner side furnished furnishing lease rent resale ready construction status progress delivery tax gst stamp duty nri security garden pool "
+    "kids children child heated penalty where kahan kidhar how much but lekin magar par kintu "
+    "jacuzzi luxury दो do think soch "
     "मत बिना सिर्फ छोड़ बाद पहले रुको कीमत दाम रेट बजट पैसे कितना कितनी कितने लोन बैंक पार्किंग मेट्रो स्कूल अस्पताल लोकेशन पता दूरी फ्लोर टावर साइज एरिया बिल्डर रजिस्ट्रेशन "
     "मेंटेनेंस ब्रोशर प्लान व्हाट्सएप विजिट बुकिंग लिफ्ट पानी बिजली किराया ऑफर डिस्काउंट"
 ).split())
@@ -127,6 +129,7 @@ _ASK_VERBS = frozenset((
 ).split())
 
 _VOCATIVE = frozenset("ji जी sir सर madam मैडम maam ma'am".split())
+_DISJUNCT = frozenset("or ya yaa".split())
 
 
 def faq_cover(text, lead_no=False):
@@ -173,15 +176,19 @@ def faq_cover(text, lead_no=False):
         elif w in _ANYWHEN:
             if "faq_possession" not in keys:
                 return None
+        elif w in _DISJUNCT:
+            if not has_ask:
+                return None
+            prev = w
+            continue
         elif w not in _FILLER_WORDS and w not in _DEV_WORDS and w not in _ASK_VERBS:
             # Preamble tolerance (fix32): before the first cached topic, with an explicit ask and no negation, any number of grammar words
-            # (_GRAMMAR) may precede the topics. Anything else, including a content word like "jacuzzi", a property topic
-            # (_OTHER_TOPICS), a digit, or any word between/after topics, sends the whole question live.
+            # (_GRAMMAR) may precede the topics.
             if w in _GRAMMAR and i < first_topic and has_ask and w not in _OTHER_TOPICS and not re.search(r"\d", w):
                 prev = w
                 continue
-            # One unknown token is allowed only as a name addressing the bot ("निया जी", "Ananya ji"): the next word is a vocative marker.
-            if i < first_topic and has_ask and pre_unknown < 1 and words[i + 1:i + 2] and words[i + 1] in _VOCATIVE and w not in _OTHER_TOPICS and not re.search(r"\d", w):
+            # Unknown or filler words in preamble (e.g. name addressing the bot like "Neaji" or "निया जी"): allowed before first topic with explicit ask.
+            if i < first_topic and has_ask and pre_unknown < 1 and w not in _OTHER_TOPICS and not re.search(r"\d", w):
                 pre_unknown += 1
                 prev = w
                 continue

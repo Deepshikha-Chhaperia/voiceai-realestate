@@ -57,7 +57,7 @@ from pipecat.frames.frames import (
     UserStoppedSpeakingFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
-    FunctionCallResultProperties,
+    InputDTMFFrame,
 )
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -128,14 +128,17 @@ from stall_watchdog import StallWatchdog, ProviderErrorMonitor
 
 
 load_dotenv(override=True)
-os.makedirs("logs", exist_ok=True)
+_DATA_DIR = os.getenv("DATA_DIR", "outputs")
+_LOG_DIR = os.path.join(_DATA_DIR, "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
 
 logger.add(
-    "logs/voicebot_{time:YYYY-MM-DD}.log",
+    os.path.join(_LOG_DIR, "voicebot_{time:YYYY-MM-DD}.log"),
     rotation="1 day",
     retention="10 days",
     level="DEBUG",
 )
+
 
 STREAM_PROVIDER_CALL_IDS: dict[str, str] = {}
 
@@ -544,23 +547,24 @@ def _attach_resilient_failover(service: Any, provider_name: str, config: dict) -
     if hasattr(service, "_client") and hasattr(service._client, "max_retries"):
         service._client.max_retries = 0
 
-    # BACKUP MODEL (second Groq model, same Groq key/client). Config key is optional:
-    #   llm_backup_groq_model: "llama-3.3-70b-versatile"   (set to "" to disable)
+    # BACKUP MODEL (Groq fallback model on same or fresh connection).
     backup_model = str(
-        (config or {}).get("llm_backup_groq_model", "") or ""
+        (config or {}).get("llm_fallback_model", "")
+        or (config or {}).get("llm_backup_groq_model", "")
+        or "qwen/qwen3.8-27b"
     ).strip()
     primary_model = str(getattr(getattr(service, "_settings", None), "model", "") or "")
     has_backup = bool(
         provider_name == "groq"
         and backup_model
-        and backup_model != primary_model
         and hasattr(service, "_client")
         and hasattr(service, "build_chat_completion_params")
     )
 
     async def _open_backup_stream(context: Any):
-        """Open a stream on the backup Groq model. Returns (iterator, first_chunk)."""
+        """Open a fresh stream on the backup Groq model. Uses a fresh client connection to avoid stale/dead socket reuse."""
         from pipecat.utils.types import assert_given
+        from openai import AsyncOpenAI
 
         adapter = service.get_llm_adapter()
         params_from_context = adapter.get_llm_invocation_params(
@@ -570,13 +574,21 @@ def _attach_resilient_failover(service: Any, provider_name: str, config: dict) -
         )
         params = service.build_chat_completion_params(params_from_context)
         params["model"] = backup_model
-        # reasoning_effort is a Qwen/gpt-oss option; Llama models reject it with a 400.
         params.pop("reasoning_effort", None)
         params.pop("service_tier", None)
-        stream = await asyncio.wait_for(service._client.chat.completions.create(**params), timeout=3.0)
-        it = stream.__aiter__()
-        first = await asyncio.wait_for(it.__anext__(), timeout=3.0)
-        return it, first
+
+        # Fresh client ensures we do not reuse a broken HTTP/2 connection or stale connection pool socket
+        api_key = os.getenv("GROQ_API_KEY", "")
+        base_url = str(getattr(service._client, "base_url", "https://api.groq.com/openai/v1"))
+        fresh_client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=httpx.Timeout(4.0, connect=2.0), max_retries=1)
+        try:
+            stream = await asyncio.wait_for(fresh_client.chat.completions.create(**params), timeout=3.5)
+            it = stream.__aiter__()
+            first = await asyncio.wait_for(it.__anext__(), timeout=3.5)
+            return it, first
+        except Exception:
+            await fresh_client.close()
+            raise
 
     def _extract_err_details(exc: Exception) -> tuple[str, str]:
         cls_name = type(exc).__name__
@@ -637,10 +649,12 @@ def _attach_resilient_failover(service: Any, provider_name: str, config: dict) -
                 msgs = getattr(context, "messages", []) or []
                 msg_roles = [m.get("role") for m in msgs if isinstance(m, dict)]
                 msg_lens = [len(str(m.get("content", ""))) for m in msgs if isinstance(m, dict)]
+                system_count = sum(1 for r in msg_roles if r == "system")
                 logger.info(
-                    "[LLM Request] provider={} msg_count={} roles={} char_lens={}",
+                    "[LLM Request] provider={} msg_count={} system_count={} roles={} char_lens={}",
                     provider_name,
                     len(msgs),
+                    system_count,
                     msg_roles,
                     msg_lens,
                 )
@@ -1730,37 +1744,28 @@ def _sync_working_memory(
                 'Consultative Dialogue: Answer caller\'s property/pricing question directly. DO NOT re-pitch brochure. DO NOT close call while caller is asking questions.'
             )
 
+    # Clean up any trailing dynamic system messages appended in previous turns.
+    # Static prompt prefix (messages 0 and 1) are never mutated to preserve Groq prefix caching.
+    cleaned_messages = []
+    for idx, msg in enumerate(messages):
+        role = msg.get("role")
+        content = str(msg.get("content", ""))
+        if idx < 2 and role == "system" and not any(k in content for k in ("[ACTIVE LEAD STATE:", "Booking Locked:")):
+            cleaned_messages.append(msg)
+        elif role != "system":
+            cleaned_messages.append(msg)
+        elif not any(k in content for k in ("[ACTIVE LEAD STATE:", "Booking Locked:")):
+            cleaned_messages.append(msg)
+    messages[:] = cleaned_messages
+
+    if slots:
+        memory_str = f"[ACTIVE LEAD STATE: {' | '.join(slots)}]"
+        lead_memory["_working_memory"] = memory_str
+        messages.append({"role": "system", "content": memory_str})
+
     if lead_memory.get("disposition") == "SITE_VISIT_BOOKED":
-        slots.append("Booking Locked: the visit is already booked and confirmed. Never re-ask the day or time, never say you made a mistake or jumped the gun. If the caller interrupts or says listen, say you are listening and answer what they ask. Change the booking only if they ask to.")
-
-    # Strip any existing [ACTIVE LEAD STATE: ...] block cleanly across all system messages
-    for msg in messages:
-        if msg.get("role") == "system":
-            content = msg.get("content", "")
-            if isinstance(content, str) and "[ACTIVE LEAD STATE:" in content:
-                parts = content.split("[ACTIVE LEAD STATE:")
-                base = parts[0].rstrip()
-                after_bracket = parts[1].split("]", 1)[-1].strip() if "]" in parts[1] else ""
-                msg["content"] = f"{base}{(' ' + after_bracket) if after_bracket else ''}".strip()
-
-    if not slots and not lead_memory:
-        return
-
-    memory_str = f"[ACTIVE LEAD STATE: {' | '.join(slots)}]"
-    lead_memory["_working_memory"] = memory_str
-
-    # Find the LAST system message so static prompt prefix remains 100% frozen for Groq prefix caching
-    last_sys_msg = None
-    for msg in messages:
-        if msg.get("role") == "system":
-            last_sys_msg = msg
-
-    if last_sys_msg is not None and sum(m.get("role") == "system" for m in messages) > 1:
-        content = last_sys_msg.get("content", "")
-        last_sys_msg["content"] = f"{content.rstrip()}\n\n{memory_str}".strip()
-    else:
-        # Fallback if no system message exists
-        messages.insert(1 if messages and messages[0].get("role") == "system" else 0, {"role": "system", "content": memory_str})
+        booking_lock_text = "Booking Locked: the visit is already booked and confirmed. Never re-ask the day or time, never say you made a mistake or jumped the gun. If the caller interrupts or says listen, say you are listening and answer what they ask. Change the booking only if they ask to."
+        messages.append({"role": "system", "content": booking_lock_text})
 
 
 def _coalesce_consecutive_messages(messages: list) -> None:
@@ -1791,9 +1796,11 @@ def _prune_history(messages: list, max_messages: int) -> None:
     if len(messages) <= max_messages:
         return
 
-    system_messages = [m for m in messages if m.get("role") == "system"]
+    # Keep static prefix system messages (messages 0 and 1) frozen at the front
+    static_prefix = [m for i, m in enumerate(messages) if i < 2 and m.get("role") == "system"]
+    trailing_system = [m for i, m in enumerate(messages) if i >= 2 and m.get("role") == "system"]
     non_system = [m for m in messages if m.get("role") != "system"]
-    keep = max_messages - len(system_messages)
+    keep = max_messages - len(static_prefix) - len(trailing_system)
     if keep < 2:
         keep = 2
 
@@ -1805,8 +1812,9 @@ def _prune_history(messages: list, max_messages: int) -> None:
         trimmed_non_system = non_system[-keep:]
 
     messages[:] = [
-        *system_messages,
+        *static_prefix,
         *trimmed_non_system,
+        *trailing_system,
     ]
 
 
@@ -1836,7 +1844,6 @@ def _load_audio_cache() -> dict[int, dict[str, bytes]]:
         static_dir = base_dir
 
     phrase_files = {"short_goodbye": "short_goodbye.wav", **{k: k + ".wav" for k in {**FAQ_TEXTS, **CALL5_TEXTS, **CALL7_TEXTS}},
-        "greeting_alex": "greeting_alex.wav",
         "greeting_generic": "greeting_generic.wav",
         "inbound_greeting": "inbound_greeting.wav",
         "opening_intro": "opening_intro.wav",
@@ -1940,13 +1947,12 @@ def _match_cached_phrase(text: str, turn_count: int = 1) -> str | None:
     if not text:
         return None
     t = text.lower().strip()
+    norm_t = _normalize_cache_key(text)
     for key, phrase in {"short_goodbye": SHORT_GOODBYE, **FAQ_TEXTS, **CALL5_TEXTS, **CALL7_TEXTS, **_FAQ_COMBO_TEXTS}.items():
-        if t == phrase.lower():
+        if t == phrase.lower() or (norm_t and norm_t == _normalize_cache_key(phrase)):
             return key
 
     # Outbound greetings
-    if "am i speaking with alex" in t:
-        return "greeting_alex"
     if ("meridian" in t or "ananya" in t) and "good time to talk" in t:
         return "greeting_generic"
     if "thank you for calling meridian group" in t and "assist you today" in t:
@@ -1954,8 +1960,8 @@ def _match_cached_phrase(text: str, turn_count: int = 1) -> str | None:
 
     # Turn 1 Opening - STRICTLY restricted to turn_count == 1 only
     if turn_count == 1 and (
-        ("meridian" in t and ("bhk" in t or "2" in t or "3" in t))
-        or ("meridian" in t or "ananya" in t)
+        ("bhk" in t or "2" in t or "3" in t)
+        and ("great" in t or "looking for" in t or "two or three" in t)
     ):
         return "opening_intro"
 
@@ -1969,16 +1975,18 @@ def _match_cached_phrase(text: str, turn_count: int = 1) -> str | None:
     if "sun nahi paayi" in t or "repeat kar sakte hain" in t:
         return "clarify_repeat_hi"
 
-    # Quick Acknowledgments
-    if t in ("sure, absolutely.", "sure, absolutely", "sure absolutely"):
+    # Quick Acknowledgments & common confirmations
+    if t in ("sure, absolutely.", "sure, absolutely", "sure absolutely", "yes, absolutely.", "yes, absolutely", "yes absolutely", "certainly"):
         return "ack_sure"
-    if t in ("understood.", "understood", "okay, got it.", "okay got it"):
+    if t in ("understood.", "understood", "noted.", "noted"):
         return "ack_understood"
+    if t in ("okay, got it.", "okay got it", "got it.", "got it"):
+        return "ack_got_it"
     if t in ("ji bilkul.", "ji bilkul", "ji, bilkul"):
         return "ack_ji_bilkul"
     if t in ("haanji, bilkul.", "haanji, bilkul", "haanji bilkul", "haanji"):
         return "ack_haanji"
-    if t in ("theek hai.", "theek hai"):
+    if t in ("theek hai.", "theek hai", "theek hai ji"):
         return "ack_theek_hai"
 
     # Site visit confirmation (only generic preference, never override actual scheduled visit details)
@@ -2003,10 +2011,9 @@ def _match_cached_phrase(text: str, turn_count: int = 1) -> str | None:
 
 
 _CACHED_PHRASE_TEXTS: dict[str, str] = {"short_goodbye": SHORT_GOODBYE, **FAQ_TEXTS, **CALL5_TEXTS, **CALL7_TEXTS,
-    "greeting_alex": "Hi, am I speaking with Alex?",
     "greeting_generic": "Hi, this is Ananya from Meridian Group. Is this a good time to talk?",
     "inbound_greeting": "Hello, thank you for calling Meridian Group. How may I assist you today?",
-    "opening_intro": "Great, this is Ananya from Meridian Group. Are you looking for a 2 or 3 BHK?",
+    "opening_intro": "Great, are you looking for a 2 or 3 BHK?",
     "brochure_close": "Sure, our team will share the brochure and floor plans on WhatsApp shortly. Have a wonderful day!",
     "objection_pivot": "Totally understand, is it the location, price, or just not the right time?",
     "final_farewell": "Understood, thanks for your time. Have a wonderful day!",
@@ -2381,18 +2388,19 @@ class _SpokenTextGuard(FrameProcessor):
     )
 
     def _strip_repeated_opening(self, text: str) -> str:
-        if not text or self._turn_count <= 1:
+        if not text or self._turn_count < 1:
             return text
         if self._OPENING_REPETITION_RE.search(text):
             logger.info(
-                "SpokenTextGuard: Stripped repetitive mid-call opening introduction from turn {}",
+                "SpokenTextGuard: Stripped repetitive opening introduction from turn {}",
                 self._turn_count,
             )
             remainder = self._OPENING_REPETITION_RE.sub("", text).strip()
             if remainder:
                 return remainder
-            return "Yes, I'm listening. What's on your mind?"
-        if self._turn_count > 1:
+            return "Are you looking for a 2 or 3 BHK?"
+        if self._turn_count >= 1:
+            text = re.sub(r"^\s*(?:hi|hello)[, ]+(?:alex[, ]+)?(?:this\s+is\s+Ananya(?:\s+from\s+Meridian(?:\s+Group)?)?)[, .]*", "", text, flags=re.I)
             text = re.sub(r"^\s*(?:hi|hello)[, ]+(?:alex[, ]+)?(?:main|मैं)\s+Ananya\s+(?:hoon|हूँ|हूं)\s+Meridian Group\s+(?:se|से)[, .]*", "", text, flags=re.I)
         return text
 
@@ -2418,6 +2426,8 @@ class _SpokenTextGuard(FrameProcessor):
         self._shutdown_state = shutdown_state
         self._sample_rate = sample_rate
         self._interruption_audio_gate = interruption_audio_gate
+        if self._interruption_audio_gate:
+            self._interruption_audio_gate._spoken_guard = self
         self._termination_processor = termination_processor
         self._context = context
         self._full_transcript = full_transcript
@@ -2446,6 +2456,7 @@ class _SpokenTextGuard(FrameProcessor):
         self._confirmation_actually_played: bool = False
         self._confirmation_spoken: bool = False
         self._task: Any = None
+        self._call_spoken_sentences: set[str] = set()
 
     def bind_task(self, task: Any) -> None:
         self._task = task
@@ -2462,6 +2473,8 @@ class _SpokenTextGuard(FrameProcessor):
             self._confirmation_queued_to_tts = True
             self._confirmation_actually_played = False
             self._confirmation_spoken = False
+            if self._interruption_audio_gate:
+                self._interruption_audio_gate.arm_booking_confirmation()
             if confirm_msg and self._task:
                 logger.info("SpokenTextGuard: Queueing deterministic booking confirmation directly to TTS: {!r}", confirm_msg)
                 if (self._lead_memory or {}).pop('_manual_close_after_booking', False) and self._call_end_coordinator and goal_complete(self._lead_memory):
@@ -2470,6 +2483,9 @@ class _SpokenTextGuard(FrameProcessor):
                     self._call_end_coordinator.request_ending()
                 conf_frame = TTSSpeakFrame(text=confirm_msg, append_to_context=True)
                 setattr(conf_frame, "is_deterministic_confirmation", True)
+                setattr(conf_frame, "is_booking_confirmation", True)
+                if self._interruption_audio_gate:
+                    setattr(conf_frame, "generation_id", self._interruption_audio_gate._current_gen_id)
                 asyncio.create_task(
                     self._task.queue_frames([conf_frame])
                 )
@@ -2506,10 +2522,29 @@ class _SpokenTextGuard(FrameProcessor):
                 dropped_any = True
                 continue
 
-            is_booking = bool(re.search(
-                r"\b(?:have\s+)?(?:booked|scheduled|confirmed)\b|\b(?:book|confirm)\s+kar|बुक\s*कर|कन्फर्म\s*कर|\b(?:site\s+visit|visit)\s+(?:is|has\s+been)\s+(?:booked|scheduled|confirmed)\b|बुक|कन्फर्म|शिड्यूल",
-                lower_p,
-            ))
+            is_booking = False
+            for clause in re.split(r'[,;:]+|\s+-\s+', lower_p):
+                c = clause.strip()
+                if not c:
+                    continue
+                if re.search(
+                    r"\b(?:"
+                    r"(?:i(?:'ve|\s+have|\s+already)?|you(?:'re|\s+are)?)\s+(?:booked|scheduled|confirmed)|"
+                    r"(?:site\s+visit|visit|slot)\s+(?:is|has\s+been|was)\s+(?:booked|scheduled|confirmed)|"
+                    r"booked\s+(?:for\s+(?:tomorrow|today|yesterday|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d+)|your\s+visit)|"
+                    r"all\s+set\s+for\s+(?:tomorrow|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d+)|"
+                    r"(?:i\s+)?booked\s+(?:your|a)\s+(?:site\s+visit|visit|slot)|"
+                    r"(?:aapka\s+)?(?:visit|site\s+visit|slot)\s+book\s+ho\s+gaya|"
+                    r"(?:book|confirm|schedule)\s+(?:kar\s+(?:diya|diye|di|chuka|chuke|chuki|gaya|gaye)|ho\s+(?:gaya|gaye|chuka))"
+                    r")\b|"
+                    r"(?:बुक|कन्फर्म|शिड्यूल)\s*(?:कर\s*(?:दिया|दिये|दी|चुका|चुके|चुकी|गया|गए)|हो\s*(?:गया|गए|चुका))",
+                    c,
+                ):
+                    is_clause_q = c.endswith("?") and bool(re.search(r"(?:\b(?:has|is|was|can|could|will|kya)\b|क्या)", c))
+                    is_clause_neg = bool(re.search(r"(?:\b(?:not|n't|never|nahi|nahin)\b|नही|नहीं)", c))
+                    if not (is_clause_q or is_clause_neg):
+                        is_booking = True
+                        break
             caller = ""
             if self._context:
                 for msg in reversed(self._context.messages):
@@ -2563,14 +2598,22 @@ class _SpokenTextGuard(FrameProcessor):
     _DUP_WINDOW_SECS = 3.0
 
     def _is_recent_duplicate(self, norm_text: str) -> bool:
-        """True only for an exact / near-exact repeat of the previous bot turn spoken within ~3s.
+        """True only for an exact / near-exact repeat of the previous bot turn spoken within ~3s,
+        or if this exact sentence was already spoken earlier in this call.
 
         Short fragments ("it", "sent", "sure") never count as duplicates unless they equal the
         whole previous turn; substring matching needs >= 12 chars of overlap.
         """
         clean_norm = re.sub(r"[^\w\s]", "", (norm_text or "").lower()).strip()
+        if not clean_norm:
+            return False
+
+        # Never send the exact same sentence twice in a call
+        if len(clean_norm) >= 15 and clean_norm in self._call_spoken_sentences:
+            return True
+
         clean_last = re.sub(r"[^\w\s]", "", self._normalize(self._last_spoken_turn_text).lower()).strip()
-        if not clean_norm or not clean_last:
+        if not clean_last:
             return False
         if time.monotonic() - self._last_spoken_turn_time >= self._DUP_WINDOW_SECS:
             return False
@@ -2585,6 +2628,10 @@ class _SpokenTextGuard(FrameProcessor):
         clean_text = text.strip()
         self._last_spoken_turn_text = clean_text
         self._last_spoken_turn_time = time.monotonic()
+        for s in re.split(r"[.?!]+", clean_text):
+            clean_s = re.sub(r"[^\w\s]", "", s.lower()).strip()
+            if len(clean_s) >= 15:
+                self._call_spoken_sentences.add(clean_s)
         if self._context and hasattr(self._context, "messages"):
             clean_norm = " ".join(clean_text.lower().split())
             already_present = any(
@@ -2594,6 +2641,8 @@ class _SpokenTextGuard(FrameProcessor):
                 for m in self._context.messages
             )
             if already_present:
+                if cached_key in ("greeting_generic", "inbound_greeting") or self._turn_count == 0:
+                    return
                 logger.info(
                     "DUPLICATE_ASSISTANT_RECORD text={!r} key={!r} - skipping append",
                     clean_text[:80],
@@ -2615,6 +2664,12 @@ class _SpokenTextGuard(FrameProcessor):
         elif cached_key == "final_farewell" and self._lead_memory is not None:
             self._lead_memory["_farewell_spoken"] = True
 
+    def _clear_tts_booking_tags(self) -> None:
+        tts_obj = getattr(self, "_tts", None) or (getattr(self._interruption_audio_gate, "_tts", None) if self._interruption_audio_gate else None)
+        if tts_obj:
+            tts_obj._active_booking_conf_tag = False
+            tts_obj._current_speak_frame_gen = None
+
     async def process_frame(
         self,
         frame: Frame,
@@ -2634,10 +2689,9 @@ class _SpokenTextGuard(FrameProcessor):
                 self._site_visit_succeeded_this_turn = False
                 self._correction_handled = False
                 self._whatsapp_succeeded_this_turn = False
-                if getattr(self, "_confirmation_queued_to_tts", False) and not getattr(self, "_confirmation_actually_played", False):
-                    logger.info("SpokenTextGuard: Booking confirmation interrupted before completion")
-                    self._confirmation_queued_to_tts = False
-                    self._confirmation_speaking = False
+                self._confirmation_queued_to_tts = False
+                self._confirmation_speaking = False
+                self._clear_tts_booking_tags()
                 if self._cached_audio_task and not self._cached_audio_task.done():
                     self._cached_audio_task.cancel()
                     self._cached_audio_task = None
@@ -2658,6 +2712,9 @@ class _SpokenTextGuard(FrameProcessor):
                 self._stale_regeneration_attempted = False
                 self._site_visit_succeeded_this_turn = False
                 self._whatsapp_succeeded_this_turn = False
+                self._confirmation_queued_to_tts = False
+                self._confirmation_speaking = False
+                self._clear_tts_booking_tags()
             elif isinstance(frame, LLMFullResponseStartFrame):
                 self._in_llm_turn = True
                 self._turn_tokens = 0
@@ -2673,14 +2730,15 @@ class _SpokenTextGuard(FrameProcessor):
                 if self._on_new_bot_turn:
                     self._on_new_bot_turn()
             elif isinstance(frame, BotStoppedSpeakingFrame):
-                if getattr(self, "_confirmation_speaking", False) or (getattr(self, "_confirmation_queued_to_tts", False) and not getattr(self, "_confirmation_spoken", False)):
-                    self._confirmation_speaking = False
+                if getattr(self, "_confirmation_speaking", False) or getattr(self, "_confirmation_queued_to_tts", False):
                     self._confirmation_actually_played = True
                     self._confirmation_spoken = True
-                    self._confirmation_queued_to_tts = False
                     if self._lead_memory is not None:
                         self._lead_memory["confirmation_spoken"] = True
                     logger.info("SpokenTextGuard: Booking confirmation playback completed (actually_played=True)")
+                self._confirmation_speaking = False
+                self._confirmation_queued_to_tts = False
+                self._clear_tts_booking_tags()
             elif isinstance(frame, TTSSpeakFrame):
                 is_silence_nudge = getattr(frame, "is_silence_nudge", False) or any(
                     nudge.lower() in getattr(frame, "text", "").lower()
@@ -2747,13 +2805,39 @@ class _SpokenTextGuard(FrameProcessor):
                                 )
                                 if self._call_metrics and hasattr(self._call_metrics, "record_cached_audio_ttfa"):
                                     self._call_metrics.record_cached_audio_ttfa(cached_key)
+                                if self._call_metrics and hasattr(self._call_metrics, "record_tts_played_characters"):
+                                    self._call_metrics.record_tts_played_characters(len(phrase_text))
                                 if cached_key == "final_farewell" and self._call_end_coordinator:
                                     self._call_end_coordinator.request_ending()
                                 return
 
-                    if getattr(frame, "is_deterministic_confirmation", False):
+                    frame_gen = getattr(frame, "generation_id", None)
+                    is_booking_conf = getattr(frame, "is_booking_confirmation", False)
+                    # Drop stale TTSSpeakFrames from older generations, but EXEMPT booking confirmation
+                    if (
+                        frame_gen is not None
+                        and not is_booking_conf
+                        and self._interruption_audio_gate
+                        and frame_gen < self._interruption_audio_gate._current_gen_id
+                    ):
+                        logger.info(
+                            "SpokenTextGuard: Dropped stale queued TTSSpeakFrame gen={} < active={}",
+                            frame_gen,
+                            self._interruption_audio_gate._current_gen_id,
+                        )
+                        return
+                    # If booking confirmation is queued or speaking, drop colliding non-confirmation speak frames
+                    if not is_booking_conf and (getattr(self, "_confirmation_queued_to_tts", False) or getattr(self, "_confirmation_speaking", False)):
+                        logger.info("SpokenTextGuard: Dropped colliding TTSSpeakFrame {!r} (booking confirmation priority)", str(original)[:60])
+                        return
+
+                    if is_booking_conf or getattr(frame, "is_deterministic_confirmation", False):
                         filtered = original
                         self._confirmation_speaking = True
+                        tts_obj = getattr(self, "_tts", None) or (getattr(self._interruption_audio_gate, "_tts", None) if self._interruption_audio_gate else None)
+                        if tts_obj:
+                            tts_obj._active_booking_conf_tag = True
+                            tts_obj._current_speak_frame_gen = getattr(frame, "generation_id", getattr(self._interruption_audio_gate, "_current_gen_id", 0) if self._interruption_audio_gate else 0)
                     else:
                         filtered = self._filter_unverified_claims(original)
                     frame.text = self._normalize(filtered)
@@ -2763,8 +2847,8 @@ class _SpokenTextGuard(FrameProcessor):
                 if self._correction_handled:
                     logger.info("SpokenTextGuard: Suppressed LLM TextFrame {!r} (booking correction handled this turn)", str(getattr(frame, "text", ""))[:60])
                     return
-                if self._site_visit_succeeded_this_turn:
-                    logger.info("SpokenTextGuard: Suppressed post-booking LLM TextFrame {!r} (deterministic confirmation active)", str(getattr(frame, "text", ""))[:60])
+                if getattr(self, "_confirmation_queued_to_tts", False) or getattr(self, "_confirmation_speaking", False) or self._site_visit_succeeded_this_turn:
+                    logger.info("SpokenTextGuard: Suppressed post-booking / colliding LLM TextFrame {!r} (deterministic confirmation active)", str(getattr(frame, "text", ""))[:60])
                     return
                 original = getattr(frame, "text", None)
                 if isinstance(original, str) and original:
@@ -2823,6 +2907,8 @@ class _SpokenTextGuard(FrameProcessor):
                                     )
                                     if self._call_metrics and hasattr(self._call_metrics, "record_cached_audio_ttfa"):
                                         self._call_metrics.record_cached_audio_ttfa(cached_key)
+                                    if self._call_metrics and hasattr(self._call_metrics, "record_tts_played_characters"):
+                                        self._call_metrics.record_tts_played_characters(len(phrase_text))
                                     if cached_key == "final_farewell" and self._call_end_coordinator:
                                         self._call_end_coordinator.request_ending()
                                     return
@@ -2843,10 +2929,18 @@ class _SpokenTextGuard(FrameProcessor):
                                 if norm.strip():
                                     if self._is_recent_duplicate(norm):
                                         logger.warning(
-                                            "SpokenTextGuard: Suppressed exact repeat {!r} (spoken <{:.0f}s ago); no regeneration",
+                                            "SpokenTextGuard: Suppressed exact repeat {!r} (spoken <{:.0f}s ago or in call); no regeneration",
                                             norm.strip(),
                                             self._DUP_WINDOW_SECS,
                                         )
+                                        if re.search(r"\b(?:2|two)\s*(?:or|ya)\s*(?:3|three)\s*b\s*h\s*k\b", norm, re.IGNORECASE) and not self._turn_has_spoken_or_generated:
+                                            short_norm = "2 or 3 BHK?"
+                                            logger.info("SpokenTextGuard: Rephrased repeated question to shorter {!r}", short_norm)
+                                            self._current_turn_spoken_text += short_norm
+                                            self._turn_has_spoken_or_generated = True
+                                            self._turn_tokens += len(short_norm.split())
+                                            await self.push_frame(TextFrame(text=short_norm), direction)
+                                            return
                                         self._suppressing_duplicate_turn = True
                                         self._leading_buffer = ""  # drop the unspoken tail of the repeated turn too
                                         return
@@ -2854,6 +2948,10 @@ class _SpokenTextGuard(FrameProcessor):
                                     self._current_turn_spoken_text += norm
                                     self._turn_has_spoken_or_generated = True
                                     self._turn_tokens += len(norm.split())
+                                    for s in re.split(r"[.?!]+", norm):
+                                        clean_s = re.sub(r"[^\w\s]", "", s.lower()).strip()
+                                        if len(clean_s) >= 15:
+                                            self._call_spoken_sentences.add(clean_s)
                                     await self.push_frame(TextFrame(text=norm), direction)
                             return
                         else:
@@ -2876,6 +2974,10 @@ class _SpokenTextGuard(FrameProcessor):
                                 return
                             self._current_turn_spoken_text += norm
                             self._turn_has_spoken_or_generated = True
+                            for s in re.split(r"[.?!]+", norm):
+                                clean_s = re.sub(r"[^\w\s]", "", s.lower()).strip()
+                                if len(clean_s) >= 15:
+                                    self._call_spoken_sentences.add(clean_s)
                             await self.push_frame(TextFrame(text=norm), direction)
                         return
             elif isinstance(frame, LLMFullResponseEndFrame):
@@ -2917,6 +3019,10 @@ class _SpokenTextGuard(FrameProcessor):
                                 self._current_turn_spoken_text += norm
                                 self._turn_has_spoken_or_generated = True
                                 self._turn_tokens += len(norm.split())
+                                for s in re.split(r"[.?!]+", norm):
+                                    clean_s = re.sub(r"[^\w\s]", "", s.lower()).strip()
+                                    if len(clean_s) >= 15:
+                                        self._call_spoken_sentences.add(clean_s)
                                 await self.push_frame(TextFrame(text=norm), direction)
                             else:
                                 logger.warning(
@@ -2924,7 +3030,15 @@ class _SpokenTextGuard(FrameProcessor):
                                     norm.strip(),
                                     self._last_spoken_turn_text[:60],
                                 )
-                                self._suppressing_duplicate_turn = True
+                                if re.search(r"\b(?:2|two)\s*(?:or|ya)\s*(?:3|three)\s*b\s*h\s*k\b", norm, re.IGNORECASE) and not self._turn_has_spoken_or_generated:
+                                    short_norm = "2 or 3 BHK?"
+                                    logger.info("SpokenTextGuard: Rephrased repeated end-buffer question to shorter {!r}", short_norm)
+                                    self._current_turn_spoken_text += short_norm
+                                    self._turn_has_spoken_or_generated = True
+                                    self._turn_tokens += len(short_norm.split())
+                                    await self.push_frame(TextFrame(text=short_norm), direction)
+                                else:
+                                    self._suppressing_duplicate_turn = True
 
                 if not self._suppressing_duplicate_turn and self._current_turn_spoken_text.strip():
                     self._last_spoken_turn_text = " ".join(self._current_turn_spoken_text.split())
@@ -2999,6 +3113,7 @@ class _InterruptionAudioGate(FrameProcessor):
         websocket: Any = None,
         call_end_coordinator: Any = None,
         max_trim_ms: float = 500.0,
+        serializer: Any = None,
     ) -> None:
         super().__init__()
 
@@ -3014,9 +3129,14 @@ class _InterruptionAudioGate(FrameProcessor):
         self._tts = tts
         self._websocket = websocket
         self._call_end_coordinator = call_end_coordinator
+        self._serializer = serializer
+        self._booking_conf_gen_id = None
         self._awaiting_first_audio_of_turn = False
         self._accumulated_trimmed_bytes = 0
         self._pre_roll_buffer = b""
+
+    def arm_booking_confirmation(self, gen_id: int | None = None) -> None:
+        self._booking_conf_gen_id = gen_id if gen_id is not None else self._current_gen_id
 
     def next_generation(self) -> int:
         self._current_gen_id += 1
@@ -3025,11 +3145,47 @@ class _InterruptionAudioGate(FrameProcessor):
         self._accumulated_trimmed_bytes = 0
         self._pre_roll_buffer = b""
         self._active_playing_gen_id = self._current_gen_id
+        if self._tts:
+            self._tts._current_turn_gen = self._current_gen_id
+            self._tts._active_booking_conf_tag = False
+            self._tts._current_speak_frame_gen = None
+        if hasattr(self._serializer, "next_generation"):
+            self._serializer.next_generation(self._current_gen_id)
         return self._current_gen_id
 
     @property
     def is_interrupted(self) -> bool:
         return self._is_interrupted
+
+    async def interrupt_goodbye(self) -> None:
+        """Interrupts and flushes goodbye/farewell audio immediately upon a real user transcript."""
+        self._is_interrupted = True
+        self._active_playing_gen_id = 0
+        if self._tts and hasattr(self._tts, "_handle_interruption"):
+            try:
+                await self._tts._handle_interruption(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+            except Exception:
+                pass
+        if self._tts:
+            self._tts._active_booking_conf_tag = False
+            self._tts._current_speak_frame_gen = None
+        if self._websocket:
+            try:
+                payload = json.dumps({"event": "clearAudio", "streamId": self._stream_id})
+                if hasattr(self._websocket, "send_text"):
+                    await self._websocket.send_text(payload)
+                elif hasattr(self._websocket, "send_json"):
+                    await self._websocket.send_json({"event": "clearAudio", "streamId": self._stream_id})
+            except Exception as _ws_err:
+                logger.debug("[{}] Error sending clearAudio: {}", self._stream_id, _ws_err)
+        if self._on_interruption:
+            self._on_interruption()
+        if hasattr(self, "_spoken_guard") and getattr(self._spoken_guard, "_cached_audio_task", None):
+            task = self._spoken_guard._cached_audio_task
+            if task and not task.done():
+                task.cancel()
+        await self.push_frame(TTSStoppedFrame(), FrameDirection.DOWNSTREAM)
+        await self.push_frame(BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
 
     async def play_cached_audio(self, pcm_bytes: bytes, sample_rate: int = 16000) -> None:
         """Streams pre-rendered PCM audio frames downstream, bypassing live TTS."""
@@ -3074,6 +3230,7 @@ class _InterruptionAudioGate(FrameProcessor):
                     break
                 chunk = pcm_bytes[offset : offset + chunk_bytes]
                 frame = TTSAudioRawFrame(audio=chunk, sample_rate=sample_rate, num_channels=1)
+                frame.generation_id = current_gen
                 await self.push_frame(frame, FrameDirection.DOWNSTREAM)
                 chunks_sent += 1
                 await asyncio.sleep(sleep_sec)
@@ -3121,12 +3278,15 @@ class _InterruptionAudioGate(FrameProcessor):
                     except Exception as _e:
                         logger.debug("[{}] Error interrupting LLM: {}", self._stream_id, _e)
 
-                # (b) Stop TTS
                 if self._tts and hasattr(self._tts, "_handle_interruption"):
                     try:
                         await self._tts._handle_interruption(frame, direction)
                     except Exception as _e:
                         logger.debug("[{}] Error interrupting TTS: {}", self._stream_id, _e)
+
+                if self._tts:
+                    self._tts._active_booking_conf_tag = False
+                    self._tts._current_speak_frame_gen = None
 
                 # (c) Flush client-side playback buffer via WebSocket clearAudio
                 if self._websocket:
@@ -3166,17 +3326,31 @@ class _InterruptionAudioGate(FrameProcessor):
                 self._awaiting_first_audio_of_turn = False
                 self._accumulated_trimmed_bytes = 0
                 self._pre_roll_buffer = b""
+                self._booking_conf_gen_id = None
+                if self._tts:
+                    self._tts._active_booking_conf_tag = False
+                    self._tts._current_speak_frame_gen = None
 
             elif isinstance(frame, AudioRawFrame):
-                if (
-                    self._is_interrupted
-                    or (
-                        self._active_playing_gen_id
-                        != self._current_gen_id
-                    )
-                ):
-                    self._dropped_frames += 1
-                    return
+                if getattr(frame, "generation_id", None) is None:
+                    frame.generation_id = self._current_gen_id
+
+                frame_gen = frame.generation_id
+                is_conf = getattr(frame, "is_booking_confirmation", False)
+
+                if not is_conf:
+                    if frame_gen < self._current_gen_id:
+                        self._dropped_frames += 1
+                        return
+                    if (
+                        self._is_interrupted
+                        or (
+                            self._active_playing_gen_id
+                            != self._current_gen_id
+                        )
+                    ):
+                        self._dropped_frames += 1
+                        return
 
                 # Shave leading silence from audio onset capped strictly at max_trim_ms
                 if self._awaiting_first_audio_of_turn:
@@ -3227,7 +3401,10 @@ class _InterruptionAudioGate(FrameProcessor):
                         if self._metrics_collector and hasattr(self._metrics_collector, "record_tts_silence_trimmed"):
                             self._metrics_collector.record_tts_silence_trimmed(saved_ms, gen_id=self._current_gen_id)
 
-        await super().process_frame(frame, direction)
+        try:
+            await super().process_frame(frame, direction)
+        except Exception:
+            pass
         await self.push_frame(frame, direction)
 
 
@@ -3449,16 +3626,67 @@ class _FastPathRouter(FrameProcessor):
                     logger.info("[{}] Caller agreed to the exact slot we named ({} {}); booking without another model turn", self._stream_id, _yes_slot[0], _yes_slot[1])
                     await self._on_visit_ready(_yes_slot[0], _yes_slot[1])
                     return
-                if visit_intent(latest_user_text, memory):
+                # Item 7: Consume _pending_visit_intent if present from previous turn
+                if memory.get("_pending_visit_intent"):
+                    turns_left = memory.get("_pending_visit_intent", 0)
+                    if isinstance(turns_left, int) and turns_left <= 1:
+                        memory.pop("_pending_visit_intent", None)
+                    elif isinstance(turns_left, int):
+                        memory["_pending_visit_intent"] = turns_left - 1
+
+                    slot = visit_time(latest_user_text)
+                    is_certain_time = bool(slot and re.search(r"\b(?:\d{1,2}(?::\d{2})?\s*(?:am|pm)?|(?:morning|afternoon|evening|dopahar|subah|shaam))\b", latest_user_text, re.I))
                     date = memory.get("visit_date_iso")
-                    slot = memory.get("time_slot")
-                    if date and slot and self._on_visit_ready:
+                    if is_certain_time and date and self._on_visit_ready:
+                        memory.pop("_pending_visit_intent", None)
+                        memory["time_slot"] = slot
+                        logger.info("[{}] Consuming _pending_visit_intent with certain slot {}: booking visit", self._stream_id, slot)
                         await self._on_visit_ready(date, slot)
                         return
-                    if date and not slot:
-                        line = "Kal kitne baje aana chahenge?" if re.search(r"[\u0900-\u097f]|\bkal\b", latest_user_text, re.I) else "What time would you like to visit?"
+                    elif not is_certain_time and re.search(r"\b(?:ok|okay|sure|theek|haan|yes|yep|fine|great|accha|acha)\b", latest_user_text.lower()) and date:
+                        memory.pop("_pending_visit_intent", None)
+                        line = "Kal kitne baje aana chahenge?" if (re.search(r"[\u0900-\u097f]|\bkal\b", latest_user_text, re.I) or memory.get("language") == "Hindi") else "What time would you like to visit tomorrow?"
                         await self.push_frame(TTSSpeakFrame(text=line, append_to_context=True), direction)
                         return
+
+                if visit_intent(latest_user_text, memory):
+                    sentences = [s.strip() for s in re.split(r"[.!?।]+", latest_user_text) if s.strip()]
+                    clauses = [c.strip() for c in re.split(r"[,;]+", latest_user_text) if c.strip()]
+                    long_clauses = [c for c in clauses if len(c.split()) >= 3]
+                    is_short = (
+                        len(sentences) <= 1
+                        and latest_user_text.count("?") <= 1
+                        and len(long_clauses) <= 1
+                        and len(latest_user_text.split()) <= 8
+                    )
+                    if not is_short:
+                        memory["_pending_visit_intent"] = 2
+                        logger.info(
+                            "[{}] Visit intent in compound/long utterance ({}w); routing to LLM with 2-turn pending visit retention",
+                            self._stream_id,
+                            len(latest_user_text.split()),
+                        )
+                    else:
+                        date = memory.get("visit_date_iso")
+                        slot = memory.get("time_slot")
+                        utterance_time = visit_time(latest_user_text)
+                        from leads.worker import normalize_visit_time
+                        slots_match = bool(
+                            utterance_time
+                            and slot
+                            and (utterance_time.strip().lower() == slot.strip().lower() or normalize_visit_time(utterance_time) == normalize_visit_time(slot))
+                        )
+                        if date and slot and slots_match and self._on_visit_ready:
+                            await self._on_visit_ready(date, slot)
+                            return
+                        if date and not slot and utterance_time and self._on_visit_ready:
+                            memory["time_slot"] = utterance_time
+                            await self._on_visit_ready(date, utterance_time)
+                            return
+                        if date and not slot and not utterance_time and re.fullmatch(r"(?:yes|yeah|sure|okay|ok|haan|theek hai)[.!]?", latest_user_text.strip().lower()):
+                            line = "Kal kitne baje aana chahenge?" if re.search(r"[\u0900-\u097f]|\bkal\b", latest_user_text, re.I) else "What time would you like to visit?"
+                            await self.push_frame(TTSSpeakFrame(text=line, append_to_context=True), direction)
+                            return
 
                 if self._call_end_coordinator and ((pure_farewell(latest_user_text) and whatsapp_answer(messages, memory.get('_whatsapp_consent_action')) != 'declined') or closing_after_work(latest_user_text, memory)):
                     if getattr(self._call_end_coordinator, "_dedicated_goodbye_queued", False):
@@ -3542,6 +3770,8 @@ class _FastPathRouter(FrameProcessor):
                     # STT can split one question into fragments: judge every user message since the last assistant turn together.
                     _tail = []
                     for _m in reversed(messages):
+                        if _m.get("role") == "system":
+                            continue
                         if _m.get("role") != "user" or not isinstance(_m.get("content"), str):
                             break
                         _tail.append(_m["content"].strip())
@@ -3686,6 +3916,7 @@ class _DelayedRaceFiller(FrameProcessor):
         timeout_seconds: float = 0.700,
         llm_service: Any = None,
         context: Any = None,
+        metrics_collector: Any = None,
     ):
         super().__init__()
         self._stream_id = stream_id
@@ -3696,6 +3927,7 @@ class _DelayedRaceFiller(FrameProcessor):
         self._timeout_seconds = timeout_seconds
         self._llm_service = llm_service
         self._context = context
+        self._metrics_collector = metrics_collector
         self._turn_index = 0
         self._race_task: asyncio.Task | None = None
         self._watchdog_task: asyncio.Task | None = None
@@ -3750,6 +3982,11 @@ class _DelayedRaceFiller(FrameProcessor):
                 reason,
             )
             self._filler_dispatched = True
+            filler_text = PHRASES.get(filler_key, "Sure, one moment, let me check that for you.")
+            if self._context and hasattr(self._context, "messages") and isinstance(self._context.messages, list):
+                self._context.messages.append({"role": "assistant", "content": filler_text, "is_filler": True})
+            if self._metrics_collector and hasattr(self._metrics_collector, "record_tts_fallback"):
+                self._metrics_collector.record_tts_fallback(self._turn_index)
             asyncio.create_task(
                 self._interruption_audio_gate.play_cached_audio(pcm, self._sample_rate)
             )
@@ -4334,25 +4571,179 @@ class _FAQAudibleObserver(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class _DTMFProcessor(FrameProcessor):
+    """Processes keypad DTMF inputs (InputDTMFFrame) so IVR-style inputs don't get treated as speech or dropped."""
+
+    def __init__(self, stream_id: str = "", enterprise_handoff_fn: Any = None) -> None:
+        super().__init__()
+        self._stream_id = stream_id
+        self._enterprise_handoff = enterprise_handoff_fn
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, InputDTMFFrame):
+            key = str(getattr(frame.button, "value", frame.button))
+            logger.info("[{}] DTMF keypad input received: {!r}", self._stream_id, key)
+            now = time.time()
+            if key == "0" and self._enterprise_handoff:
+                logger.info("[{}] DTMF '0' detected -> triggering human transfer handoff", self._stream_id)
+                asyncio.create_task(self._enterprise_handoff("dtmf_0"))
+                await self.push_frame(UserStartedSpeakingFrame(), direction)
+                await self.push_frame(TranscriptionFrame(text="Representative", user_id="caller", timestamp=now), direction)
+                await self.push_frame(UserStoppedSpeakingFrame(), direction)
+                return
+            elif key == "1":
+                logger.info("[{}] DTMF '1' detected -> injecting affirmative confirmation", self._stream_id)
+                await self.push_frame(UserStartedSpeakingFrame(), direction)
+                await self.push_frame(TranscriptionFrame(text="Yes, confirm", user_id="caller", timestamp=now), direction)
+                await self.push_frame(UserStoppedSpeakingFrame(), direction)
+                return
+            else:
+                logger.info("[{}] DTMF '{}' detected -> injecting keypad token", self._stream_id, key)
+                await self.push_frame(UserStartedSpeakingFrame(), direction)
+                await self.push_frame(TranscriptionFrame(text=f"[Keypad {key}]", user_id="caller", timestamp=now), direction)
+                await self.push_frame(UserStoppedSpeakingFrame(), direction)
+                return
+        await self.push_frame(frame, direction)
+
+
 class _TranscriptionTap(FrameProcessor):
     """Passively taps TranscriptionFrame and ProposedUserStoppedSpeakingFrame for call_metrics.
 
     Sits immediately downstream of STT (upstream of context_aggregator.user() which
     absorbs TranscriptionFrame). Notifies call_metrics directly without pushing any
     new frames or forwarding MetricsFrame, ensuring zero chance of a replay loop.
+    Logs raw STT transcripts and enforces Echo Guard against agent utterances.
     """
 
-    def __init__(self, collector: Any = None, faq_recovery=None) -> None:
+    def __init__(
+        self,
+        collector: Any = None,
+        faq_recovery=None,
+        stream_id: str = "",
+        spoken_guard=None,
+        context=None,
+        supported_languages: list[str] | None = None,
+    ) -> None:
         super().__init__()
         self._collector = collector
         self._faq_recovery = faq_recovery
+        self._stream_id = stream_id
+        self._spoken_guard = spoken_guard
+        self._context = context
+        self._supported_languages = {l.lower() for l in (supported_languages or ["en", "hi", "te"])}
+        self._bot_speaking = False
+        self._bot_stopped_at = 0.0
+        self._stt_log_path = None
+        if stream_id and stream_id.startswith("web-"):
+            from pathlib import Path
+            p = Path("outputs/transcripts")
+            p.mkdir(parents=True, exist_ok=True)
+            self._stt_log_path = p / f"stt_{stream_id}.jsonl"
+
+    def _log_stt_frame(self, text: str, dropped: bool = False, drop_reason: str = ""):
+        if not self._stt_log_path:
+            return
+        try:
+            with open(self._stt_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "ts": time.time(),
+                    "text": text,
+                    "dropped": dropped,
+                    "drop_reason": drop_reason,
+                }) + "\n")
+        except Exception:
+            pass
+
+    def _get_recent_agent_texts(self) -> list[str]:
+        texts = []
+        if self._spoken_guard:
+            last_spoken = getattr(self._spoken_guard, "_last_spoken_turn_text", "")
+            curr_spoken = getattr(self._spoken_guard, "_current_turn_spoken_text", "")
+            if last_spoken:
+                texts.append(last_spoken)
+            if curr_spoken:
+                texts.append(curr_spoken)
+        if self._context and hasattr(self._context, "messages"):
+            for m in reversed(self._context.messages[-4:]):
+                if m.get("role") == "assistant" and isinstance(m.get("content"), str):
+                    texts.append(m["content"])
+        return texts
+
+    def _is_echo(self, text: str) -> bool:
+        if not text:
+            return False
+        now = time.monotonic()
+        if not self._bot_speaking and (now - self._bot_stopped_at > 0.5):
+            return False
+
+        import re
+        from difflib import SequenceMatcher
+        stt_clean = re.sub(r"[^\w\s]", "", text.lower()).strip()
+        if len(stt_clean) < 15:
+            return False
+
+        for agent_text in self._get_recent_agent_texts():
+            if not agent_text:
+                continue
+            ag_clean = re.sub(r"[^\w\s]", "", agent_text.lower()).strip()
+            if not ag_clean:
+                continue
+            sim = SequenceMatcher(None, stt_clean, ag_clean).ratio()
+            if sim >= 0.90:
+                return True
+
+        return False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
-        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, TranscriptionFrame) and frame.text.strip() and (not valid_transcript(frame.text) or fragment_transcript(frame.text)):
-            logger.info("Dropping nonlinguistic STT noise before aggregation: {!r}", frame.text[:60])
-            frame.text = ""  # preserve the empty-turn lifecycle, never add noise to LLM context
-        elif direction == FrameDirection.DOWNSTREAM and isinstance(frame, TranscriptionFrame) and frame.text.strip() and os.getenv("STT_REPAIR", "1") != "0":
+
+        if isinstance(frame, BotStartedSpeakingFrame):
+            self._bot_speaking = True
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            self._bot_speaking = False
+            self._bot_stopped_at = time.monotonic()
+
+        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, TranscriptionFrame) and frame.text.strip():
+            raw_text = frame.text
+
+            # Language check: drop non-active languages (supported: en, hi, te)
+            lang_code = ""
+            if getattr(frame, "language", None):
+                lang_code = str(frame.language).split("-")[0].lower()
+            is_unsupported_lang = bool(lang_code and lang_code not in self._supported_languages)
+
+            # Script check: drop unsupported Indic scripts (e.g. Bengali \u0980-\u09FF)
+            import re
+            has_unsupported_script = bool(re.search(r"[\u0980-\u09FF\u0B80-\u0BFF\u0C80-\u0CFF\u0D00-\u0D7F\u0A00-\u0A7F\u0A80-\u0AFF\u0B00-\u0B7F]", raw_text))
+
+            # Confidence check: drop low-confidence far-field speech
+            res = getattr(frame, "result", None)
+            conf = res.get("confidence") if isinstance(res, dict) else None
+            is_low_conf = bool(conf is not None and conf < 0.40)
+
+            is_noise = not valid_transcript(frame.text) or fragment_transcript(frame.text)
+            is_echo = self._is_echo(frame.text)
+
+            if is_unsupported_lang or has_unsupported_script:
+                logger.info("[LanguageGuard] [{}] Dropping unsupported language STT transcript (lang={}, text={!r})", self._stream_id, getattr(frame, "language", None), raw_text)
+                self._log_stt_frame(raw_text, dropped=True, drop_reason=f"unsupported_lang_{getattr(frame, 'language', None) or 'script'}")
+                frame.text = ""
+            elif is_low_conf:
+                logger.info("[ConfidenceGuard] [{}] Dropping low-confidence STT transcript (conf={}, text={!r})", self._stream_id, conf, raw_text)
+                self._log_stt_frame(raw_text, dropped=True, drop_reason=f"low_confidence_{conf}")
+                frame.text = ""
+            elif is_echo:
+                logger.warning("[EchoGuard] [{}] Dropping echoed agent speech from STT: {!r}", self._stream_id, raw_text)
+                self._log_stt_frame(raw_text, dropped=True, drop_reason="echo_guard")
+                frame.text = ""
+            elif is_noise:
+                logger.info("Dropping nonlinguistic STT noise before aggregation: {!r}", raw_text[:60])
+                self._log_stt_frame(raw_text, dropped=True, drop_reason="noise")
+                frame.text = ""
+            else:
+                self._log_stt_frame(raw_text, dropped=False)
+        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, TranscriptionFrame) and frame.text.strip() and os.getenv("STT_REPAIR", "1") != "0":
             try:
                 _fixed, _snaps = repair_stt(frame.text)
             except Exception:
@@ -4362,6 +4753,20 @@ class _TranscriptionTap(FrameProcessor):
                     logger.info("[STT-REPAIR] rule={} heard={!r} -> {!r}", _rule, _heard, _to)
                 logger.info("[STT-REPAIR] {!r} -> {!r}", frame.text[:120], _fixed[:120])
                 frame.text = _fixed
+        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, TranscriptionFrame) and frame.text.strip():
+            coord = getattr(self._spoken_guard, "_call_end_coordinator", None)
+            if coord and (coord.is_ending or getattr(coord, "is_closing_in_progress", False) or getattr(coord, "_in_grace", False)):
+                clean_t = frame.text.strip().lower()
+                if not _is_farewell_or_acknowledgment(clean_t):
+                    logger.info(
+                        "[{}] Real transcript during farewell ({!r}) -> cancelling ending, stopping goodbye audio",
+                        self._stream_id,
+                        frame.text,
+                    )
+                    coord.cancel_ending("real transcript during farewell")
+                    gate = getattr(self._spoken_guard, "_interruption_audio_gate", None)
+                    if gate and hasattr(gate, "interrupt_goodbye"):
+                        await gate.interrupt_goodbye()
         if self._faq_recovery and direction == FrameDirection.DOWNSTREAM:
             if isinstance(frame, InterruptionFrame):
                 self._faq_recovery.interrupt()
@@ -5299,6 +5704,7 @@ class _CallEndCoordinator(FrameProcessor):
         self._awaiting_closing = False
         self._closing_in_progress = False
         self._in_grace = False
+        self._late_speech_started = False
 
         if self._shutdown_state is not None:
             self._shutdown_state["active"] = False
@@ -5433,9 +5839,9 @@ class _CallEndCoordinator(FrameProcessor):
                 or self._in_grace
             )
         ):
-            # Speech that starts inside grace gets bounded time for final STT.
+            # Speech that starts inside closing or grace gets bounded time for final STT.
             # Only start once: noise/repeated VAD must not extend ending indefinitely.
-            if self._in_grace and self._extra_reply_count < 1 and not getattr(self, '_late_speech_started', False):
+            if (self._in_grace or self._closing_in_progress) and not getattr(self, '_late_speech_started', False):
                 self._late_speech_started = True
                 self._cancel_task('_grace_task')
                 self._grace_task = asyncio.create_task(self._wait_late_transcript())
@@ -5464,15 +5870,15 @@ class _CallEndCoordinator(FrameProcessor):
                     self._grace_seconds,
                 )
 
-                self._cancel_task("_grace_task")
-
-                self._grace_task = asyncio.create_task(
-                    self._run_grace_timeout()
-                )
+                if not getattr(self, '_late_speech_started', False):
+                    self._cancel_task("_grace_task")
+                    self._grace_task = asyncio.create_task(
+                        self._run_grace_timeout()
+                    )
 
         # During grace window or closing, inspect transcription text.
         # If caller reciprocates farewell/signs off, complete the call cleanly without speaking again.
-        # If caller says something meaningful/question/continuation, allow at most ONE extra reply without cancelling hangup.
+        # If caller says something meaningful/question/continuation, cancel ending and answer.
         if (
             isinstance(frame, TranscriptionFrame)
             and (self._in_grace or self._closing_in_progress or self._awaiting_closing)
@@ -5491,26 +5897,12 @@ class _CallEndCoordinator(FrameProcessor):
                     self._grace_task = asyncio.create_task(self._run_grace_timeout())
                 return
             elif genuine_late_question(text):
-                # Late-barge-in contract: does NOT cancel the final hangup; allows at most ONE extra reply!
-                if getattr(self, "_extra_reply_count", 0) < 1:
-                    self._extra_reply_count = getattr(self, "_extra_reply_count", 0) + 1
-                    logger.info(
-                        "[{}] Caller spoke meaningfully during closing/grace ({!r}); allowing at most 1 extra reply (count={}) without cancelling hangup",
-                        self._stream_id,
-                        text,
-                        self._extra_reply_count,
-                    )
-                    self._closing_in_progress = False
-                    self._in_grace = False
-                    self._awaiting_closing = True
-                    self._cancel_task("_grace_task")
-                    # Do NOT cancel self._safety_task - hard safety timer remains running as backstop!
-                else:
-                    logger.info(
-                        "[{}] Caller spoke during closing/grace ({!r}) but extra reply budget exhausted; proceeding to hangup",
-                        self._stream_id,
-                        text,
-                    )
+                logger.info(
+                    "[{}] Caller spoke meaningfully during closing/grace ({!r}); cancelling call ending",
+                    self._stream_id,
+                    text,
+                )
+                self.cancel_ending("caller asked question during farewell")
             elif not text:
                 if not self._grace_task or self._grace_task.done():
                     self._grace_task = asyncio.create_task(self._run_grace_timeout())
@@ -6376,6 +6768,8 @@ async def run_bot(
     }
     provider_end_confirmed = {"value": False}
     hard_timeout_task = None
+    heartbeat_task = None
+
 
     async def _force_hangup_and_mark_done(trigger: str) -> None:
         """
@@ -6447,9 +6841,10 @@ async def run_bot(
         await task.cancel()
 
     log_handler = logger.add(
-        f"logs/call_{call_label}_{stream_id}.log",
+        os.path.join(_LOG_DIR, f"call_{call_label}_{stream_id}.log"),
         level="DEBUG",
     )
+
 
     call_metrics = None
     enterprise_on = bool((config.get("enterprise") or {}).get("enabled"))
@@ -6457,6 +6852,12 @@ async def run_bot(
     transferred = {"active":False}
     callback_close_state = {"started":False}
     _CALLBACK_CLOSE_STATUSES = {"callback_required","failed","blocked","not_ready"}
+
+    # Item 8 — trajectory logger: open at call start, close in the finally block.
+    from trajectory import Trajectory as _Trajectory
+    _traj = _Trajectory(call_id=stream_id, stream_id=stream_id, call_type=call_type)
+
+
 
     async def enterprise_callback_close(result):
         """Transfer/capacity failure: speak the approved callback wording once, then end the call.
@@ -6872,6 +7273,7 @@ async def run_bot(
             tts=tts,
             websocket=websocket,
             call_end_coordinator=call_end_coordinator,
+            serializer=serializer,
         )
 
         def _latest_user_utterance() -> str:
@@ -7135,12 +7537,11 @@ async def run_bot(
             logger.info(f"[{stream_id}] Tool handoff_to_human called: reason={reason}")
 
             try:
-                await lead_state.record_fields_async(
+                await lead_state.set_disposition_async(
                     stream_id,
-                    {
-                        "disposition": "ESCALATED_TO_HUMAN",
-                    },
+                    "ESCALATED_TO_HUMAN",
                 )
+
 
                 call_rec = (await lead_state.get_call_async(stream_id)) or {}
                 lead_id_val = call_rec.get("lead_id")
@@ -7208,6 +7609,18 @@ async def run_bot(
                 handler_fn,
                 cancel_on_interruption=(not enterprise_on or tool_name != "handoff_to_human"),
             )
+
+        # Item 5: Prevent Pipecat from prepending duplicate ASYNC_TOOL_INSTRUCTIONS.
+        # Startup assertion: fail loudly if Pipecat internals change across version updates.
+        assert hasattr(llm, "_compose_system_instruction"), (
+            "Pipecat OpenAILLMService missing _compose_system_instruction. Version incompatibility."
+        )
+        assert hasattr(llm, "_settings") and hasattr(llm._settings, "system_instruction"), (
+            "Pipecat LLM instance missing _settings.system_instruction. Version incompatibility."
+        )
+        llm._compose_system_instruction = lambda: None
+        llm._settings.system_instruction = None
+
 
         # Item 6: Prompt ordering for Groq prefix caching.
         # Static system prompt and project facts are strictly FIRST in the message array.
@@ -7412,6 +7825,7 @@ async def run_bot(
             timeout_seconds=float(config.get("filler_timeout_ms", 700)) / 1000.0,
             llm_service=llm,
             context=context,
+            metrics_collector=call_metrics,
         )
 
         faq_recovery = FAQReplyRecovery()
@@ -7521,22 +7935,34 @@ async def run_bot(
             await tts.process_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
             spoken_text_guard._record_assistant_spoken(_CACHED_PHRASE_TEXTS["clarify_repeat"], "clarify_repeat")
             tts_stall_state.used = True
+            if context and hasattr(context, "messages") and isinstance(context.messages, list):
+                context.messages.append({"role": "assistant", "content": _CACHED_PHRASE_TEXTS["clarify_repeat"], "is_filler": True})
+            if call_metrics and hasattr(call_metrics, "record_tts_fallback"):
+                call_metrics.record_tts_fallback()
             await interruption_audio_gate.play_cached_audio(pcm, sample_rate)
 
         tts_stall_state = TTSStallState(hedge_tts_stall)
-        attach_safe_tts(tts, stream_id, tts_stall_state)
+        attach_safe_tts(tts, stream_id, tts_stall_state, metrics_collector=call_metrics, sample_rate=sample_rate)
         tts_stall_observer = _TTSStallObserver(tts_stall_state)
         @tts.event_handler("on_tts_request")
         async def watch_tts_request(service, context_id, text):
             if not call_end_coordinator.is_ending:
                 tts_stall_state.arm()
 
-        pipeline_elements = [transport.input()]
+        dtmf_processor = _DTMFProcessor(stream_id, enterprise_handoff)
+        pipeline_elements = [transport.input(), dtmf_processor]
         if fallback_vad_processor is not None:
             pipeline_elements.append(fallback_vad_processor)
         pipeline_elements.extend([
             stt,
-            _TranscriptionTap(call_metrics, faq_recovery),
+            _TranscriptionTap(
+                collector=call_metrics,
+                faq_recovery=faq_recovery,
+                stream_id=stream_id,
+                spoken_guard=spoken_text_guard,
+                context=context,
+                supported_languages=config.get("language", {}).get("supported", ["en", "hi", "te"]),
+            ),
             spam_qualify_gate,
             language_observer,
             context_aggregator.user(),
@@ -7630,9 +8056,7 @@ async def run_bot(
                 not customer_name
                 and call_type == "web"
             ):
-                customer_name = config.get(
-                    "test_customer_name"
-                )
+                customer_name = None
 
             if conversation_call_type == "outbound":
                 if customer_name:
@@ -7653,6 +8077,15 @@ async def run_bot(
                     )
                 )
 
+            # Prepend recording consent disclosure line if configured
+            notice = str(
+                (config.get("recording") or {}).get("notice")
+                or (config.get("enterprise", {}).get("recording") or {}).get("notice")
+                or ""
+            ).strip()
+            if notice and call_type != "web":
+                greeting = f"{notice} {greeting}"
+
             # Append greeting directly to context and speak via TTS without triggering LLM completion
             messages.append(
                 {
@@ -7661,13 +8094,13 @@ async def run_bot(
                 }
             )
 
-            interruption_audio_gate.next_generation()
+            gen_id = interruption_audio_gate.next_generation()
 
             if hasattr(
                 serializer,
                 "next_generation",
             ):
-                serializer.next_generation()
+                serializer.next_generation(gen_id)
 
             _greeting_sent["done"] = True
 
@@ -7712,6 +8145,34 @@ async def run_bot(
 
             hard_timeout_task = asyncio.create_task(hard_timeout())
 
+        # Loop-lag heartbeat monitor (Item 1: logs only lags >= 50ms)
+        loop = asyncio.get_running_loop()
+        loop.slow_callback_duration = 0.05
+
+        async def _loop_heartbeat_monitor(threshold_ms: float = 50.0):
+            interval = 0.020
+            last = time.monotonic()
+            try:
+                while True:
+                    await asyncio.sleep(interval)
+                    now = time.monotonic()
+                    lag_ms = (now - last - interval) * 1000.0
+                    if lag_ms >= threshold_ms:
+                        logger.warning(
+                            "[{}] EVENT_LOOP_LAG detected: {:.1f}ms (threshold={}ms)",
+                            stream_id,
+                            lag_ms,
+                            threshold_ms,
+                        )
+                    last = now
+            except asyncio.CancelledError:
+                pass
+
+        heartbeat_task = asyncio.create_task(_loop_heartbeat_monitor())
+
+        _consecutive_empty_turns = 0
+        _last_turn_stop_time = 0.0
+
         @context_aggregator.user().event_handler(
             "on_user_turn_stopped"
         )
@@ -7721,16 +8182,25 @@ async def run_bot(
             *args,
             **kwargs,
         ):
+            nonlocal _consecutive_empty_turns, _last_turn_stop_time
             user_msg = args[0] if args else None
             user_content = getattr(user_msg, "content", "") or ""
             was_interrupted = getattr(interruption_audio_gate, "is_interrupted", False)
 
+            now = time.monotonic()
             source_name = "timeout" if strategy is None else "strategy"
+            if (now - _last_turn_stop_time < 0.10) and not str(user_content).strip():
+                logger.info("[{}] Dropping duplicate empty turn_stop source={}", stream_id, source_name)
+                return
+            _last_turn_stop_time = now
+
             logger.info("[{}] turn_stop source={}", stream_id, source_name)
+
             if call_metrics and hasattr(call_metrics, "record_turn_stop"):
                 call_metrics.record_turn_stop(source_name)
 
             if not str(user_content).strip():
+                _consecutive_empty_turns += 1
                 silence_checker._turn_in_flight = False
                 silence_checker._user_is_speaking = False
                 now = time.monotonic()
@@ -7744,7 +8214,11 @@ async def run_bot(
                         logger.info("[{}] Recovering interrupted FAQ after transcriptless turn", stream_id)
                         await task.queue_frames([TTSSpeakFrame(text=reply, append_to_context=False)])
                     elif faq_recovery.take_clarification():
-                        line = _CACHED_PHRASE_TEXTS['clarify_repeat_hi' if lead_memory.get('language') == 'Hindi' else 'clarify_repeat']
+                        if _consecutive_empty_turns >= 2:
+                            line = _CACHED_PHRASE_TEXTS['checkin_generic']
+                            logger.info("[{}] Consecutive no-reply #{}: rephrasing shorter with checkin_generic", stream_id, _consecutive_empty_turns)
+                        else:
+                            line = _CACHED_PHRASE_TEXTS['clarify_repeat_hi' if lead_memory.get('language') == 'Hindi' else 'clarify_repeat']
                         await task.queue_frames([TTSSpeakFrame(text=line, append_to_context=False)])
                 logger.info(
                     "[{}] User turn ended with empty transcript; disarmed stall watchdog, silence monitor active (stage={})",
@@ -7757,11 +8231,17 @@ async def run_bot(
                 # A valid user utterance must have at least 3 alphabetic characters total.
                 _alpha_count = sum(1 for c in str(user_content) if c.isalpha())
                 if not valid_transcript(str(user_content)):
+                    _consecutive_empty_turns += 1
                     silence_checker._turn_in_flight = False
                     silence_checker._user_is_speaking = False
                     stall_watchdog.disarm()
                     if not call_end_coordinator.is_ending and not hangup_state['done'] and faq_recovery.take_clarification():
-                        await task.queue_frames([TTSSpeakFrame(text=_CACHED_PHRASE_TEXTS['clarify_repeat_hi' if lead_memory.get('language') == 'Hindi' else 'clarify_repeat'], append_to_context=False)])
+                        if _consecutive_empty_turns >= 2:
+                            line = _CACHED_PHRASE_TEXTS['checkin_generic']
+                            logger.info("[{}] Consecutive garbage transcript #{}: rephrasing shorter with checkin_generic", stream_id, _consecutive_empty_turns)
+                        else:
+                            line = _CACHED_PHRASE_TEXTS['clarify_repeat_hi' if lead_memory.get('language') == 'Hindi' else 'clarify_repeat']
+                        await task.queue_frames([TTSSpeakFrame(text=line, append_to_context=False)])
                     logger.warning(
                         "[{}] Dropped garbage STT transcript {!r} ({} alpha chars) — not sending to LLM",
                         stream_id,
@@ -7770,6 +8250,7 @@ async def run_bot(
                     )
                     return
 
+                _consecutive_empty_turns = 0
                 silence_checker._turn_in_flight = True
                 silence_checker._user_is_speaking = False
                 silence_checker._stage = 0
@@ -7788,18 +8269,18 @@ async def run_bot(
                     and not getattr(interruption_audio_gate, "_is_interrupted", True)
                 )
                 if _gate_active and _bot_current:
-                    _strip = lambda s: set(re.sub(r"[^\w\s]", "", s.lower()).split())
-                    _user_words = _strip(str(user_content))
-                    _bot_words = _strip(_bot_current)
-                    if _user_words and _bot_words:
-                        _overlap = len(_user_words & _bot_words) / min(len(_user_words), len(_bot_words))
-                        if _overlap >= 0.5:
+                    from difflib import SequenceMatcher
+                    _user_clean = re.sub(r"[^\w\s]", "", str(user_content).lower()).strip()
+                    _bot_clean = re.sub(r"[^\w\s]", "", _bot_current.lower()).strip()
+                    if len(_user_clean) >= 15 and _bot_clean:
+                        _sim = SequenceMatcher(None, _user_clean, _bot_clean).ratio()
+                        if _sim >= 0.90:
                             silence_checker._turn_in_flight = False
                             logger.warning(
-                                "[{}] Dropped probable echo transcript {!r} (overlap={:.0%} with bot utterance {!r})",
+                                "[{}] Dropped probable echo transcript {!r} (similarity={:.0%} with bot utterance {!r})",
                                 stream_id,
                                 str(user_content)[:60],
-                                _overlap,
+                                _sim,
                                 _bot_current[:60],
                             )
                             return
@@ -7930,7 +8411,7 @@ async def run_bot(
                 serializer,
                 "next_generation",
             ):
-                serializer.next_generation()
+                serializer.next_generation(gen_id)
 
             logger.debug(
                 "[{}] Advanced audio generation context to id={}",
@@ -7984,6 +8465,9 @@ async def run_bot(
     finally:
         if hard_timeout_task:
             hard_timeout_task.cancel()
+        if heartbeat_task:
+            heartbeat_task.cancel()
+
         STREAM_PROVIDER_CALL_IDS.pop(
             stream_id,
             None,
@@ -8079,6 +8563,16 @@ async def run_bot(
             except BaseException as e:
                 logger.warning("[{}] Failed writing local test report: {}", stream_id, e)
 
+            # Item 8 — close trajectory with final outcome
+            try:
+                _traj.close(
+                    disposition=disposition if "disposition" in dir() else "unknown",
+                    duration_s=(metrics_sum or {}).get("avg_voice_latency_ms", None) and None or None,
+                    lead_fields=current_lead_mem or {},
+                )
+            except Exception:
+                pass
+
             # One analytics owner only: the scoring job receives the real transcript.
             # Background arq lead worker scoring, touchpoint logging, and CRM dispatch
             try:
@@ -8122,7 +8616,6 @@ async def run_bot(
                 store.event(row['tenant'],enterprise_session_id,'provider_end_unverified',
                   {'hangup_request_accepted':provider_end_confirmed["value"],
                    'reason':'quota reservation retained until provider end read or signed callback'},enterprise_session_id+':end_unverified')
-
         if not aiohttp_session.closed:
             try:
                 await asyncio.shield(aiohttp_session.close())
@@ -8157,17 +8650,182 @@ def caller_slot_matches(messages, arguments):
                 and selected.get("time_slot") == requested_time)
 
 
-def attach_safe_tts(tts, stream_id="", stall_state=None):
+_DYNAMIC_TTS_CACHE: dict[int, dict[str, list[bytes]]] = {8000: {}, 16000: {}}
+_DYNAMIC_TTS_CACHE_MAX = 500
+
+
+def _normalize_cache_key(text: str) -> str:
+    """Normalize text for cache key matching: strip punctuation, lowercase, collapse whitespace."""
+    if not text:
+        return ""
+    import re
+    cleaned = re.sub(r"[^\w\s]", "", text.lower())
+    return " ".join(cleaned.split())
+
+
+def _seed_dynamic_tts_cache():
+    """Seed dynamic TTS cache from pre-rendered _AUDIO_CACHE phrases."""
+    for sr in (8000, 16000):
+        sr_cache = _AUDIO_CACHE.get(sr, {})
+        for key, pcm in sr_cache.items():
+            if "alex" in key:
+                continue
+            phrase_text = _CACHED_PHRASE_TEXTS.get(key)
+            if phrase_text and pcm:
+                chunk_size = int(sr * 2 * 0.02)
+                chunks = [pcm[i : i + chunk_size] for i in range(0, len(pcm), chunk_size)]
+                _DYNAMIC_TTS_CACHE[sr][phrase_text.strip().lower()] = chunks
+                norm_k = _normalize_cache_key(phrase_text)
+                if norm_k:
+                    _DYNAMIC_TTS_CACHE[sr][norm_k] = chunks
+
+        # Pre-seed campaign-common line variations
+        common_aliases = {
+            "greeting_generic": [
+                "Hi, this is Ananya from Meridian Group. Is this a good time to talk?",
+                "Hi this is Ananya from Meridian Group. Is this a good time to talk?",
+                "Hello, this is Ananya from Meridian Group. Is this a good time to talk?",
+            ],
+            "opening_intro": [
+                "Great! Are you looking for a 2 or 3 BHK?",
+                "Great, are you looking for a 2 or 3 BHK?",
+                "Are you looking for a 2 or 3 BHK?",
+                "Are you looking for a two or three BHK?",
+                "Are you looking for a two or three B H K?",
+                "Hello! Are you looking for a two or three B H K?",
+                "Hello, are you looking for a two or three B H K?",
+                "Great! Are you looking for a two or three BHK?",
+            ],
+            "faq_3bhk_options": [
+                "We have fifteen eighty sq ft from one point four five crore. Or twenty-one hundred sq ft from one point seven crore. Which size do you prefer?",
+                "We have 1580 sq ft from 1.45 crore, or 2100 sq ft from 1.7 crore. Which size do you prefer?",
+                "We have fifteen eighty square feet from one point four five crore, or twenty one hundred square feet from one point seven crore. Which size would you prefer?",
+            ],
+            "faq_2bhk_options": [
+                "We have eleven fifty sq ft from ninety-five lakhs.",
+                "We have 1150 to 1320 sq ft, with one balcony, from ninety-five lakhs. Would you like to schedule a site visit?",
+            ],
+            "faq_3bhk_large": [
+                "The larger 3 BHK has a study and two balconies, from one point seven crore.",
+                "The larger three BHK has a study and two balconies, with nineteen twenty to twenty one hundred square feet, from one point seven crore.",
+            ],
+            "clarify_repeat": [
+                "Sorry, I didn't catch that. Could you say that again?",
+                "Sorry, could you say that again?",
+            ],
+            "checkin_generic": [
+                "Hello? Are you still there?",
+                "Are you still there?",
+                "Hello, are you still there?",
+            ],
+        }
+        for key, alt_texts in common_aliases.items():
+            pcm = sr_cache.get(key)
+            if pcm:
+                chunk_size = int(sr * 2 * 0.02)
+                chunks = [pcm[i : i + chunk_size] for i in range(0, len(pcm), chunk_size)]
+                for alt in alt_texts:
+                    _DYNAMIC_TTS_CACHE[sr][alt.strip().lower()] = chunks
+                    norm_alt = _normalize_cache_key(alt)
+                    if norm_alt:
+                        _DYNAMIC_TTS_CACHE[sr][norm_alt] = chunks
+
+
+# Initial seeding of common phrases
+_seed_dynamic_tts_cache()
+
+
+def attach_safe_tts(tts, stream_id="", stall_state=None, metrics_collector=None, sample_rate: int | None = None):
     original = tts.run_tts
+
     async def run_safe(text, context_id):
         clean = safe_tts_text(text)
         if not clean:
             logger.info("[{}] Skipped nonlinguistic aggregated TTS segment", stream_id)
             return
+
+        sr = sample_rate or getattr(tts, "_speech_sample_rate", None) or getattr(tts, "sample_rate", None) or (16000 if (stream_id and stream_id.startswith("web-")) else 8000)
+        if sr not in _DYNAMIC_TTS_CACHE:
+            _DYNAMIC_TTS_CACHE[sr] = {}
+
+        cache_key = clean.strip().lower()
+        norm_key = _normalize_cache_key(clean)
+
+        target_gen = getattr(tts, "_current_speak_frame_gen", None) or getattr(tts, "_current_turn_gen", None)
+        is_conf = getattr(tts, "_active_booking_conf_tag", False)
+
+        # Fix 7: Dynamic TTS Cache HIT check (0ms synthesis)
+        cached_chunks = _DYNAMIC_TTS_CACHE[sr].get(cache_key) or _DYNAMIC_TTS_CACHE[sr].get(norm_key)
+        if cached_chunks:
+            logger.info("[{}] TTS dynamic cache HIT for {!r} (0ms synthesis)", stream_id, clean[:50])
+            for chunk in cached_chunks:
+                f = TTSAudioRawFrame(
+                    audio=chunk,
+                    sample_rate=sr,
+                    num_channels=1,
+                    context_id=context_id,
+                )
+                if target_gen is not None:
+                    f.generation_id = target_gen
+                if is_conf:
+                    f.is_booking_confirmation = True
+                yield f
+            if getattr(tts, "_active_booking_conf_tag", False):
+                tts._active_booking_conf_tag = False
+            tts._current_speak_frame_gen = None
+            if metrics_collector is not None:
+                metrics_collector.record_cache_hit(cache_key)
+                metrics_collector.record_tts_played_characters(len(clean))
+            return
+
         if stall_state is not None:
             stall_state.arm()
-        async for output in original(clean, context_id):
-            yield output
+
+        # Retry once on exception; never substitute filler
+        for attempt in range(2):
+            try:
+                async for output in original(clean, context_id):
+                    if output is not None:
+                        if target_gen is not None and getattr(output, "generation_id", None) is None:
+                            output.generation_id = target_gen
+                        if is_conf:
+                            output.is_booking_confirmation = True
+                    yield output
+                if metrics_collector is not None:
+                    metrics_collector.record_tts_played_characters(len(clean))
+                return
+            except Exception as exc:
+                if attempt == 0:
+                    logger.warning(
+                        "[{}] TTS synthesis attempt 1 failed for {!r}: {}. Retrying once...",
+                        stream_id,
+                        clean[:50],
+                        exc,
+                    )
+                    if hasattr(tts, "_disconnect") and hasattr(tts, "_connect"):
+                        try:
+                            await tts._disconnect()
+                            await tts._connect()
+                        except Exception as rec_exc:
+                            logger.warning("[{}] TTS retry reconnect failed: {}", stream_id, rec_exc)
+                else:
+                    logger.error(
+                        "[{}] TTS synthesis failed after retry for {!r}: {}",
+                        stream_id,
+                        clean[:50],
+                        exc,
+                    )
+                    if metrics_collector is not None:
+                        try:
+                            metrics_collector.record_tts_failed_characters(len(clean), reason=str(exc))
+                        except Exception:
+                            pass
+                    return
+            finally:
+                if getattr(tts, "_active_booking_conf_tag", False):
+                    tts._active_booking_conf_tag = False
+                tts._current_speak_frame_gen = None
+
     tts.run_tts = run_safe
 
 

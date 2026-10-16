@@ -45,7 +45,7 @@ def get_engine() -> AsyncEngine:
         engine_kwargs = {"echo": False}
         if not is_sqlite:
             engine_kwargs.update({
-                "pool_size": 10,
+                "pool_size": 30,
                 "max_overflow": 20,
                 "pool_pre_ping": True,
             })
@@ -86,8 +86,13 @@ async def init_models() -> None:
         # Lightweight schema migration for SQLite / Postgres if tables already exist
         def _migrate(sync_conn):
             from sqlalchemy import inspect, text
+            from loguru import logger
             inspector = inspect(sync_conn)
-            if "site_visits" in inspector.get_table_names():
+            table_names = inspector.get_table_names()
+            is_postgres = sync_conn.dialect.name == "postgresql"
+            timestamp_type = "TIMESTAMP WITH TIME ZONE" if is_postgres else "TIMESTAMP"
+
+            if "site_visits" in table_names:
                 existing_cols = {c["name"] for c in inspector.get_columns("site_visits")}
                 new_cols = {
                     "call_id": "VARCHAR(255)",
@@ -96,7 +101,7 @@ async def init_models() -> None:
                     "time_slot": "VARCHAR(32)",
                     "configuration": "VARCHAR(64)",
                     "whatsapp_opt_in": "BOOLEAN DEFAULT 0",
-                    "whatsapp_opt_in_at": "TIMESTAMP",
+                    "whatsapp_opt_in_at": timestamp_type,
                     "whatsapp_status": "VARCHAR(32)",
                     "whatsapp_message_id": "VARCHAR(255)",
                 }
@@ -104,9 +109,49 @@ async def init_models() -> None:
                     if col_name not in existing_cols:
                         try:
                             sync_conn.execute(text(f"ALTER TABLE site_visits ADD COLUMN {col_name} {col_type}"))
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.warning(f"Schema migration warning for site_visits.{col_name}: {exc}")
+
+            if "outbox" in table_names:
+                existing_cols = {c["name"] for c in inspector.get_columns("outbox")}
+                new_cols = {
+                    "claimed_by": "VARCHAR(255)",
+                    "claimed_at": timestamp_type,
+                }
+                for col_name, col_type in new_cols.items():
+                    if col_name not in existing_cols:
+                        try:
+                            sync_conn.execute(text(f"ALTER TABLE outbox ADD COLUMN {col_name} {col_type}"))
+                            logger.info(f"Schema migration: added column {col_name} ({col_type}) to outbox")
+                        except Exception as exc:
+                            logger.warning(f"Schema migration warning for outbox.{col_name}: {exc}")
+
         await conn.run_sync(_migrate)
+
+
+async def ensure_outbox_schema() -> None:
+    """Non-destructive, safe to rerun; ensures atomic claiming columns exist on outbox table."""
+    from sqlalchemy import inspect, text
+    from loguru import logger
+    async with get_engine().begin() as conn:
+        def _migrate_outbox(sync_conn):
+            inspector = inspect(sync_conn)
+            if "outbox" in inspector.get_table_names():
+                existing_cols = {c["name"] for c in inspector.get_columns("outbox")}
+                is_postgres = sync_conn.dialect.name == "postgresql"
+                timestamp_type = "TIMESTAMP WITH TIME ZONE" if is_postgres else "TIMESTAMP"
+                new_cols = {
+                    "claimed_by": "VARCHAR(255)",
+                    "claimed_at": timestamp_type,
+                }
+                for col_name, col_type in new_cols.items():
+                    if col_name not in existing_cols:
+                        try:
+                            sync_conn.execute(text(f"ALTER TABLE outbox ADD COLUMN {col_name} {col_type}"))
+                            logger.info(f"Schema migration: added column {col_name} ({col_type}) to outbox")
+                        except Exception as exc:
+                            logger.warning(f"Schema migration warning for outbox.{col_name}: {exc}")
+        await conn.run_sync(_migrate_outbox)
 
 
 async def ensure_call_sheet_schema() -> None:
@@ -118,3 +163,4 @@ async def ensure_call_sheet_schema() -> None:
         exists = await conn.run_sync(lambda c: inspect(c).has_table("call_sheet_exports"))
         if not exists:
             raise RuntimeError("call_sheet_exports was not created on the active Leads engine")
+

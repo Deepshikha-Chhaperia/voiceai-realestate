@@ -14,12 +14,14 @@ from loguru import logger
 
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
     ErrorFrame,
     Frame,
     InterruptionFrame,
     MetricsFrame,
     ProposedUserStoppedSpeakingFrame,
     TranscriptionFrame,
+    TTSStoppedFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
@@ -76,6 +78,9 @@ class CallMetricsCollector(FrameProcessor):
         self._llm_ttft_ms: list[float] = []
         self._tts_raw_ttfa_ms: list[float] = []
         self._tts_ttfa_ms: list[float] = []
+        self._tts_records: list[tuple[int, float, float]] = []
+        self._failed_synthesis_turns: set[int] = set()
+        self._fallback_turns: set[int] = set()
         self._cached_ttfa_ms: list[float] = []
         self._tts_silence_trimmed_ms: list[float] = []
         self._stt_final_ms: list[float] = []
@@ -108,6 +113,9 @@ class CallMetricsCollector(FrameProcessor):
             "llm_prompt_tokens": 0,
             "llm_completion_tokens": 0,
             "tts_characters": 0,
+            "tts_characters_billed_provider": 0,
+            "tts_characters_played": 0,
+            "tts_characters_failed": 0,
             "stt_audio_seconds": 0.0,
             "interruptions": 0,
             "provider_errors": 0,
@@ -124,6 +132,8 @@ class CallMetricsCollector(FrameProcessor):
         self._cached_answer_key: str = ""
         self._generation_silence_trimmed: dict[int, float] = {}
         self._missing_native_usage_requests = 0
+        self._bot_speaking: bool = False
+        self._stt_languages: list[str] = []
         self._billed_usage_ids = set()
         self._billed_usage_objects = []
         self._provider_llm_tokens: dict[str, dict[str, int]] = {}
@@ -296,6 +306,7 @@ class CallMetricsCollector(FrameProcessor):
             self._waiting_for_bot_after_user_stop = True  # FIX D
 
         elif isinstance(frame, BotStartedSpeakingFrame):
+            self._bot_speaking = True
             # FIX D: bot replied, so this was not a no-reply turn
             self._waiting_for_bot_after_user_stop = False
 
@@ -378,17 +389,22 @@ class CallMetricsCollector(FrameProcessor):
                 self._last_transcript_at = None
                 self._speech_stop_at = None
 
+        elif isinstance(frame, (BotStoppedSpeakingFrame, TTSStoppedFrame)):
+            self._bot_speaking = False
+
         elif isinstance(frame, InterruptionFrame):
-            self._totals["interruptions"] += 1
+            if self._bot_speaking:
+                self._totals["interruptions"] += 1
+                self._bot_speaking = False
+                self._log(
+                    "interruption",
+                    turn=self._turn_index,
+                    total_so_far=self._totals["interruptions"],
+                )
             # FIX D: barge-in before bot replied counts as no-reply
             if self._waiting_for_bot_after_user_stop:
                 self._turns_with_no_reply += 1
                 self._waiting_for_bot_after_user_stop = False
-            self._log(
-                "interruption",
-                turn=self._turn_index,
-                total_so_far=self._totals["interruptions"],
-            )
 
         elif isinstance(frame, ErrorFrame):
             # Only count if not already recorded this turn via record_provider_failure
@@ -427,6 +443,17 @@ class CallMetricsCollector(FrameProcessor):
             else None
         )
         detected_language = getattr(frame, "language", None)
+        if hasattr(detected_language, "value"):
+            detected_language = detected_language.value
+        if not detected_language and isinstance(result, dict):
+            detected_language = (
+                result.get("language_code")
+                or result.get("language")
+                or result.get("detected_language")
+            )
+        if detected_language:
+            self._stt_languages.append(str(detected_language))
+
         self._log(
             "stt_final_transcript",
             turn=self._turn_index,
@@ -470,6 +497,8 @@ class CallMetricsCollector(FrameProcessor):
 
         elif isinstance(metrics_data, TTFAMetricsData):
             # TTS: time to first audio.
+            if self._turn_index in self._failed_synthesis_turns or self._turn_index in self._fallback_turns:
+                return
             # FIX 2: Report post-trim time so silence padded by TTS service does not inflate perceived TTFA.
             ttfa_raw = metrics_data.ttfa if metrics_data.ttfa is not None else metrics_data.ttfb
             leading_silence = getattr(metrics_data, "leading_silence", None) or 0.0
@@ -477,10 +506,14 @@ class CallMetricsCollector(FrameProcessor):
             trim_reduction = max(0.0, leading_silence - 0.020)
             ttfa_post_trim = max(0.0, ttfa_raw - trim_reduction) if ttfa_raw is not None else None
 
+            raw_val = round(ttfa_raw * 1000, 1) if ttfa_raw is not None else 0.0
+            post_val = round(ttfa_post_trim * 1000, 1) if ttfa_post_trim is not None else 0.0
+            self._tts_records.append((self._turn_index, raw_val, post_val))
+
             if ttfa_raw is not None:
-                self._tts_raw_ttfa_ms.append(round(ttfa_raw * 1000, 1))
+                self._tts_raw_ttfa_ms.append(raw_val)
             if ttfa_post_trim is not None:
-                self._tts_ttfa_ms.append(round(ttfa_post_trim * 1000, 1))
+                self._tts_ttfa_ms.append(post_val)
             self._log(
                 "tts_time_to_first_audio",
                 turn=self._turn_index,
@@ -560,6 +593,7 @@ class CallMetricsCollector(FrameProcessor):
                 )
             else:
                 self._totals["tts_characters"] += metrics_data.value or 0
+                self._totals["tts_characters_billed_provider"] = self._totals["tts_characters"]
             if model_name:
                 self._tts_models_used.add(model_name)
             self._log(
@@ -569,6 +603,42 @@ class CallMetricsCollector(FrameProcessor):
                 model=model_name,
                 characters=metrics_data.value,
             )
+
+    def record_tts_played_characters(self, count: int) -> None:
+        """Record characters whose synthesized audio was actually delivered/played."""
+        if count <= 0:
+            return
+        self._totals["tts_characters_played"] = self._totals.get("tts_characters_played", 0) + count
+
+    def record_tts_failed_characters(self, count: int, reason: str = "") -> None:
+        """Record characters billed by provider but failed/severed before playback."""
+        if count <= 0:
+            return
+        self._failed_synthesis_turns.add(self._turn_index)
+        self._tts_records = [r for r in self._tts_records if r[0] != self._turn_index]
+        self._tts_raw_ttfa_ms = [r[1] for r in self._tts_records]
+        self._tts_ttfa_ms = [r[2] for r in self._tts_records]
+        self._totals["tts_characters_failed"] = self._totals.get("tts_characters_failed", 0) + count
+        # Ensure a failed line is never billed twice (deduct retry usage if accumulated)
+        if self._totals.get("tts_characters", 0) >= count * 2:
+            self._totals["tts_characters"] -= count
+            self._totals["tts_characters_billed_provider"] = self._totals["tts_characters"]
+        self._log(
+            "tts_failed_chars",
+            turn=self._turn_index,
+            characters=count,
+            reason=reason,
+            total_failed=self._totals["tts_characters_failed"],
+        )
+
+    def record_tts_fallback(self, turn_index: int | None = None) -> None:
+        """Record that fallback/filler audio was played, excluding this turn from TTFA metrics."""
+        t_idx = turn_index if turn_index is not None else self._turn_index
+        self._fallback_turns.add(t_idx)
+        self._tts_records = [r for r in self._tts_records if r[0] != t_idx]
+        self._tts_raw_ttfa_ms = [r[1] for r in self._tts_records]
+        self._tts_ttfa_ms = [r[2] for r in self._tts_records]
+        self._log("tts_fallback", turn=t_idx)
 
     def record_tool_call(
         self,
@@ -691,9 +761,16 @@ class CallMetricsCollector(FrameProcessor):
         tts_chars = self._totals.get("tts_characters", 0)
         tts_rates = self._rate_for(rates.get("tts", {}), self._tts_models_used, self._tts_provider)
         if tts_rates and tts_chars > 0:
+            rate_per_char = tts_rates.get("per_character", 0)
+            failed_chars = self._totals.get("tts_characters_failed", 0)
+            delivered_chars = max(0, tts_chars - failed_chars)
             breakdown["tts"] = round(
-                tts_chars * tts_rates.get("per_character", 0), 6
+                delivered_chars * rate_per_char, 6
             )
+            if failed_chars > 0:
+                breakdown["tts_failure_cost"] = round(
+                    failed_chars * rate_per_char, 6
+                )
 
         if not breakdown:
             return None, None
@@ -789,6 +866,25 @@ class CallMetricsCollector(FrameProcessor):
             else None
         )
 
+        lang_map = {
+            "en": "English",
+            "en-in": "English",
+            "en-us": "English",
+            "hi": "Hindi",
+            "hi-in": "Hindi",
+            "te": "Telugu",
+            "te-in": "Telugu",
+            "english": "English",
+            "hindi": "Hindi",
+            "telugu": "Telugu",
+        }
+        dominant_stt_lang = None
+        if self._stt_languages:
+            from collections import Counter
+            normalized = [lang_map.get(str(l).lower(), str(l).title()) for l in self._stt_languages if l]
+            if normalized:
+                dominant_stt_lang = Counter(normalized).most_common(1)[0][0]
+
         return {
             # FIX D: headline = live turns only; overall = all turns
             "latency_cohort": "live_responses_only",
@@ -837,6 +933,8 @@ class CallMetricsCollector(FrameProcessor):
             "stt_provider": self._stt_provider,
             "llm_provider": self._llm_provider,
             "tts_provider": self._tts_provider,
+            "spoken_language": dominant_stt_lang or lang_map.get(str(self._language).lower(), "English"),
+            "interruptions": self._totals.get("interruptions", 0),
             "context_rewinds": self._totals.get("context_rewinds", 0),
             "duplicate_assistant_records": self._totals.get("duplicate_assistant_records", 0),
             "tool_calls_ok": self._totals.get("tool_calls_ok", 0),
@@ -846,6 +944,9 @@ class CallMetricsCollector(FrameProcessor):
             "llm_prompt_tokens": self._totals.get("llm_prompt_tokens", 0),
             "llm_completion_tokens": self._totals.get("llm_completion_tokens", 0),
             "tts_characters": self._totals.get("tts_characters", 0),
+            "tts_characters_billed_provider": self._totals.get("tts_characters_billed_provider", self._totals.get("tts_characters", 0)),
+            "tts_characters_played": self._totals.get("tts_characters_played", 0),
+            "tts_characters_failed": self._totals.get("tts_characters_failed", 0),
             "stt_audio_seconds": self._totals.get("stt_audio_seconds", 0.0),
         }
 

@@ -6,6 +6,7 @@ from loguru import logger
 from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.frames.frames import (
     AudioRawFrame,
+    BotStoppedSpeakingFrame,
     Frame,
     InputAudioRawFrame,
     StartFrame,
@@ -21,6 +22,10 @@ _POST_CLEAR_DROP_WINDOW_S = 0.25
 class WebPCMFrameSerializer(FrameSerializer):
     def __init__(self, stream_id: str):
         self._stream_id = stream_id
+        self._active_generation_id = 0
+        self._interrupted_generation_id = -1
+        self._booking_conf_playing = False
+        self._booking_conf_deadline = 0.0
         self._drop_audio_until = 0.0
         self._is_first_audio_frame = True
 
@@ -28,41 +33,77 @@ class WebPCMFrameSerializer(FrameSerializer):
         pass
 
     def on_interruption(self) -> None:
-        """Call when barge-in detected - activates drop window."""
+        """Call when barge-in detected - activates drop window and marks active generation interrupted."""
         self._drop_audio_until = time.monotonic() + _POST_CLEAR_DROP_WINDOW_S
+        self._interrupted_generation_id = self._active_generation_id
+        self._booking_conf_playing = False
+        self._booking_conf_deadline = 0.0
         self._is_first_audio_frame = True
         logger.debug(
-            "[WebPCM] TX -> clearAudio stream_id={} guard_window={}s",
+            "[WebPCM] TX -> clearAudio stream_id={} interrupted_gen={} guard_window={}s",
             self._stream_id,
+            self._interrupted_generation_id,
             _POST_CLEAR_DROP_WINDOW_S,
         )
 
-    def next_generation(self) -> int:
-        """Call when a new user turn starts - clears any pending drop window."""
+    def next_generation(self, generation_id: int | None = None) -> int:
+        """Call when a new user turn starts - clears any pending drop window and sets active generation."""
+        if generation_id is not None:
+            self._active_generation_id = generation_id
+        else:
+            self._active_generation_id += 1
         self._drop_audio_until = 0.0
+        self._booking_conf_playing = False
+        self._booking_conf_deadline = 0.0
         self._is_first_audio_frame = True
         logger.debug(
-            "[WebPCMSerializer] New generation started, drop window cleared stream_id={}",
+            "[WebPCMSerializer] New generation started (gen={}), drop window cleared stream_id={}",
+            self._active_generation_id,
             self._stream_id,
         )
-        return 1
+        return self._active_generation_id
 
     async def serialize(self, frame: Frame) -> str | bytes | None:
         logger.info(f"[WebPCM] serialize frame={type(frame).__name__} stream_id={self._stream_id}")
+        if isinstance(frame, BotStoppedSpeakingFrame):
+            self._booking_conf_playing = False
+            self._booking_conf_deadline = 0.0
+            return None
+
         if isinstance(frame, InterruptionFrame):
             self.on_interruption()
             return json.dumps({"event": "clearAudio", "streamId": self._stream_id})
 
         if isinstance(frame, AudioRawFrame):
-            if time.monotonic() < self._drop_audio_until:
-                logger.warning(
-                    "[WebPCM] Dropped {} bytes of audio inside the "
-                    "post-interruption guard window (stale TTS straggler) "
-                    "stream_id={}",
-                    len(frame.audio),
-                    self._stream_id,
-                )
+            frame_gen = getattr(frame, "generation_id", None)
+            is_booking_conf = getattr(frame, "is_booking_confirmation", False)
+
+            now = time.monotonic()
+            if is_booking_conf:
+                self._booking_conf_playing = True
+                self._booking_conf_deadline = now + 10.0
+            elif self._booking_conf_playing and now < self._booking_conf_deadline:
+                # Booking confirmation has priority; drop colliding other replies
                 return None
+            else:
+                self._booking_conf_playing = False
+                # 1. Stale older generation frame
+                if frame_gen is not None and frame_gen < self._active_generation_id:
+                    return None
+
+                # 2. Frame arriving during active interruption drop window
+                if now < self._drop_audio_until:
+                    # Drop untagged frames or frames belonging to the interrupted generation
+                    if frame_gen is None or frame_gen <= self._interrupted_generation_id:
+                        logger.warning(
+                            "[WebPCM] Dropped {} bytes of audio inside the "
+                            "post-interruption guard window (gen={}) "
+                            "stream_id={}",
+                            len(frame.audio),
+                            frame_gen,
+                            self._stream_id,
+                        )
+                        return None
 
             audio_bytes = frame.audio
             if self._is_first_audio_frame and len(audio_bytes) >= 2:

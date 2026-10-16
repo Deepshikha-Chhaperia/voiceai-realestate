@@ -101,7 +101,7 @@ async function initCall() {
         workletNode = new AudioWorkletNode(audioContext, 'voice-audio-processor');
         
         source.connect(workletNode);
-        workletNode.connect(audioContext.destination);
+        // Do NOT connect workletNode to audioContext.destination (prevents mic playback loop into speakers)
 
         statusText.innerText = `Connecting to voice agent...`;
         console.log(`AudioContext Initialized. State: ${audioContext.state}, hardware SR: ${audioContext.sampleRate}`);

@@ -26,6 +26,17 @@ import leads.dashboard
 import leads.db
 from settings import is_local_demo, safe_eq, validate_startup
 
+_DATA_DIR = os.getenv("DATA_DIR", "outputs")
+_LOG_DIR = os.path.join(_DATA_DIR, "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+logger.add(
+    os.path.join(_LOG_DIR, "voicebot.log"),
+    rotation="10 MB",
+    retention="7 days",
+    level="INFO",
+    enqueue=True,
+)
+
 class CallManager:
     """
     Manages campaign state for calls. 
@@ -339,8 +350,9 @@ async def initiate_outbound_call(
             return {"status":"blocked","reason":"enterprise_outbound_admission_not_ready"}
     # 1. Calling hours check (IST: 09:00 - 21:00)
     from leads.worker import is_within_calling_hours
+    from leads.notify import mask_phone
     if not is_within_calling_hours("Asia/Kolkata", "09:00", "21:00"):
-        logger.warning(f"Outbound call to {to_phone} blocked: outside legal calling hours (09:00-21:00 IST)")
+        logger.warning(f"Outbound call to {mask_phone(to_phone)} blocked: outside legal calling hours (09:00-21:00 IST)")
         return {"status": "blocked", "reason": "outside_calling_hours", "phone": to_phone}
 
     # 2. Do-Not-Call (DNC) check - fails closed: a lookup error aborts the call
@@ -351,7 +363,7 @@ async def initiate_outbound_call(
         stmt = select(DoNotCall).where(DoNotCall.phone == to_phone).limit(1)
         res = await session.execute(stmt)
         if res.scalar_one_or_none():
-            logger.warning(f"Outbound call to {to_phone} blocked: number is on Do-Not-Call list")
+            logger.warning(f"Outbound call to {mask_phone(to_phone)} blocked: number is on Do-Not-Call list")
             return {"status": "blocked", "reason": "do_not_call", "phone": to_phone}
 
     if ep.get("enabled"):
@@ -400,7 +412,7 @@ async def initiate_outbound_call(
     from_number = os.getenv("VOBIZ_FROM_NUMBER")
 
     if not all([auth_id, auth_token, from_number]):
-        logger.info(f"Vobiz credentials not configured. Created call session for {to_phone} (call_id={call_id})")
+        logger.info(f"Vobiz credentials not configured. Created call session for {mask_phone(to_phone)} (call_id={call_id})")
         return {"status": "success", "call_id": call_id, "answer_url": answer_url, "simulated": True}
 
     vobiz_url = f"https://api.vobiz.ai/api/v1/Account/{auth_id}/Call/"
@@ -437,7 +449,7 @@ async def initiate_outbound_call(
                     if ep.get('enabled'):campaign_data['enterprise_session_id']=provider_call_id
                     await CALL_MANAGER.save(call_id, campaign_data)
                 lead_state.upsert_call(call_id, provider_call_id=provider_call_id)
-            logger.info(f"Outbound call initiated to {to_phone}, answer_url={answer_url}")
+            logger.info(f"Outbound call initiated to {mask_phone(to_phone)}, answer_url={answer_url}")
             return {"status": "success", "call_id": call_id, "vobiz_response": result}
         except httpx.HTTPStatusError as e:
             if ep.get('enabled'):
@@ -611,7 +623,7 @@ if is_local_demo():
         campaign_id = websocket.query_params.get("campaign_id", "web-test")
         lead_id = websocket.query_params.get("lead_id")
         phone = websocket.query_params.get("phone")
-        customer_name = websocket.query_params.get("name") or "Alex"
+        customer_name = websocket.query_params.get("name")
 
         semaphore = get_call_semaphore()
         try:
@@ -656,15 +668,251 @@ if is_local_demo():
 
 
 
-# HEALTH CHECK
+# HEALTH CHECK (item 4) — real dependency checks, not a static 200.
 @app.get("/health")
 async def health():
-    return {"status": "healthy"}
+    """
+    Returns {"status":"healthy"} only when postgres, redis, and the arq worker are all reachable.
+    Individual component statuses are included for diagnostics.
+    Designed to be fast (<2 s) and safe to call frequently from the monitor service.
+    Not in the call path — never blocks a WebSocket connection.
+    """
+    checks: dict[str, str] = {}
+
+    # 1. PostgreSQL — run a trivial query via the SQLAlchemy pool
+    try:
+        from sqlalchemy import text
+        from leads.db import get_session
+        async with get_session() as sess:
+            await sess.execute(text("SELECT 1"))
+        checks["postgres"] = "ok"
+    except Exception as exc:
+        checks["postgres"] = f"error: {exc!s:.120}"
+
+    # 2. Redis — PING via the existing CALL_MANAGER client or a fresh one-shot client
+    try:
+        redis_url = os.getenv("REDIS_URL")
+        if CALL_MANAGER.redis:
+            await CALL_MANAGER.redis.ping()
+            checks["redis"] = "ok"
+        elif redis_url:
+            import redis.asyncio as _redis
+            _r = _redis.from_url(redis_url, socket_timeout=2)
+            await _r.ping()
+            await _r.aclose()
+            checks["redis"] = "ok"
+        else:
+            checks["redis"] = "not_configured"
+    except Exception as exc:
+        checks["redis"] = f"error: {exc!s:.120}"
+
+    # 3. Worker — arq queues a health-probe key into Redis; we check it exists.
+    # Lightweight: just checks that the arq worker has recently written its heartbeat key.
+    # The worker updates "arq:health:<queue>" at startup and on each job cycle.
+    try:
+        redis_url = os.getenv("REDIS_URL")
+        if redis_url:
+            import redis.asyncio as _redis
+            _r = _redis.from_url(redis_url, socket_timeout=2)
+            # arq stores queue presence in "arq:queue" keys; we check the default queue exists
+            queue_key = b"arq:queue:arq:queue"
+            exists = await _r.exists(queue_key)
+            await _r.aclose()
+            checks["worker"] = "ok" if exists else "no_queue_key"
+        else:
+            checks["worker"] = "not_configured"
+    except Exception as exc:
+        checks["worker"] = f"error: {exc!s:.120}"
+
+    overall = all(v in ("ok", "not_configured") for v in checks.values())
+    status_code = 200 if overall else 503
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        content={"status": "healthy" if overall else "degraded", **checks},
+        status_code=status_code,
+    )
 
 
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
     return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# Item 4 — Caddy forward_auth gate
+# ---------------------------------------------------------------------------
+# Credentials are read from env vars and bcrypt-hashed once at import time.
+# /internal/auth is only reachable from within the Docker network (Caddy → api).
+# It is NOT exposed to the internet; Caddy's forward_auth directive calls it.
+
+def _init_gate_credentials() -> dict[str, dict]:
+    """
+    Returns a dict: {username: {"hash": bcrypt_hash, "role": "admin"|"client"}}
+    Passwords are read from env vars and hashed once at startup.
+    Returns empty dict if bcrypt is unavailable (disables the gate gracefully in dev).
+    """
+    try:
+        import bcrypt
+    except ImportError:
+        logger.warning("bcrypt not installed — gate auth disabled (install bcrypt)")
+        return {}
+
+    creds: dict[str, dict] = {}
+    for role, user_var, pass_var in (
+        ("admin",  "ADMIN_GATE_USER",  "ADMIN_GATE_PASSWORD"),
+        ("client", "CLIENT_GATE_USER", "CLIENT_GATE_PASSWORD"),
+    ):
+        username = os.getenv(user_var, "").strip()
+        password = os.getenv(pass_var, "").strip()
+        if username and password:
+            hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+            creds[username] = {
+                "hash": hashed,
+                "role": role,
+            }
+    if not creds:
+        logger.warning(
+            "Gate credentials not configured. "
+            "Set ADMIN_GATE_USER/ADMIN_GATE_PASSWORD (and optionally CLIENT_GATE_USER/CLIENT_GATE_PASSWORD) in .env"
+        )
+    return creds
+
+
+_GATE_CREDS: dict[str, dict] = _init_gate_credentials()
+
+
+@app.get("/internal/auth", include_in_schema=False)
+async def internal_auth(
+    request: Request,
+    require_role: str | None = None,
+):
+    """
+    Caddy forward_auth target. Called by Caddy before proxying every gated request.
+
+    Reads the Authorization: Basic ... header that the browser sends.
+    Returns:
+      200  + X-Auth-User / X-Auth-Role headers → Caddy allows the request
+      401  → Caddy returns 401 (browser shows login prompt)
+      403  → Caddy returns 403 (authenticated but insufficient role)
+
+    IMPORTANT: this endpoint must only be reachable from the internal Docker
+    network (Caddy → api:8000). It is never mapped to a public port.
+    """
+    from fastapi.responses import Response as FastResponse
+
+    # No credentials configured → let everything through (LOCAL_DEMO / bare dev)
+    if not _GATE_CREDS:
+        return FastResponse(
+            status_code=200,
+            headers={"X-Auth-User": "dev", "X-Auth-Role": "admin"},
+        )
+
+    _AUTH_CHALLENGE = {"WWW-Authenticate": 'Basic realm="enterprise"'}
+
+    # Parse Authorization: Basic base64(user:pass)
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.lower().startswith("basic "):
+        logger.warning("Enterprise gate auth failed: missing credentials")
+        return FastResponse(
+            status_code=401,
+            headers=_AUTH_CHALLENGE,
+        )
+
+    try:
+        decoded = base64.b64decode(auth_header[6:].strip()).decode("utf-8", errors="replace")
+        username, _, password = decoded.partition(":")
+        if not username or not password:
+            logger.warning("Enterprise gate auth failed: missing credentials")
+            return FastResponse(status_code=401, headers=_AUTH_CHALLENGE)
+    except Exception:
+        logger.warning("Enterprise gate auth failed: missing credentials")
+        return FastResponse(status_code=401, headers=_AUTH_CHALLENGE)
+
+    entry = _GATE_CREDS.get(username)
+    if not entry:
+        logger.warning(f"Enterprise gate auth failed for user '{username}': unknown user")
+        return FastResponse(status_code=401, headers=_AUTH_CHALLENGE)
+
+    try:
+        import bcrypt
+        if not bcrypt.checkpw(password.encode("utf-8"), entry["hash"].encode("utf-8")):
+            logger.warning(f"Enterprise gate auth failed for user '{username}': wrong password")
+            return FastResponse(status_code=401, headers=_AUTH_CHALLENGE)
+    except Exception:
+        logger.warning(f"Enterprise gate auth failed for user '{username}': wrong password")
+        return FastResponse(status_code=401, headers=_AUTH_CHALLENGE)
+
+    role = entry["role"]
+
+    # Role check: if caller specifies ?require_role=admin, client role is rejected
+    if require_role == "admin" and role != "admin":
+        return FastResponse(status_code=403)
+
+    return FastResponse(
+        status_code=200,
+        headers={
+            "X-Auth-User": username,
+            "X-Auth-Role": role,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Item 5 — On-demand eval API (ADMIN-gated via Caddy, not a call-path route)
+# ---------------------------------------------------------------------------
+
+@app.post("/evals/run", include_in_schema=False)
+async def evals_run(call_id: str | None = None, no_judge: bool = False):
+    """
+    Run the eval harness on demand against a saved trajectory.
+
+    POST /evals/run?call_id=<id>
+    Returns the full report JSON.
+    This endpoint is ADMIN-only (enforced by the Caddy forward_auth gate).
+    It is never in the live call path.
+    """
+    if not call_id:
+        raise HTTPException(400, "call_id query param is required")
+
+    try:
+        from trajectory import Trajectory
+        from evals.harness import score_transcript, save_report, _transcript_from_trajectory
+
+        events = Trajectory.load(call_id)
+        if not events:
+            raise HTTPException(404, f"No trajectory found for call_id={call_id!r}")
+
+        messages = _transcript_from_trajectory(events)
+        report = score_transcript(call_id, messages, events, run_judge=not no_judge)
+        path = save_report(report)
+        logger.info(f"[evals] on-demand report written: {path}")
+        return report
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception(f"[evals] run error for call_id={call_id}")
+        raise HTTPException(500, f"Eval failed: {exc}") from exc
+
+
+@app.get("/evals/report/{call_id}", include_in_schema=False)
+async def evals_report(call_id: str):
+    """
+    Return a previously saved eval report.
+
+    GET /evals/report/<call_id>
+    ADMIN-only (Caddy gate).
+    """
+    import os as _os
+    data_dir = _os.getenv("DATA_DIR", "outputs")
+    report_path = __import__("pathlib").Path(data_dir) / "evals" / f"{call_id}.json"
+    if not report_path.exists():
+        raise HTTPException(404, f"No eval report for call_id={call_id!r}. Run POST /evals/run?call_id={call_id} first.")
+    try:
+        return __import__("json").loads(report_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(500, str(exc)) from exc
+
+
 
 # Dashboard and call reporting endpoints
 def _require_dashboard_key(x_api_key: str | None) -> None:

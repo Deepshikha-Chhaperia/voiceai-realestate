@@ -31,3 +31,7 @@ pyrnnoise==0.4.3
 
 # Async SQLite local/demo runtime (leads.db).
 aiosqlite==0.22.1
+
+# Access control gate authentication (Item 4)
+passlib[bcrypt]==1.7.4
+bcrypt==5.0.0

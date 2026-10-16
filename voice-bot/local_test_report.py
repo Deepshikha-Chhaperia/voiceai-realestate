@@ -25,7 +25,9 @@ from loguru import logger
 
 import lead_state
 
-REPORTS_DIR = Path(os.getenv("LOCAL_REPORTS_DIR", "outputs/call_reports"))
+_DATA_DIR = os.getenv("DATA_DIR", "outputs")
+REPORTS_DIR = Path(os.getenv("LOCAL_REPORTS_DIR", os.path.join(_DATA_DIR, "call_reports")))
+
 
 
 def _transcript_text(messages: list[dict]) -> str:
@@ -41,7 +43,12 @@ def _transcript_text(messages: list[dict]) -> str:
                 part.get("text", "") for part in content if isinstance(part, dict)
             )
         if content:
-            speaker = "CALLER" if role == "user" else "AGENT"
+            if role == "user":
+                speaker = "CALLER"
+            elif m.get("is_filler") or m.get("filler") or m.get("is_fallback"):
+                speaker = "AGENT [FILLER]"
+            else:
+                speaker = "AGENT"
             lines.append(f"{speaker}: {content}")
     return "\n".join(lines)
 
@@ -155,13 +162,49 @@ def write_report(
             metrics_summary.get("tts_chars_per_min") if metrics_summary else None
         )
 
+        is_test_call = str(call_id).startswith("web-") or call.get("campaign_id") == "web-test"
+        title_prefix = "[TEST CALL] " if is_test_call else ""
+
+        tts_chars_billed = (metrics_summary or {}).get("tts_characters_billed_provider", (metrics_summary or {}).get("tts_characters", 0))
+        tts_chars_played = (metrics_summary or {}).get("tts_characters_played", 0)
+        tts_chars_failed = (metrics_summary or {}).get("tts_characters_failed", 0)
+
+        lang_map = {
+            "en": "English",
+            "en-in": "English",
+            "en-us": "English",
+            "hi": "Hindi",
+            "hi-in": "Hindi",
+            "te": "Telugu",
+            "te-in": "Telugu",
+            "english": "English",
+            "hindi": "Hindi",
+            "telugu": "Telugu",
+        }
+        raw_spoken = (
+            (metrics_summary.get("spoken_language") if metrics_summary else None)
+            or call.get("spoken_language")
+            or call.get("language")
+            or "English"
+        )
+        spoken_lang = lang_map.get(str(raw_spoken).lower(), str(raw_spoken).capitalize())
+
+        raw_preferred = (
+            lead_fields.get("language")
+            or (lead_memory.get("language") if lead_memory else None)
+            or call.get("preferred_language")
+            or spoken_lang
+        )
+        preferred_lang = lang_map.get(str(raw_preferred).lower(), str(raw_preferred).capitalize())
+
         lines = [
-            f"# Call report — `{call_id}`",
+            f"# {title_prefix}Call report — `{call_id}`",
             "",
             f"- **Started:** {_iso(call.get('started_at'))}",
             f"- **Ended:** {_iso(ended_ts)}",
             f"- **Duration:** {duration_s}s" if duration_s is not None else "- **Duration:** —",
             f"- **Campaign:** {call.get('campaign_id') or '—'}",
+            f"- **Language:** Spoken: {spoken_lang} | Lead Preferred: {preferred_lang}",
             f"- **Disposition:** `{disposition_val or 'INCOMPLETE'}`",
             f"- **Avg voice-to-voice latency:** {avg_voice_latency or '—'} ms" + (f" (Live commit anchor: {metrics_summary.get('avg_speech_stop_to_audio_ms', '—')} ms | Final-transcript: {metrics_summary.get('avg_transcript_to_audio_ms', '—')} ms)" if metrics_summary and (metrics_summary.get('avg_speech_stop_to_audio_ms') or metrics_summary.get('avg_transcript_to_audio_ms')) else ""),
             f"- **Received END_SPEECH to server first output (live only):** {(metrics_summary or {}).get('avg_end_speech_to_audio_ms', 'unavailable')} ms. Not physical ear-to-ear; excludes client/network playback.",
@@ -173,6 +216,9 @@ def write_report(
             f"- **Latency split:** STT Final: {avg_stt_final or '—'} ms | LLM TTFT: {avg_llm_ttft or '—'} ms | TTS TTFA: {ttfa_display}",
             f"- **Phrase Cache Hit:** {cache_hit_pct if cache_hit_pct is not None else '—'}% ({cache_hits} hits)",
             f"- **TTS Characters / min:** {tts_chars_per_min if tts_chars_per_min is not None else '—'}",
+            f"- **TTS Characters (billed by provider):** {tts_chars_billed}",
+            f"- **TTS Characters (actually played):** {tts_chars_played}",
+            *( [f"- **TTS Characters (failed/severed before playback):** {tts_chars_failed} (FAILURE COST VISIBLE IN PROVIDER BILLING)"] if tts_chars_failed > 0 else [] ),
             f"- **Turns:** {turns or '—'} (No reply: {metrics_summary.get('turns_with_no_reply', 0) if metrics_summary else 0} | Cached audio: {metrics_summary.get('cached_audio_turns', 0) if metrics_summary else 0})",
             f"- **Estimated cost:** ₹{cost_inr:.4f} (${cost_usd:.6f})" if cost_usd is not None else "- **Estimated cost:** not available",
             f"- **Blended CPM (Cost per Minute):** {cpm_str}",

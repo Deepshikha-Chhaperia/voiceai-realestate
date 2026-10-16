@@ -309,6 +309,23 @@ def infer_deterministic_disposition(
         k in user_text for k in ("not interested", "nahi chahiye", "don't want", "no requirement", "not look", "dont want")
     )
 
+    # 0. Sanity Check: If caller spoke fewer than 2 turns or fewer than 3 words total,
+    # refuse to grade as QUALIFIED or SITE_VISIT_BOOKED.
+    user_words = [w for w in user_text.split() if w.strip()]
+    if user_turns == 0:
+        return Disposition.NO_RESPONSE.value
+    if user_turns < 2 or len(user_words) < 3:
+        # Check explicit early signals first
+        if any(k in user_text for k in ("do not call", "stop calling", "remove my number", "dnc", "don't call again")):
+            return Disposition.DNC_REQUESTED.value
+        if any(k in user_text for k in ("wrong number", "wrong person")):
+            return Disposition.WRONG_NUMBER.value
+        if has_user_refusal or any(k in user_text for k in ("not interested", "nahi chahiye", "don't want", "no")):
+            return Disposition.NOT_INTERESTED.value
+        if any(k in user_text for k in ("call me later", "call later", "call back", "busy now", "busy right now", "driving", "meeting")):
+            return Disposition.CALLBACK_REQUESTED.value
+        return Disposition.NO_RESPONSE.value if user_turns <= 1 else Disposition.INCOMPLETE.value
+
     # 4. Site Visit Booked / Confirmed
     sv_mem = str(mem.get("site_visit", "")).lower()
     has_date_time = bool(mem.get("preferred_visit_date") or mem.get("preferred_visit_time"))
@@ -380,13 +397,25 @@ def infer_deterministic_disposition(
     if any(k in user_text for k in ("talk to a human", "connect me to a person", "speak with a person", "talk to manager", "connect to agent")):
         return Disposition.ESCALATED_TO_HUMAN.value
 
-    # 9. Qualified (Captured configuration, budget, or WhatsApp brochure confirmed)
-    if (
-        mem.get("configuration")
-        or mem.get("budget")
-        or has_whatsapp_confirmed
-        or any(k in transcript_text for k in ("share the floor plan", "brochure with you shortly", "details on whatsapp"))
-    ):
+    # 9. Qualified: requires a real qualifier (chosen size, budget, timeline, or booked visit),
+    # not just a stated configuration or agent closing line.
+    has_chosen_size = bool(
+        mem.get("unit_size_choice")
+        or mem.get("unit_size")
+        or mem.get("size")
+        or (
+            mem.get("configuration")
+            and any(s in str(mem.get("configuration", "")).lower() for s in ("large", "standard", "compact", "sq ft", "sqft", "sq.ft", "study"))
+        )
+    )
+    has_budget = bool(mem.get("budget"))
+    has_timeline = bool(mem.get("timeline"))
+    has_booked_visit = bool(
+        mem.get("disposition") == Disposition.SITE_VISIT_BOOKED.value
+        or "confirmed" in sv_mem
+    )
+
+    if has_chosen_size or has_budget or has_timeline or has_booked_visit:
         return Disposition.QUALIFIED.value
 
     # 10. No response / early abandonment

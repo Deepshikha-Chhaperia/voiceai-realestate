@@ -21,27 +21,109 @@ router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 
+import base64
+
+try:
+    import bcrypt
+except ImportError:
+    bcrypt = None
+
+
+def _init_dashboard_gate_creds() -> dict[str, dict]:
+    creds: dict[str, dict] = {}
+    for role, user_var, pass_var in (
+        ("admin", "ADMIN_GATE_USER", "ADMIN_GATE_PASSWORD"),
+        ("client", "CLIENT_GATE_USER", "CLIENT_GATE_PASSWORD"),
+    ):
+        username = os.getenv(user_var, "").strip()
+        password = os.getenv(pass_var, "").strip()
+        if username and password:
+            hashed = None
+            if bcrypt:
+                try:
+                    hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+                except Exception:
+                    hashed = None
+            creds[username] = {
+                "password": password,
+                "hash": hashed,
+                "role": role,
+            }
+    return creds
+
+
+_GATE_CREDS: dict[str, dict] = _init_dashboard_gate_creds()
+_AUTH_CHALLENGE = {"WWW-Authenticate": 'Basic realm="enterprise"'}
+
+
 def verify_dashboard_auth(
     request: Request,
     dashboard_key_cookie: str | None = Cookie(None, alias="dashboard_key"),
     authorization: str | None = Header(None),
 ) -> bool:
     """Verifies dashboard access key with secure constant-time comparison."""
-    expected_key = os.getenv("DASHBOARD_API_KEY", "").strip()
-    if not expected_key:
-        raise HTTPException(status_code=401, detail="Unauthorized dashboard access")
+    # 1. Forwarded authentication from Caddy gate
+    if request.headers.get("x-auth-user"):
+        return True
 
+    # 2. HTTP Basic Auth
+    auth_header = authorization or request.headers.get("Authorization", "")
+    if auth_header.lower().startswith("basic "):
+        try:
+            decoded = base64.b64decode(auth_header[6:].strip()).decode("utf-8", errors="replace")
+            username, _, password = decoded.partition(":")
+        except Exception:
+            logger.warning("Enterprise gate auth failed: missing credentials")
+            raise HTTPException(status_code=401, detail="Unauthorized dashboard access", headers=_AUTH_CHALLENGE)
+
+        if not username or not password:
+            logger.warning("Enterprise gate auth failed: missing credentials")
+            raise HTTPException(status_code=401, detail="Unauthorized dashboard access", headers=_AUTH_CHALLENGE)
+
+        try:
+            import main as app_module
+            creds = getattr(app_module, "_GATE_CREDS", None) or _GATE_CREDS
+        except Exception:
+            creds = _GATE_CREDS
+
+        entry = creds.get(username)
+        if not entry:
+            logger.warning(f"Enterprise gate auth failed for user '{username}': unknown user")
+            raise HTTPException(status_code=401, detail="Unauthorized dashboard access", headers=_AUTH_CHALLENGE)
+
+        valid = False
+        try:
+            if bcrypt and entry.get("hash"):
+                valid = bcrypt.checkpw(password.encode("utf-8"), entry["hash"].encode("utf-8"))
+        except Exception:
+            valid = False
+
+        if not valid and entry.get("password"):
+            valid = safe_eq(password, entry["password"])
+
+        if valid:
+            return True
+
+        logger.warning(f"Enterprise gate auth failed for user '{username}': wrong password")
+        raise HTTPException(status_code=401, detail="Unauthorized dashboard access", headers=_AUTH_CHALLENGE)
+
+    # 3. DASHBOARD_API_KEY / Bearer check
+    expected_key = os.getenv("DASHBOARD_API_KEY", "").strip()
     provided_key = dashboard_key_cookie or ""
-    if not provided_key and authorization:
-        parts = authorization.split()
+    if not provided_key and auth_header:
+        parts = auth_header.split()
         if len(parts) == 2 and parts[0].lower() in ("bearer", "apikey"):
             provided_key = parts[1]
-        else:
-            provided_key = authorization
 
-    if safe_eq(provided_key, expected_key):
+    if expected_key and provided_key and safe_eq(provided_key, expected_key):
         return True
-    raise HTTPException(status_code=401, detail="Unauthorized dashboard access")
+
+    if provided_key:
+        logger.warning("Enterprise gate auth failed: wrong password")
+    else:
+        logger.warning("Enterprise gate auth failed: missing credentials")
+
+    raise HTTPException(status_code=401, detail="Unauthorized dashboard access", headers=_AUTH_CHALLENGE)
 
 
 @router.get("", response_class=HTMLResponse)

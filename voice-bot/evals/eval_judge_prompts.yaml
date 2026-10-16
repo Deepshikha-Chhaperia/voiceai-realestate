@@ -1,0 +1,103 @@
+# eval_judge_prompts.yaml
+# Editable LLM judge prompts for the eval harness (items 9 + 5).
+# Change these without touching code. Field names referenced in evals/harness.py.
+#
+# Each prompt is sent to the judge LLM with the call transcript interpolated
+# into {transcript}.
+#
+# Standard output schema (all three judges must return this shape):
+#   {
+#     "score": 0.0..1.0,          # normalized — harness divides 0-10 scales automatically
+#     "reasoning": "...",          # brief explanation (= notes / evidence / explanation)
+#     "passed": true | false,      # explicit pass/fail (score >= 0.7 if omitted)
+#     "confidence": 0.0..1.0       # how confident the judge is (1.0 if omitted)
+#   }
+#
+# You may include extra fields (e.g. "hallucination", "checks") — the harness
+# keeps them in the report and uses only the four standard fields for roll-up.
+
+hallucination_check: |
+  You are an evaluator for a real-estate AI voice bot named Pooja.
+  The bot sells residential apartments in India.
+
+  Below is a call transcript between Pooja (bot) and a prospective buyer (caller).
+
+  <transcript>
+  {transcript}
+  </transcript>
+
+  Check: did the bot state any fact about the project (location, price, size,
+  amenities, possession date, RERA number) that is NOT in the transcript as
+  something the caller provided or the bot was pre-configured to say?
+
+  Reply with a JSON object ONLY, no prose. Use this exact schema:
+  {{
+    "hallucination": true | false,
+    "evidence": "<direct quote from transcript if hallucination=true, else null>",
+    "score": 0.0 to 1.0,
+    "reasoning": "<one sentence explaining your verdict>",
+    "passed": true | false,
+    "confidence": 0.0 to 1.0
+  }}
+
+  Score 1.0 = no hallucination detected. Score 0.0 = clear fabrication.
+  passed = true when score >= 0.7.
+
+script_adherence: |
+  You are an evaluator for a real-estate AI voice bot named Pooja.
+
+  Below is a call transcript.
+
+  <transcript>
+  {transcript}
+  </transcript>
+
+  Check the following script steps in order:
+  1. Did the bot open with a greeting and introduce itself?
+  2. Did the bot ask for the caller's name early in the call?
+  3. Did the bot offer to schedule a site visit?
+  4. If the caller provided a visit date, did the bot confirm it back clearly?
+  5. If the caller asked an FAQ, did the bot answer without making up facts?
+  6. Did the bot close politely (goodbye / dhanyavaad)?
+
+  Reply with a JSON object ONLY. Use this exact schema:
+  {{
+    "checks": {{
+      "greeting": true | false,
+      "asked_name": true | false,
+      "offered_visit": true | false,
+      "confirmed_date": true | false | "n/a",
+      "faq_accurate": true | false | "n/a",
+      "polite_close": true | false
+    }},
+    "score": 0.0 to 1.0,
+    "reasoning": "<brief explanation of any failures, or 'all steps passed' if none>",
+    "passed": true | false,
+    "confidence": 0.0 to 1.0
+  }}
+
+  Score = fraction of applicable checks passed. passed = true when score >= 0.8.
+
+answer_quality: |
+  You are an evaluator for a real-estate AI voice bot.
+
+  <transcript>
+  {transcript}
+  </transcript>
+
+  Rate the overall quality of the bot's answers: were they helpful, concise,
+  and accurate to what a caller would need to make a site-visit decision?
+  Consider: did the bot avoid hallucinating? Did it handle objections gracefully?
+  Did it keep answers brief (voice-appropriate)?
+
+  Reply with JSON ONLY. Use this exact schema:
+  {{
+    "score": 0.0 to 1.0,
+    "reasoning": "<one paragraph summary of quality, strengths and weaknesses>",
+    "passed": true | false,
+    "confidence": 0.0 to 1.0,
+    "strengths": ["...", "..."],
+    "weaknesses": ["...", "..."]
+  }}
+
+  Score 1.0 = excellent. Score 0.0 = completely unhelpful. passed = true when score >= 0.7.

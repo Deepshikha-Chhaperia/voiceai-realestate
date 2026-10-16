@@ -5,6 +5,7 @@ import io
 import json
 import math
 import os
+from pathlib import Path
 import time
 import uuid
 from datetime import datetime,timezone,timedelta
@@ -404,3 +405,148 @@ async def forwardable_report(work_id:str,auth=Depends(verify_dashboard_auth)):
     report=await stored_report(work_id,auth)
     from enterprise.report import report_html
     return HTMLResponse(report_html(report),headers={'Content-Security-Policy':"default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",'Cache-Control':'no-store'})
+
+
+@router.get('/eval/calls')
+async def list_eval_calls(auth=Depends(verify_dashboard_auth)):
+    """
+    List AI eval call reports and human override status for reviewer UI (Coval pattern).
+    Scans <DATA_DIR>/evals/ for per-call evaluation JSON files.
+    """
+    data_dir = Path(os.getenv("DATA_DIR", "outputs")) / "evals"
+    calls: list[dict] = []
+    if data_dir.exists():
+        for path in sorted(data_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            if path.stem.startswith("regression_") or path.stem.startswith("red_team_"):
+                continue
+            try:
+                rep = json.loads(path.read_text(encoding="utf-8"))
+                call_id = rep.get("call_id") or path.stem
+                det = {**rep.get("deterministic", {}), **rep.get("statistical", {})}
+                failed_checks = [k for k, v in det.items() if not v.get("pass", True)]
+
+                for judge_name, judge_res in rep.get("llm_judge", {}).items():
+                    if judge_res.get("passed") is False:
+                        failed_checks.append(f"judge:{judge_name}")
+
+                override = rep.get("human_override")
+                ai_verdict = "PASS" if rep.get("overall_pass", True) else "FAIL"
+                effective_verdict = (override.get("verdict", "").upper()) if override else ai_verdict
+
+                calls.append({
+                    "call_id": call_id,
+                    "scored_at": rep.get("scored_at") or "",
+                    "ai_verdict": ai_verdict,
+                    "effective_verdict": effective_verdict,
+                    "deterministic_pass_rate": rep.get("deterministic_pass_rate") or "",
+                    "failed_checks": failed_checks,
+                    "human_override": override,
+                    "root_cause": rep.get("root_cause_analysis", {}).get("primary_layer") if isinstance(rep.get("root_cause_analysis"), dict) else None,
+                })
+            except Exception:
+                continue
+
+    return {"calls": calls, "total": len(calls)}
+
+
+@router.post('/eval/override/{call_id}')
+async def override_call_verdict(call_id: str, request: Request, auth=Depends(verify_dashboard_auth)):
+    """
+    Human Override (Coval pattern):
+    Allows a reviewer (admin or client) to mark a call as pass or fail with a mandatory one-line reason.
+    Updates the call's eval report and writes/updates the permanent regression fixture in evals/fixtures/.
+    Audit logs the reviewer identity from X-Auth-User / X-Auth-Role.
+    """
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(422, detail="Invalid JSON body")
+
+    verdict = str(body.get("verdict", "")).strip().lower()
+    if verdict not in {"pass", "fail"}:
+        raise HTTPException(422, detail="Verdict must be 'pass' or 'fail'")
+
+    reason = str(body.get("reason", "")).strip()
+    if not reason or len(reason) < 3:
+        raise HTTPException(422, detail="A mandatory one-line reason (at least 3 characters) is required for override")
+
+    reviewer = request.headers.get("X-Auth-User") or body.get("reviewer") or "operator"
+    role = request.headers.get("X-Auth-Role") or "admin"
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    override_record = {
+        "verdict": verdict,
+        "reason": reason,
+        "by": reviewer,
+        "role": role,
+        "at": now_iso,
+    }
+
+    # 1. Update <DATA_DIR>/evals/<call_id>.json
+    evals_dir = Path(os.getenv("DATA_DIR", "outputs")) / "evals"
+    evals_dir.mkdir(parents=True, exist_ok=True)
+    report_file = evals_dir / f"{call_id}.json"
+    report_data = {}
+    if report_file.exists():
+        try:
+            report_data = json.loads(report_file.read_text(encoding="utf-8"))
+        except Exception:
+            report_data = {}
+    report_data["call_id"] = call_id
+    report_data["human_override"] = override_record
+    report_file.write_text(json.dumps(report_data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # 2. Find messages and events from trajectory or existing fixtures
+    messages: list[dict] = []
+    events: list[dict] = []
+    trajectories_dir = Path(os.getenv("DATA_DIR", "outputs")) / "trajectories"
+    if trajectories_dir.exists():
+        for f in trajectories_dir.glob(f"*/*{call_id}*.jsonl"):
+            from evals.regression import _load_trajectory
+            messages, events = _load_trajectory(f)
+            break
+
+    # 3. Write or update fixture in evals/fixtures/
+    from evals.harness import _fixtures_dir
+    fixtures_base = _fixtures_dir()
+    found_fixture: Path | None = None
+    for existing in fixtures_base.glob(f"*/*{call_id}*.json"):
+        found_fixture = existing
+        break
+
+    from datetime import date
+    today = date.today().isoformat()
+    if found_fixture:
+        target_path = found_fixture
+        try:
+            fixture_data = json.loads(target_path.read_text(encoding="utf-8"))
+        except Exception:
+            fixture_data = {}
+        if not messages and fixture_data.get("messages"):
+            messages = fixture_data["messages"]
+        if not events and fixture_data.get("events"):
+            events = fixture_data["events"]
+    else:
+        override_dir = fixtures_base / "human_override"
+        override_dir.mkdir(parents=True, exist_ok=True)
+        target_path = override_dir / f"{today}-{call_id}.json"
+        fixture_data = {}
+
+    fixture_data.update({
+        "call_id": call_id,
+        "check_name": fixture_data.get("check_name", "human_override"),
+        "failure_detail": reason,
+        "ground_truth_verdict": verdict,
+        "human_override": override_record,
+        "captured_at": now_iso,
+        "messages": messages,
+        "events": events,
+    })
+    target_path.write_text(json.dumps(fixture_data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    return {
+        "ok": True,
+        "call_id": call_id,
+        "verdict": verdict,
+        "human_override": override_record,
+        "fixture_path": str(target_path),
+    }

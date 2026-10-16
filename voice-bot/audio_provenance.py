@@ -9,10 +9,9 @@ from call_repairs import SHORT_GOODBYE, FAQ_TEXTS, CALL5_TEXTS, CALL7_TEXTS
 
 PHRASES = {"short_goodbye": SHORT_GOODBYE, **FAQ_TEXTS, **CALL5_TEXTS, **CALL7_TEXTS,
     # Outbound & Inbound Greetings
-    "greeting_alex": "Hi, am I speaking with Alex?",
     "greeting_generic": "Hi, this is Ananya from Meridian Group. Is this a good time to talk?",
     "inbound_greeting": "Hello, thank you for calling Meridian Group. How may I assist you today?",
-    "opening_intro": "Great, this is Ananya from Meridian Group. Are you looking for a 2 or 3 BHK?",
+    "opening_intro": "Great, are you looking for a 2 or 3 BHK?",
 
     # Acknowledgments & Affirmations (English & Hindi)
     "ack_sure": "Sure, absolutely.",

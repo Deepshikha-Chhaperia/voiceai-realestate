@@ -1,5 +1,7 @@
 from datetime import datetime
 from loguru import logger
+from pipecat.processors.aggregators.async_tool_messages import ASYNC_TOOL_INSTRUCTIONS
+
 
 
 def _looks_like_orchestration_instruction(text: str) -> bool:
@@ -42,14 +44,21 @@ def _looks_like_orchestration_instruction(text: str) -> bool:
 
 
 _OUTBOUND_RUNTIME_RULE = (
-    "OUTBOUND: The opening greeting is already spoken. Do not repeat greeting. "
-    "Respond directly to what caller said and continue naturally."
+    "OUTBOUND: The opening greeting and your introduction ('Ananya from Meridian Group') are already spoken in the opening line. "
+    "Do not re-introduce yourself, state your name, or repeat company name. "
+    "Never send the exact same sentence twice in a call; if re-asking or nudging, rephrase shorter. "
+    "Respond directly to what caller said and continue naturally. "
+    "When the caller asks multiple questions or combines a question with a visit request, always answer what was asked first. Do not jump straight to booking or push the next step in the same reply."
 )
 
 _INBOUND_RUNTIME_RULE = (
-    "INBOUND: The opening greeting is already spoken. Do not repeat greeting. "
-    "Respond directly to what caller said and continue naturally."
+    "INBOUND: The opening greeting and your introduction ('Ananya from Meridian Group') are already spoken in the opening line. "
+    "Do not re-introduce yourself, state your name, or repeat company name. "
+    "Never send the exact same sentence twice in a call; if re-asking or nudging, rephrase shorter. "
+    "Respond directly to what caller said and continue naturally. "
+    "When the caller asks multiple questions or combines a question with a visit request, always answer what was asked first. Do not jump straight to booking or push the next step in the same reply."
 )
+
 
 def build_system_prompt(
     call_type: str,
@@ -128,7 +137,10 @@ def build_system_prompt(
     else:
         parts.append(_INBOUND_RUNTIME_RULE)
 
+    parts.append(ASYNC_TOOL_INSTRUCTIONS)
+
     system_prompt = "\n\n".join(parts)
+
 
     # Build customer context message for caching-friendly dynamic content.
     # Always include today's IST date so the LLM can resolve relative terms

@@ -218,8 +218,18 @@ class OutboxItem(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
+    # --- Atomic claiming fields (item 7) ---
+    # A worker atomically sets status='claiming', claimed_by, claimed_at before sending.
+    # Only the worker that successfully set these fields sends the message.
+    # A crash mid-send leaves status='claiming'; on restart it is reset to 'pending'
+    # for retry, never silently duplicated.
+    claimed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     lead: Mapped[Lead] = relationship("Lead", back_populates="outbox_items")
+
 
 
 class DoNotCall(Base):

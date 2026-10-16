@@ -85,8 +85,9 @@ async def start_outbox_worker() -> None:
     if is_outbox_worker_running():
         return
 
-    from leads.db import ensure_call_sheet_schema
+    from leads.db import ensure_call_sheet_schema, ensure_outbox_schema
     await ensure_call_sheet_schema()
+    await ensure_outbox_schema()
     _outbox_worker_running = True
 
     async def _worker_loop():
@@ -116,21 +117,62 @@ async def stop_outbox_worker() -> None:
 
 
 async def drain_outbox() -> int:
-    """Processes pending outbox items without fake simulated success."""
+    """Processes pending outbox items without fake simulated success.
+
+    Atomic claiming (item 7): before any send I/O, each item is atomically
+    marked status='claiming' with claimed_by/claimed_at using SELECT FOR UPDATE
+    SKIP LOCKED.  Only the worker that won the row lock proceeds to send.
+    A crash mid-send leaves status='claiming'; the next drain cycle (stale
+    reset) returns it to 'pending' for safe retry — never a silent duplicate.
+    """
+    import socket
+    worker_id = f"{socket.gethostname()}-{os.getpid()}"
     now = datetime.now(timezone.utc)
     processed_count = 0
 
     async with get_session() as session:
-        stmt = (
+        # Reset stale 'claiming' rows from workers that crashed mid-send (>5 min ago).
+        # Use FOR UPDATE SKIP LOCKED so two concurrent drains don't race on the reset.
+        stale_cutoff = now - timedelta(minutes=5)
+        stale_res = await session.execute(
+            select(OutboxItem)
+            .where(
+                OutboxItem.status == "claiming",
+                OutboxItem.claimed_at <= stale_cutoff,
+            )
+            .with_for_update(skip_locked=True)
+        )
+        for stale_item in stale_res.scalars().all():
+            logger.warning(
+                "outbox: reset stale claim id={} originally claimed_by={}",
+                stale_item.id, stale_item.claimed_by,
+            )
+            stale_item.status = "pending"
+            stale_item.claimed_by = None
+            stale_item.claimed_at = None
+        await session.flush()
+
+        # Atomically claim pending rows — SKIP LOCKED means concurrent workers never race.
+        res = await session.execute(
             select(OutboxItem)
             .where(
                 OutboxItem.status == "pending",
                 (OutboxItem.next_attempt_at == None) | (OutboxItem.next_attempt_at <= now),  # noqa: E711
             )
+            .with_for_update(skip_locked=True)
             .limit(50)
         )
-        res = await session.execute(stmt)
         items = res.scalars().all()
+
+        # Mark all won rows as 'claiming' before leaving the lock so no other worker
+        # can select them while we are performing network I/O below.
+        for item in items:
+            item.status = "claiming"
+            item.claimed_by = worker_id
+            item.claimed_at = now
+        await session.flush()
+
+
 
         for item in items:
             item.attempts += 1

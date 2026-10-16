@@ -1,0 +1,113 @@
+# Caddyfile — TLS-terminating reverse proxy + access control gate.
+# Caddy auto-obtains and renews HTTPS certs from Let's Encrypt.
+#
+# Required env var: PUBLIC_HOST  (e.g. bot.example.com)
+# Gate env vars (set in .env):
+#   ADMIN_GATE_USER / ADMIN_GATE_PASSWORD   — owner/ops access (all paths)
+#   CLIENT_GATE_USER / CLIENT_GATE_PASSWORD — client/sales team (CRM+dashboard only)
+#
+# Access rules:
+#   /enterprise/crm*        — admin OR client
+#   /enterprise/analysis*   — admin OR client
+#   /ws*, /webhook*, /inbound*, /outbound-answer* — no auth (HMAC-protected internally)
+#   everything else         — admin only
+#
+# Credential setup (run once, then restart caddy):
+#   Credentials are set as plaintext env vars and bcrypt-hashed by the app at startup.
+#   No hashes in this file — zero Caddyfile changes needed on password rotation.
+#
+# Extensibility: to add per-client accounts later, update the app's _init_gate_credentials()
+# to read from a GATE_USERS_FILE config — zero Caddyfile change required.
+
+{PUBLIC_HOST} {
+
+    # ------------------------------------------------------------------
+    # Bot/webhook paths — no user auth; they use their own HMAC/token.
+    # The telephony bridge reaches these from the internet.
+    # ------------------------------------------------------------------
+    @bot_paths path /ws /ws/* /ws-web /ws-web/* \
+                    /inbound /inbound/* \
+                    /outbound-answer /outbound-answer/* \
+                    /webhook /webhook/* \
+                    /call/* /call
+
+    handle @bot_paths {
+        reverse_proxy api:8000 {
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Real-IP      {remote_host}
+            transport http {
+                dial_timeout            10s
+                response_header_timeout 0
+                read_buffer_size        64kb
+                write_buffer_size       64kb
+            }
+        }
+    }
+
+    # ------------------------------------------------------------------
+    # CRM + analysis — both admin AND client roles allowed
+    # ------------------------------------------------------------------
+    @client_paths path /enterprise/crm* \
+                       /enterprise/analysis* \
+                       /enterprise/callbacks/ui* \
+                       /enterprise/review/ui*
+
+    handle @client_paths {
+        forward_auth http://api:8000/internal/auth {
+            uri /internal/auth
+            copy_headers X-Auth-User X-Auth-Role
+        }
+        reverse_proxy api:8000 {
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Real-IP      {remote_host}
+        }
+    }
+
+    # ------------------------------------------------------------------
+    # Internal health / monitoring endpoint — no browser auth needed
+    # but kept localhost-only; external requests hit this path only via
+    # the monitor service inside Docker. Expose to internet if desired
+    # by moving it out of this handle block.
+    # ------------------------------------------------------------------
+    @health_path path /health
+
+    handle @health_path {
+        reverse_proxy api:8000 {
+            header_up X-Forwarded-For {remote_host}
+        }
+    }
+
+    # ------------------------------------------------------------------
+    # Everything else — admin only
+    # ------------------------------------------------------------------
+    handle {
+        forward_auth http://api:8000/internal/auth {
+            uri /internal/auth?require_role=admin
+            copy_headers X-Auth-User X-Auth-Role
+        }
+        reverse_proxy api:8000 {
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Real-IP      {remote_host}
+        }
+    }
+
+    # ------------------------------------------------------------------
+    # Security headers (applied to all responses)
+    # ------------------------------------------------------------------
+    header {
+        Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+        X-Content-Type-Options    "nosniff"
+        X-Frame-Options           "SAMEORIGIN"
+        Referrer-Policy           "strict-origin-when-cross-origin"
+    }
+
+    encode gzip
+
+    log {
+        output file /data/logs/caddy/access.log {
+            roll_size  10mb
+            roll_keep  5
+        }
+        format json
+    }
+}

@@ -35,7 +35,12 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     logging: *logging
-    command: redis-server --requirepass ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+    # AOF persistence (item 6): fsync every second — survives crashes, minimal perf impact.
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+      --appendonly yes
+      --appendfsync everysec
     volumes:
       - redis_data:/data
     healthcheck:
@@ -50,8 +55,10 @@ services:
     build: .
     restart: unless-stopped
     logging: *logging
-    ports:
-      - "8000:8000"
+    # :8000 is NOT exposed to the host — Caddy fronts all external traffic (item 1).
+    # For local debugging without TLS: docker compose run --service-ports api
+    # ports:
+    #   - "8000:8000"   # DISABLED in production; Caddy handles TLS termination
     env_file: .env
     environment: *app-env
     volumes:
@@ -88,7 +95,67 @@ services:
       timeout: 10s
       retries: 3
 
+  # ---- TLS reverse proxy (item 1) ----
+  # Requires PUBLIC_HOST env var (e.g. bot.example.com) in .env.
+  # Caddy auto-obtains Let's Encrypt certs and renews them — no manual cert management.
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    logging: *logging
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3 (QUIC)
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - api_data:/data/logs
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST:?set PUBLIC_HOST in .env}
+    depends_on:
+      - api
+
+  # ---- Nightly backup service (item 2) ----
+  # Runs pg_dump + SQLite copy into /data/backups/<YYYY-MM-DD>/ every night at 02:00 local.
+  backup:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    logging: *logging
+    entrypoint: ["/bin/sh", "/scripts/backup.sh"]
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      PGHOST: postgres
+      PGUSER: voicebot
+      PGDATABASE: voicebot_leads
+    volumes:
+      - api_data:/data
+      - ./scripts/backup.sh:/scripts/backup.sh:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ---- Health checker / alerter (item 3) ----
+  # Hits /health every 60 s; sends Telegram alert on failure.
+  # Uses only existing TELEGRAM_* env vars — zero new paid services.
+  monitor:
+    image: python:3.11-slim
+    restart: unless-stopped
+    logging: *logging
+    entrypoint: ["python", "/scripts/monitor.py"]
+    env_file: .env
+    environment:
+      MONITOR_TARGET: http://api:8000/health
+      MONITOR_INTERVAL: "60"
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379/0
+    volumes:
+      - ./scripts/monitor.py:/scripts/monitor.py:ro
+    depends_on:
+      - api
+
 volumes:
   postgres_data:
   redis_data:
   api_data:
+  caddy_data:
+  caddy_config:

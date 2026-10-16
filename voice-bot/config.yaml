@@ -17,11 +17,11 @@ providers:
         keepalive_timeout: 30
         keepalive_interval: 15
         vad_signals: true
-        high_vad_sensitivity: true
-        positive_speech_threshold: 0.70
-        negative_speech_threshold: 0.48
-        min_speech_frames: 2
-        first_turn_min_speech_frames: 2
+        high_vad_sensitivity: false
+        positive_speech_threshold: 0.75
+        negative_speech_threshold: 0.50
+        min_speech_frames: 3
+        first_turn_min_speech_frames: 3
         negative_frames_count: 6
         negative_frames_window: 12
         interrupt_min_speech_frames: 3
@@ -161,7 +161,9 @@ providers:
 
 voice_rules: |
   You are Ananya, Meridian Group property advisor. Help the caller choose a home and arrange a site visit.
-  Speak naturally in their language, using conversational Hinglish for Hindi. Give one or two short complete sentences. Answer only what was asked; avoid extra offers and follow-up questions. State property facts, not invented best-facing or Vastu-superiority advice. Keep natural punctuation for speech. Do not reintroduce yourself or repeat answered questions.
+  The introduction happens ONLY in the opening line. Never reintroduce yourself, repeat your name, or repeat company name in subsequent turns.
+  Never send the exact same sentence twice in a call; on consecutive no-reply or nudging, rephrase shorter.
+  Speak naturally in their language, using conversational Hinglish for Hindi. Give one or two short complete sentences. Answer only what was asked; avoid extra offers and follow-up questions. State property facts, not invented best-facing or Vastu-superiority advice. Keep natural punctuation for speech. Do not repeat answered questions.
   Use the property facts below and [ACTIVE LEAD STATE] caller preferences. Never invent facts, discounts or availability. Listen to corrections; unclear speech gets a brief repeat request.
   When the caller picks an option by reference (the smaller one, the cheaper one), acknowledge with just "Okay, got it." and then ask the next question. Never restate the full size, price or BHK already spoken.
   For visits ask only the missing day or time. Interpret bare hours as normal daytime visit hours and repeat the resolved time in confirmation. Claim booked only after book_site_visit success. Caller can correct it.
@@ -204,11 +206,12 @@ vad:
   enabled: true
   start_threshold: 0.55
   min_speech_duration: 0.20
-  silence_timeout: 0.50
+  silence_timeout: 0.25
 
 silence_nudge_first_secs: 15
-# Second Groq model used when the primary Groq model fails / hits 429 (same GROQ_API_KEY). "" disables.
-llm_backup_groq_model: ""  # set only after local authenticated model-list validation
+# Second Groq model used when the primary Groq model fails / hits 429 (same GROQ_API_KEY).
+llm_backup_groq_model: ""
+llm_fallback_model: "qwen/qwen3.8-27b"
 filler_timeout_ms: 700
 preemptive_llm_enabled: false
 
@@ -289,9 +292,6 @@ cost_rates:
     "qwen-3.8-27b":
       prompt_per_mtok: 0.99
       completion_per_mtok: 1.49
-    "gpt-oss-120b":
-      prompt_per_mtok: 0.35
-      completion_per_mtok: 0.75
 
     # OpenRouter qwen/qwen3.6-27b via Venice ($0.325 input / $3.25 output per 1M tokens)
     "openrouter:qwen/qwen3.6-27b":
@@ -402,8 +402,8 @@ enterprise:
     callback_message: "Our team is busy right now. We have your number and will call you back shortly. Thank you for calling."  # CONFIRM wording with client; Approved fallback wording; never invent a promised callback
     broker_job_policy: close  # close | route
   recording:
-    notice: null
-    consent_policy: null  # notice_continue only when approved; explicit opt-in IVR unsupported
+    notice: "This call may be recorded for quality and training purposes."
+    consent_policy: notice_continue  # notice_continue only when approved; explicit opt-in IVR unsupported
     retention_days: null
     access_policy: null  # Existing shared dashboard-key holders; no multi-user role system
     allowed_hosts: []  # Exact provider media hosts, no redirects; typically media.vobiz.ai after verification

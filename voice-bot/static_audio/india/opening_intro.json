@@ -8,8 +8,8 @@
     "sample_rate": 16000,
     "pace": 1.02,
     "temperature": 0.6,
-    "text": "Great, this is Ananya from Meridian Group. Are you looking for a 2 or 3 BHK?",
+    "text": "Great, are you looking for a 2 or 3 BHK?",
     "api": "sarvam-rest"
   },
-  "sha256": "fd6ebb6907d8741654bce8e2e86942b7904cbd3898dc267b627b8d195cb63bb6"
+  "sha256": "f6ea31ddebad15b4980ed2edcbc01cc069ac593b8037fc4637c749049c11da0d"
 }
